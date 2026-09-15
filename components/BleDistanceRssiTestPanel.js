@@ -28,6 +28,12 @@ import Svg, {
   ClipPath,
 } from "react-native-svg";
 import { convertMeters, formatDistance } from "../services/BleScannerService.js";
+import {
+  calculateMAE,
+  calculateRMSE,
+  SPEED_OF_LIGHT_M_NS,
+  DEFAULT_RTT_HARDWARE_OFFSET_NS,
+} from "../services/RttRangingService.js";
 
 let AsyncStorage = null;
 try {
@@ -43,6 +49,8 @@ export default function BleDistanceRssiTestPanel({
   distanceUnit = "m",
   txPower1m = -59,
   environmentalN = 2.2,
+  groundTruthM = 1.0,
+  rttOffsetNs = DEFAULT_RTT_HARDWARE_OFFSET_NS,
 }) {
   // Available devices list
   const deviceList = Object.values(devices);
@@ -135,12 +143,17 @@ export default function BleDistanceRssiTestPanel({
       if (dev && dev.rawRssi !== null && dev.rawRssi !== undefined) {
         const rawMeters = dev.distance !== null && dev.distance !== undefined ? dev.distance : null;
         if (rawMeters !== null) {
+          const rttData = dev.rtt || null;
           const sample = {
             t: elapsed,
             rawRssi: dev.rawRssi,
             filteredRssi: dev.filteredRssi !== null ? dev.filteredRssi : dev.rawRssi,
             distM: rawMeters,
             distUnit: convertMeters(rawMeters, distanceUnit),
+            rttRawNs: rttData ? rttData.rawTimeNs : null,
+            rttCorrNs: rttData ? rttData.correctedTimeNs : null,
+            rttDistM: rttData ? rttData.rttDistanceM : null,
+            gtDistM: rttData ? rttData.groundTruthM : groundTruthM,
           };
 
           setCurrentSamples((prev) => [...prev, sample]);
@@ -176,21 +189,48 @@ export default function BleDistanceRssiTestPanel({
     }
 
     // Compute comprehensive test analytics
-    const rssiValues = currentSamples.map((s) => s.filteredRssi);
-    const distValues = currentSamples.map((s) => s.distM);
+    const rssiValues = currentSamples.map((s) => s.filteredRssi).filter((v) => typeof v === "number" && isFinite(v));
+    const distValues = currentSamples.map((s) => s.distM).filter((v) => typeof v === "number" && isFinite(v));
 
-    const minRssi = Math.min(...rssiValues);
-    const maxRssi = Math.max(...rssiValues);
-    const avgRssi = Number((rssiValues.reduce((a, b) => a + b, 0) / rssiValues.length).toFixed(1));
+    const minRssi = rssiValues.length > 0 ? Math.min(...rssiValues) : -100;
+    const maxRssi = rssiValues.length > 0 ? Math.max(...rssiValues) : -40;
+    const avgRssi = rssiValues.length > 0 ? Number((rssiValues.reduce((a, b) => a + b, 0) / rssiValues.length).toFixed(1)) : -70;
 
-    const minMeters = Math.min(...distValues);
-    const maxMeters = Math.max(...distValues);
-    const avgMeters = Number((distValues.reduce((a, b) => a + b, 0) / distValues.length).toFixed(2));
+    const minMeters = distValues.length > 0 ? Math.min(...distValues) : 0;
+    const maxMeters = distValues.length > 0 ? Math.max(...distValues) : 5;
+    const avgMeters = distValues.length > 0 ? Number((distValues.reduce((a, b) => a + b, 0) / distValues.length).toFixed(2)) : 1;
 
     // RSSI standard deviation (signal stability)
     const rssiVariance =
-      rssiValues.reduce((acc, v) => acc + (v - avgRssi) ** 2, 0) / rssiValues.length;
+      rssiValues.length > 0 ? rssiValues.reduce((acc, v) => acc + (v - avgRssi) ** 2, 0) / rssiValues.length : 0;
     const rssiStdDev = Number(Math.sqrt(rssiVariance).toFixed(2));
+
+    // RTT Analytics & Metrics
+    const rttDistValues = currentSamples.map((s) => s.rttDistM).filter((v) => typeof v === "number" && isFinite(v));
+    const rttRawValues = currentSamples.map((s) => s.rttRawNs).filter((v) => typeof v === "number" && isFinite(v));
+    const rttCorrValues = currentSamples.map((s) => s.rttCorrNs).filter((v) => typeof v === "number" && isFinite(v));
+
+    const minRttM = rttDistValues.length > 0 ? Math.min(...rttDistValues) : null;
+    const maxRttM = rttDistValues.length > 0 ? Math.max(...rttDistValues) : null;
+    const avgRttM = rttDistValues.length > 0 ? Number((rttDistValues.reduce((a, b) => a + b, 0) / rttDistValues.length).toFixed(3)) : null;
+
+    const avgRawNs = rttRawValues.length > 0 ? Number((rttRawValues.reduce((a, b) => a + b, 0) / rttRawValues.length).toFixed(1)) : null;
+    const avgCorrNs = rttCorrValues.length > 0 ? Number((rttCorrValues.reduce((a, b) => a + b, 0) / rttCorrValues.length).toFixed(1)) : null;
+    const rawVariance = rttRawValues.length > 0 ? rttRawValues.reduce((acc, v) => acc + (v - avgRawNs) ** 2, 0) / rttRawValues.length : 0;
+    const rawJitterNs = Number(Math.sqrt(rawVariance).toFixed(2));
+
+    // Ground Truth benchmarks (MAE & RMSE)
+    const runGtDist = currentSamples[0]?.gtDistM || groundTruthM || 1.0;
+    const rttMae = rttDistValues.length > 0 ? calculateMAE(rttDistValues, runGtDist) : null;
+    const rttRmse = rttDistValues.length > 0 ? calculateRMSE(rttDistValues, runGtDist) : null;
+    const rssiMae = distValues.length > 0 ? calculateMAE(distValues, runGtDist) : null;
+    const rssiRmse = distValues.length > 0 ? calculateRMSE(distValues, runGtDist) : null;
+
+    // Discrepancy between RTT and RSSI
+    const diffList = currentSamples
+      .filter((s) => typeof s.rttDistM === "number" && typeof s.distM === "number")
+      .map((s) => Math.abs(s.rttDistM - s.distM));
+    const avgDiffM = diffList.length > 0 ? Number((diffList.reduce((a, b) => a + b, 0) / diffList.length).toFixed(3)) : null;
 
     const devMeta = devices[selectedTargetId] || {};
     const newRun = {
@@ -204,6 +244,8 @@ export default function BleDistanceRssiTestPanel({
       txPower: txPower1m,
       pathLossN: environmentalN,
       unit: distanceUnit,
+      groundTruthM: runGtDist,
+      rttOffsetNs: rttOffsetNs,
       stats: {
         minRssi,
         maxRssi,
@@ -212,6 +254,17 @@ export default function BleDistanceRssiTestPanel({
         minMeters,
         maxMeters,
         avgMeters,
+        minRttM,
+        maxRttM,
+        avgRttM,
+        avgRawNs,
+        avgCorrNs,
+        rawJitterNs,
+        rttMae,
+        rttRmse,
+        rssiMae,
+        rssiRmse,
+        avgDiffM,
       },
       samples: [...currentSamples],
     };
@@ -300,15 +353,21 @@ export default function BleDistanceRssiTestPanel({
             <Text style={styles.liveMetricVal}>{currentSamples.length}</Text>
           </View>
           <View style={styles.liveMetricItem}>
-            <Text style={styles.liveMetricLabel}>RSSI</Text>
-            <Text style={[styles.liveMetricVal, { color: "#1f6feb" }]}>
-              {targetDevice?.filteredRssi ?? targetDevice?.rawRssi ?? "--"} dBm
+            <Text style={styles.liveMetricLabel}>RSSI DIST</Text>
+            <Text style={[styles.liveMetricVal, { color: "#1a7f37" }]}>
+              {formatDistance(targetDevice?.distance, distanceUnit).value} {distanceUnit}
             </Text>
           </View>
           <View style={styles.liveMetricItem}>
-            <Text style={styles.liveMetricLabel}>DISTANCE</Text>
-            <Text style={[styles.liveMetricVal, { color: "#1a7f37" }]}>
-              {formatDistance(targetDevice?.distance, distanceUnit).value} {distanceUnit}
+            <Text style={styles.liveMetricLabel}>RTT DIST</Text>
+            <Text style={[styles.liveMetricVal, { color: "#0284c7" }]}>
+              {formatDistance(targetDevice?.rtt?.rttDistanceM, distanceUnit).value} {distanceUnit}
+            </Text>
+          </View>
+          <View style={styles.liveMetricItem}>
+            <Text style={styles.liveMetricLabel}>SIGNAL</Text>
+            <Text style={[styles.liveMetricVal, { color: "#1f6feb" }]}>
+              {targetDevice?.filteredRssi ?? targetDevice?.rawRssi ?? "--"} dBm
             </Text>
           </View>
         </View>
@@ -370,7 +429,7 @@ export default function BleDistanceRssiTestPanel({
             </View>
           )}
 
-          {/* Graph Sub-Tabs: Scatter | Time Series | Statistics */}
+          {/* Graph Sub-Tabs: Scatter | Multi Series | RTT Timing | Statistics */}
           <View style={styles.graphTabBar}>
             <Pressable
               onPress={() => setActiveGraphTab("scatter")}
@@ -385,7 +444,15 @@ export default function BleDistanceRssiTestPanel({
               style={[styles.graphTabBtn, activeGraphTab === "timeseries" && styles.graphTabBtnActive]}
             >
               <Text style={[styles.graphTabText, activeGraphTab === "timeseries" && styles.graphTabTextActive]}>
-                📈 Time Series
+                📈 Multi Series
+              </Text>
+            </Pressable>
+            <Pressable
+              onPress={() => setActiveGraphTab("rtt_time")}
+              style={[styles.graphTabBtn, activeGraphTab === "rtt_time" && styles.graphTabBtnActive]}
+            >
+              <Text style={[styles.graphTabText, activeGraphTab === "rtt_time" && styles.graphTabTextActive]}>
+                ⏱️ RTT ToF
               </Text>
             </Pressable>
             <Pressable
@@ -393,13 +460,13 @@ export default function BleDistanceRssiTestPanel({
               style={[styles.graphTabBtn, activeGraphTab === "stats" && styles.graphTabBtnActive]}
             >
               <Text style={[styles.graphTabText, activeGraphTab === "stats" && styles.graphTabTextActive]}>
-                📋 Stats
+                📋 Evaluation
               </Text>
             </Pressable>
           </View>
 
           {/* Interactive Zoom Toolbar for Graphs */}
-          {(activeGraphTab === "scatter" || activeGraphTab === "timeseries") && (
+          {(activeGraphTab === "scatter" || activeGraphTab === "timeseries" || activeGraphTab === "rtt_time") && (
             <View style={styles.zoomToolbar}>
               <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
                 <Text style={styles.zoomLabel}>Zoom:</Text>
@@ -450,10 +517,18 @@ export default function BleDistanceRssiTestPanel({
             <View style={styles.tooltipBox}>
               <Text style={styles.tooltipTitle}>📌 Sample #{selectedPointInfo.idx + 1}</Text>
               <Text style={styles.tooltipBody}>
-                RSSI: <Text style={{ fontWeight: "800", color: "#1f6feb" }}>{selectedPointInfo.rssi} dBm</Text> • Dist:{" "}
+                RSSI: <Text style={{ fontWeight: "800", color: "#1f6feb" }}>{selectedPointInfo.rssi} dBm</Text> • RSSI Dist:{" "}
                 <Text style={{ fontWeight: "800", color: "#1a7f37" }}>
                   {selectedPointInfo.dist.toFixed(2)} {distanceUnit}
                 </Text>{" "}
+                {selectedPointInfo.rttDist !== undefined && selectedPointInfo.rttDist !== null && (
+                  <>
+                    • RTT Dist:{" "}
+                    <Text style={{ fontWeight: "800", color: "#0284c7" }}>
+                      {selectedPointInfo.rttDist.toFixed(2)} {distanceUnit}
+                    </Text>{" "}
+                  </>
+                )}
                 • Time: {selectedPointInfo.t.toFixed(1)}s
               </Text>
             </View>
@@ -477,7 +552,7 @@ export default function BleDistanceRssiTestPanel({
                 </View>
                 <View style={styles.legendItem}>
                   <View style={[styles.legendDash, { borderColor: "#cf222e" }]} />
-                  <Text style={styles.legendLabel}>Theoretical ($n={activeRun.pathLossN}$)</Text>
+                  <Text style={styles.legendLabel}>Theoretical (n={activeRun.pathLossN})</Text>
                 </View>
               </View>
 
@@ -506,7 +581,7 @@ export default function BleDistanceRssiTestPanel({
           )}
 
           {/* ──────────────────────────────────────────────────────────────── */}
-          {/* TAB 2: DUAL-AXIS TIME SERIES RUN (Distance & RSSI over Time)    */}
+          {/* TAB 2: MULTI TIME SERIES RUN (RTT Dist, RSSI Dist, GT & RSSI)   */}
           {/* ──────────────────────────────────────────────────────────────── */}
           {activeGraphTab === "timeseries" && (
             <View
@@ -519,11 +594,19 @@ export default function BleDistanceRssiTestPanel({
               <View style={styles.graphLegendRow}>
                 <View style={styles.legendItem}>
                   <View style={[styles.legendDot, { backgroundColor: "#1a7f37" }]} />
-                  <Text style={styles.legendLabel}>Distance ({distanceUnit})</Text>
+                  <Text style={styles.legendLabel}>RSSI Dist ({distanceUnit})</Text>
+                </View>
+                <View style={styles.legendItem}>
+                  <View style={[styles.legendDot, { backgroundColor: "#0284c7" }]} />
+                  <Text style={styles.legendLabel}>RTT Dist ({distanceUnit})</Text>
+                </View>
+                <View style={styles.legendItem}>
+                  <View style={[styles.legendDash, { borderColor: "#d97706" }]} />
+                  <Text style={styles.legendLabel}>Ground Truth</Text>
                 </View>
                 <View style={styles.legendItem}>
                   <View style={[styles.legendDot, { backgroundColor: "#8250df" }]} />
-                  <Text style={styles.legendLabel}>Filtered RSSI (dBm)</Text>
+                  <Text style={styles.legendLabel}>RSSI (dBm)</Text>
                 </View>
               </View>
 
@@ -543,18 +626,142 @@ export default function BleDistanceRssiTestPanel({
               </ScrollView>
 
               <Text style={styles.graphFootnote}>
-                • Green = Distance over time. Purple = RSSI over time.
+                • Green = RSSI Distance. Cyan = RTT Distance (ToF). Amber = Ground Truth. Purple = Filtered RSSI.
               </Text>
             </View>
           )}
 
           {/* ──────────────────────────────────────────────────────────────── */}
-          {/* TAB 3: STATS & SUMMARY TABLE                                     */}
+          {/* TAB 3: RTT TIME-OF-FLIGHT GRAPH                                  */}
+          {/* ──────────────────────────────────────────────────────────────── */}
+          {activeGraphTab === "rtt_time" && (
+            <View
+              style={styles.graphBox}
+              onLayout={(e) => {
+                const w = Math.round(e.nativeEvent.layout.width);
+                if (w > 60 && Math.abs(w - plotContainerWidth) > 3) setPlotContainerWidth(w);
+              }}
+            >
+              <View style={styles.graphLegendRow}>
+                <View style={styles.legendItem}>
+                  <View style={[styles.legendDot, { backgroundColor: "#0284c7" }]} />
+                  <Text style={styles.legendLabel}>T_corrected (ns)</Text>
+                </View>
+                <View style={styles.legendItem}>
+                  <View style={[styles.legendDash, { borderColor: "#d97706" }]} />
+                  <Text style={styles.legendLabel}>Ideal ToF @ Ground Truth</Text>
+                </View>
+              </View>
+
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={zoomLevel > 1.05}
+                contentContainerStyle={{ alignItems: "center" }}
+              >
+                <RttTimingGraph
+                  samples={activeRun.samples}
+                  durationSec={activeRun.durationSec}
+                  unit={distanceUnit}
+                  zoomLevel={zoomLevel}
+                  autoFit={autoFitData}
+                  containerWidth={plotContainerWidth}
+                />
+              </ScrollView>
+
+              <Text style={styles.graphFootnote}>
+                • Cyan = Corrected Round-Trip Time (ns). Amber = Ideal physical ToF (2 × d_GT / c).
+              </Text>
+            </View>
+          )}
+
+          {/* ──────────────────────────────────────────────────────────────── */}
+          {/* TAB 4: COMPREHENSIVE STATS & EVALUATION TABLE                    */}
           {/* ──────────────────────────────────────────────────────────────── */}
           {activeGraphTab === "stats" && (
             <View style={styles.statsCard}>
-              <Text style={styles.statsCardTitle}>Run Analytics: {activeRun.targetName}</Text>
-              <View style={styles.statsGrid}>
+              <Text style={styles.statsCardTitle}>Run Evaluation: {activeRun.targetName}</Text>
+              <Text style={styles.statsCardSub}>
+                Comparative benchmark between Experimental RTT-Style ToF and Log-Distance RSSI ranging.
+              </Text>
+
+              {/* Benchmark Summary Table */}
+              <View style={styles.evalTable}>
+                <View style={styles.evalTableRowHeader}>
+                  <Text style={[styles.evalTableCell, styles.evalHeaderCell, { flex: 1.4 }]}>Metric</Text>
+                  <Text style={[styles.evalTableCell, styles.evalHeaderCell, { color: "#0284c7" }]}>RTT (ToF)</Text>
+                  <Text style={[styles.evalTableCell, styles.evalHeaderCell, { color: "#1a7f37" }]}>RSSI (Path Loss)</Text>
+                </View>
+
+                {/* Ground Truth Row */}
+                <View style={styles.evalTableRow}>
+                  <Text style={[styles.evalTableCell, styles.evalLabelCell, { flex: 1.4 }]}>Ground Truth</Text>
+                  <Text style={[styles.evalTableCell, styles.evalValCell, { color: "#d97706" }]}>
+                    {activeRun.groundTruthM ? convertMeters(activeRun.groundTruthM, distanceUnit) : "--"} {distanceUnit}
+                  </Text>
+                  <Text style={[styles.evalTableCell, styles.evalValCell, { color: "#d97706" }]}>
+                    {activeRun.groundTruthM ? convertMeters(activeRun.groundTruthM, distanceUnit) : "--"} {distanceUnit}
+                  </Text>
+                </View>
+
+                {/* MAE Row */}
+                <View style={[styles.evalTableRow, { backgroundColor: "#f0fdf4" }]}>
+                  <Text style={[styles.evalTableCell, styles.evalLabelCell, { flex: 1.4 }]}>MAE vs GT (Error)</Text>
+                  <Text style={[styles.evalTableCell, styles.evalValCell, { fontWeight: "800", color: "#0284c7" }]}>
+                    {activeRun.stats.rttMae !== null && activeRun.stats.rttMae !== undefined
+                      ? `${convertMeters(activeRun.stats.rttMae, distanceUnit)} ${distanceUnit}`
+                      : "--"}
+                  </Text>
+                  <Text style={[styles.evalTableCell, styles.evalValCell, { fontWeight: "800", color: "#1a7f37" }]}>
+                    {activeRun.stats.rssiMae !== null && activeRun.stats.rssiMae !== undefined
+                      ? `${convertMeters(activeRun.stats.rssiMae, distanceUnit)} ${distanceUnit}`
+                      : "--"}
+                  </Text>
+                </View>
+
+                {/* RMSE Row */}
+                <View style={[styles.evalTableRow, { backgroundColor: "#f8fafc" }]}>
+                  <Text style={[styles.evalTableCell, styles.evalLabelCell, { flex: 1.4 }]}>RMSE vs GT (Std Error)</Text>
+                  <Text style={[styles.evalTableCell, styles.evalValCell, { fontWeight: "800", color: "#0284c7" }]}>
+                    {activeRun.stats.rttRmse !== null && activeRun.stats.rttRmse !== undefined
+                      ? `${convertMeters(activeRun.stats.rttRmse, distanceUnit)} ${distanceUnit}`
+                      : "--"}
+                  </Text>
+                  <Text style={[styles.evalTableCell, styles.evalValCell, { fontWeight: "800", color: "#1a7f37" }]}>
+                    {activeRun.stats.rssiRmse !== null && activeRun.stats.rssiRmse !== undefined
+                      ? `${convertMeters(activeRun.stats.rssiRmse, distanceUnit)} ${distanceUnit}`
+                      : "--"}
+                  </Text>
+                </View>
+
+                {/* Avg Distance Row */}
+                <View style={styles.evalTableRow}>
+                  <Text style={[styles.evalTableCell, styles.evalLabelCell, { flex: 1.4 }]}>Avg Distance</Text>
+                  <Text style={[styles.evalTableCell, styles.evalValCell]}>
+                    {activeRun.stats.avgRttM !== null && activeRun.stats.avgRttM !== undefined
+                      ? `${convertMeters(activeRun.stats.avgRttM, distanceUnit)} ${distanceUnit}`
+                      : "--"}
+                  </Text>
+                  <Text style={[styles.evalTableCell, styles.evalValCell]}>
+                    {convertMeters(activeRun.stats.avgMeters, distanceUnit)} {distanceUnit}
+                  </Text>
+                </View>
+
+                {/* Min / Max Row */}
+                <View style={styles.evalTableRow}>
+                  <Text style={[styles.evalTableCell, styles.evalLabelCell, { flex: 1.4 }]}>Min / Max Dist</Text>
+                  <Text style={[styles.evalTableCell, styles.evalValCell]}>
+                    {activeRun.stats.minRttM !== null && activeRun.stats.maxRttM !== null
+                      ? `${convertMeters(activeRun.stats.minRttM, distanceUnit)} - ${convertMeters(activeRun.stats.maxRttM, distanceUnit)}`
+                      : "--"}
+                  </Text>
+                  <Text style={[styles.evalTableCell, styles.evalValCell]}>
+                    {convertMeters(activeRun.stats.minMeters, distanceUnit)} - {convertMeters(activeRun.stats.maxMeters, distanceUnit)}
+                  </Text>
+                </View>
+              </View>
+
+              {/* Discrepancy & Timing Info Grid */}
+              <View style={[styles.statsGrid, { marginTop: 12 }]}>
                 <View style={styles.statCell}>
                   <Text style={styles.statCellLabel}>Duration</Text>
                   <Text style={styles.statCellVal}>{activeRun.durationSec}s</Text>
@@ -564,34 +771,38 @@ export default function BleDistanceRssiTestPanel({
                   <Text style={styles.statCellVal}>{activeRun.sampleCount}</Text>
                 </View>
                 <View style={styles.statCell}>
-                  <Text style={styles.statCellLabel}>Closest Dist</Text>
-                  <Text style={[styles.statCellVal, { color: "#1a7f37" }]}>
-                    {convertMeters(activeRun.stats.minMeters, distanceUnit)} {distanceUnit}
+                  <Text style={styles.statCellLabel}>Mean |RTT - RSSI|</Text>
+                  <Text style={[styles.statCellVal, { color: "#d97706" }]}>
+                    {activeRun.stats.avgDiffM !== null && activeRun.stats.avgDiffM !== undefined
+                      ? `${convertMeters(activeRun.stats.avgDiffM, distanceUnit)} ${distanceUnit}`
+                      : "--"}
                   </Text>
                 </View>
                 <View style={styles.statCell}>
-                  <Text style={styles.statCellLabel}>Farthest Dist</Text>
+                  <Text style={styles.statCellLabel}>Avg T_corrected</Text>
+                  <Text style={[styles.statCellVal, { color: "#0284c7" }]}>
+                    {activeRun.stats.avgCorrNs !== null ? `${activeRun.stats.avgCorrNs} ns` : "--"}
+                  </Text>
+                </View>
+                <View style={styles.statCell}>
+                  <Text style={styles.statCellLabel}>Timing Jitter (σ)</Text>
                   <Text style={styles.statCellVal}>
-                    {convertMeters(activeRun.stats.maxMeters, distanceUnit)} {distanceUnit}
+                    {activeRun.stats.rawJitterNs !== null ? `±${activeRun.stats.rawJitterNs} ns` : "--"}
                   </Text>
                 </View>
                 <View style={styles.statCell}>
-                  <Text style={styles.statCellLabel}>Avg Distance</Text>
-                  <Text style={styles.statCellVal}>
-                    {convertMeters(activeRun.stats.avgMeters, distanceUnit)} {distanceUnit}
-                  </Text>
-                </View>
-                <View style={styles.statCell}>
-                  <Text style={styles.statCellLabel}>Max RSSI</Text>
-                  <Text style={[styles.statCellVal, { color: "#1f6feb" }]}>{activeRun.stats.maxRssi} dBm</Text>
-                </View>
-                <View style={styles.statCell}>
-                  <Text style={styles.statCellLabel}>Min RSSI</Text>
-                  <Text style={styles.statCellVal}>{activeRun.stats.minRssi} dBm</Text>
-                </View>
-                <View style={styles.statCell}>
-                  <Text style={styles.statCellLabel}>Signal Jitter</Text>
+                  <Text style={styles.statCellLabel}>RSSI Jitter (σ)</Text>
                   <Text style={styles.statCellVal}>±{activeRun.stats.rssiStdDev} dBm</Text>
+                </View>
+                <View style={styles.statCell}>
+                  <Text style={styles.statCellLabel}>HW Offset (T_offset)</Text>
+                  <Text style={styles.statCellVal}>
+                    {activeRun.rttOffsetNs ? `${activeRun.rttOffsetNs} ns` : "--"}
+                  </Text>
+                </View>
+                <View style={styles.statCell}>
+                  <Text style={styles.statCellLabel}>Path Loss (n)</Text>
+                  <Text style={styles.statCellVal}>{activeRun.pathLossN}</Text>
                 </View>
               </View>
             </View>
@@ -815,7 +1026,9 @@ function TimeSeriesDualGraph({
 
   const convertedSamples = samples.map((s) => ({
     t: s.t,
-    dist: convertMeters(s.distM, unit),
+    dist: typeof s.distM === "number" && isFinite(s.distM) ? convertMeters(s.distM, unit) : null,
+    rttDist: typeof s.rttDistM === "number" && isFinite(s.rttDistM) ? convertMeters(s.rttDistM, unit) : null,
+    gtDist: typeof s.gtDistM === "number" && isFinite(s.gtDistM) ? convertMeters(s.gtDistM, unit) : null,
     rssi: s.filteredRssi,
   }));
 
@@ -825,8 +1038,9 @@ function TimeSeriesDualGraph({
   let maxRssi = -35;
 
   if (convertedSamples.length > 0) {
-    const sMaxDist = Math.max(...convertedSamples.map((s) => s.dist));
-    const sMinDist = Math.min(...convertedSamples.map((s) => s.dist));
+    const validDists = convertedSamples.flatMap((s) => [s.dist, s.rttDist, s.gtDist].filter((v) => typeof v === "number" && isFinite(v)));
+    const sMaxDist = validDists.length > 0 ? Math.max(...validDists) : 3.0;
+    const sMinDist = validDists.length > 0 ? Math.min(...validDists) : 0;
     const sMinRssi = Math.min(...convertedSamples.map((s) => s.rssi));
     const sMaxRssi = Math.max(...convertedSamples.map((s) => s.rssi));
 
@@ -848,7 +1062,21 @@ function TimeSeriesDualGraph({
   const mapYRssi = (r) =>
     padTop + plotH - ((Math.max(minRssi, Math.min(maxRssi, r)) - minRssi) / Math.max(1, maxRssi - minRssi)) * plotH;
 
-  const distPolyline = convertedSamples.map((s) => `${mapX(s.t).toFixed(1)},${mapYDist(s.dist).toFixed(1)}`).join(" ");
+  const distPolyline = convertedSamples
+    .filter((s) => s.dist !== null)
+    .map((s) => `${mapX(s.t).toFixed(1)},${mapYDist(s.dist).toFixed(1)}`)
+    .join(" ");
+
+  const rttPolyline = convertedSamples
+    .filter((s) => s.rttDist !== null)
+    .map((s) => `${mapX(s.t).toFixed(1)},${mapYDist(s.rttDist).toFixed(1)}`)
+    .join(" ");
+
+  const gtPolyline = convertedSamples
+    .filter((s) => s.gtDist !== null)
+    .map((s) => `${mapX(s.t).toFixed(1)},${mapYDist(s.gtDist).toFixed(1)}`)
+    .join(" ");
+
   const rssiPolyline = convertedSamples.map((s) => `${mapX(s.t).toFixed(1)},${mapYRssi(s.rssi).toFixed(1)}`).join(" ");
 
   return (
@@ -880,13 +1108,25 @@ function TimeSeriesDualGraph({
         );
       })}
 
-      {/* Clipped Dual Curves */}
+      {/* Clipped Multi Curves */}
       <G clipPath="url(#timeSeriesClip)">
-        {/* Distance Line (Green) */}
-        <Polyline points={distPolyline} fill="none" stroke="#16a34a" strokeWidth={3} />
+        {/* Ground Truth Line (Amber Dashed) */}
+        {gtPolyline.length > 0 && (
+          <Polyline points={gtPolyline} fill="none" stroke="#d97706" strokeWidth={2} strokeDasharray="5,4" />
+        )}
+
+        {/* RSSI Distance Line (Green) */}
+        {distPolyline.length > 0 && (
+          <Polyline points={distPolyline} fill="none" stroke="#16a34a" strokeWidth={2.6} />
+        )}
+
+        {/* RTT Distance Line (Cyan) */}
+        {rttPolyline.length > 0 && (
+          <Polyline points={rttPolyline} fill="none" stroke="#0284c7" strokeWidth={2.6} />
+        )}
 
         {/* RSSI Line (Purple) */}
-        <Polyline points={rssiPolyline} fill="none" stroke="#9333ea" strokeWidth={2.2} strokeDasharray="4,2" />
+        <Polyline points={rssiPolyline} fill="none" stroke="#9333ea" strokeWidth={2} strokeDasharray="4,2" />
       </G>
 
       {/* Time axis ticks */}
@@ -927,6 +1167,163 @@ function TimeSeriesDualGraph({
       </SvgText>
 
       {/* Bottom Axis Label */}
+      <SvgText x={padLeft + plotW / 2} y={svgHeight - 8} fontSize={11} fontWeight="700" fill="#1e293b" textAnchor="middle">
+        Elapsed Test Time (Seconds)
+      </SvgText>
+    </Svg>
+  );
+}
+
+// ============================================================================
+// SVG GRAPH 3: RTT TIME-OF-FLIGHT GRAPH (Corrected Time in ns & Equivalent Dist)
+// ============================================================================
+function RttTimingGraph({
+  samples = [],
+  durationSec = 10,
+  unit = "m",
+  zoomLevel = 1.0,
+  autoFit = true,
+  containerWidth = 0,
+}) {
+  const screenWidth = Dimensions.get("window").width;
+  const baseWidth = containerWidth > 150 ? containerWidth - 8 : Math.max(280, screenWidth - 68);
+  const svgWidth = Math.round(baseWidth * zoomLevel);
+  const svgHeight = 280;
+
+  const padLeft = 60;
+  const padRight = 55;
+  const padTop = 24;
+  const padBottom = 46;
+
+  const plotW = Math.max(120, svgWidth - padLeft - padRight);
+  const plotH = Math.max(120, svgHeight - padTop - padBottom);
+
+  if (samples.length < 2) return null;
+
+  const maxTime = Math.max(1, durationSec);
+
+  const timingSamples = samples.map((s) => {
+    const corrNs = typeof s.rttCorrNs === "number" && isFinite(s.rttCorrNs) ? s.rttCorrNs : 0;
+    const rawNs = typeof s.rttRawNs === "number" && isFinite(s.rttRawNs) ? s.rttRawNs : 0;
+    const gtDistM = typeof s.gtDistM === "number" && isFinite(s.gtDistM) ? s.gtDistM : 1.0;
+    const idealNs = (2.0 * gtDistM) / SPEED_OF_LIGHT_M_NS;
+    return {
+      t: s.t,
+      corrNs,
+      rawNs,
+      idealNs,
+      equivDist: convertMeters((SPEED_OF_LIGHT_M_NS * corrNs) / 2.0, unit),
+    };
+  });
+
+  const allNs = timingSamples.map((s) => s.corrNs);
+  const minSampleNs = Math.min(...allNs, ...timingSamples.map((s) => s.idealNs));
+  const maxSampleNs = Math.max(...allNs, ...timingSamples.map((s) => s.idealNs));
+
+  let minNs = 0;
+  let maxNs = 35; // ~5.2 meters default
+
+  if (autoFit) {
+    minNs = Math.max(0, Number((minSampleNs * 0.8).toFixed(1)));
+    maxNs = Math.max(10, Number((maxSampleNs * 1.2).toFixed(1)));
+  } else {
+    maxNs = Math.max(maxNs, Number((maxSampleNs * 1.15).toFixed(1)));
+  }
+
+  const mapX = (t) => padLeft + (Math.max(0, Math.min(maxTime, t)) / maxTime) * plotW;
+  const mapYNs = (ns) =>
+    padTop + plotH - ((Math.max(minNs, Math.min(maxNs, ns)) - minNs) / Math.max(1, maxNs - minNs)) * plotH;
+
+  const corrPolyline = timingSamples.map((s) => `${mapX(s.t).toFixed(1)},${mapYNs(s.corrNs).toFixed(1)}`).join(" ");
+  const idealPolyline = timingSamples.map((s) => `${mapX(s.t).toFixed(1)},${mapYNs(s.idealNs).toFixed(1)}`).join(" ");
+
+  return (
+    <Svg width={svgWidth} height={svgHeight}>
+      <Defs>
+        <ClipPath id="rttTimingClip">
+          <Rect x={padLeft} y={padTop} width={plotW} height={plotH} />
+        </ClipPath>
+      </Defs>
+
+      {/* Frame */}
+      <Rect x={padLeft} y={padTop} width={plotW} height={plotH} fill="#f0f9ff" rx={6} stroke="#bae6fd" strokeWidth={1} />
+
+      {/* Grid Lines */}
+      {[0, 0.25, 0.5, 0.75, 1].map((ratio, idx) => {
+        const y = padTop + plotH * (1 - ratio);
+        const valNs = (minNs + ratio * (maxNs - minNs)).toFixed(1);
+        const eqDist = convertMeters((SPEED_OF_LIGHT_M_NS * Number(valNs)) / 2.0, unit).toFixed(unit === "in" ? 0 : 1);
+        return (
+          <G key={`rtt-grid-${idx}`}>
+            <Line x1={padLeft} y1={y} x2={padLeft + plotW} y2={y} stroke="#e0f2fe" strokeWidth={1} strokeDasharray="3,3" />
+            <SvgText x={padLeft - 6} y={y + 4} fontSize={9.5} fontWeight="700" fill="#0284c7" textAnchor="end">
+              {valNs}ns
+            </SvgText>
+            <SvgText x={padLeft + plotW + 6} y={y + 4} fontSize={9.5} fontWeight="700" fill="#64748b" textAnchor="start">
+              {eqDist} {unit}
+            </SvgText>
+          </G>
+        );
+      })}
+
+      {/* Curves */}
+      <G clipPath="url(#rttTimingClip)">
+        {/* Ideal ToF Line (Ground Truth) */}
+        <Polyline points={idealPolyline} fill="none" stroke="#d97706" strokeWidth={2} strokeDasharray="5,4" />
+
+        {/* Measured Corrected Time Line */}
+        <Polyline points={corrPolyline} fill="none" stroke="#0284c7" strokeWidth={2.8} />
+
+        {/* Sample Points */}
+        {timingSamples.map((s, idx) => (
+          <Circle
+            key={`rtt-dot-${idx}`}
+            cx={mapX(s.t)}
+            cy={mapYNs(s.corrNs)}
+            r={3}
+            fill="#0284c7"
+            stroke="#ffffff"
+            strokeWidth={1}
+          />
+        ))}
+      </G>
+
+      {/* Time ticks */}
+      {[0, 0.25, 0.5, 0.75, 1].map((ratio, idx) => {
+        const x = padLeft + ratio * plotW;
+        const timeVal = (ratio * maxTime).toFixed(0);
+        return (
+          <SvgText key={`rtt-tick-${idx}`} x={x} y={padTop + plotH + 16} fontSize={10} fontWeight="600" fill="#64748b" textAnchor="middle">
+            {timeVal}s
+          </SvgText>
+        );
+      })}
+
+      {/* Labels */}
+      <SvgText
+        x={14}
+        y={padTop + plotH / 2}
+        fontSize={10.5}
+        fontWeight="700"
+        fill="#0284c7"
+        transform={`rotate(-90, 14, ${padTop + plotH / 2})`}
+        textAnchor="middle"
+      >
+        T_corrected (ns)
+      </SvgText>
+
+      <SvgText
+        x={svgWidth - 6}
+        y={padTop + plotH / 2}
+        fontSize={10}
+        fontWeight="700"
+        fill="#64748b"
+        transform={`rotate(90, ${svgWidth - 6}, ${padTop + plotH / 2})`}
+        textAnchor="middle"
+      >
+        Equiv Dist ({unit})
+      </SvgText>
+
       <SvgText x={padLeft + plotW / 2} y={svgHeight - 8} fontSize={11} fontWeight="700" fill="#1e293b" textAnchor="middle">
         Elapsed Test Time (Seconds)
       </SvgText>
@@ -1305,7 +1702,53 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: "700",
     color: "#1e293b",
+    marginBottom: 4,
+  },
+  statsCardSub: {
+    fontSize: 11,
+    color: "#64748b",
     marginBottom: 10,
+    lineHeight: 15,
+  },
+  evalTable: {
+    backgroundColor: "#ffffff",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    overflow: "hidden",
+  },
+  evalTableRowHeader: {
+    flexDirection: "row",
+    backgroundColor: "#f1f5f9",
+    borderBottomWidth: 1,
+    borderColor: "#cbd5e1",
+    paddingVertical: 7,
+    paddingHorizontal: 8,
+  },
+  evalTableRow: {
+    flexDirection: "row",
+    borderBottomWidth: 1,
+    borderColor: "#f1f5f9",
+    paddingVertical: 7,
+    paddingHorizontal: 8,
+    alignItems: "center",
+  },
+  evalTableCell: {
+    flex: 1,
+    fontSize: 11,
+  },
+  evalHeaderCell: {
+    fontWeight: "800",
+    color: "#334155",
+  },
+  evalLabelCell: {
+    fontWeight: "600",
+    color: "#475569",
+  },
+  evalValCell: {
+    fontWeight: "700",
+    color: "#0f172a",
+    textAlign: "right",
   },
   statsGrid: {
     flexDirection: "row",

@@ -42,6 +42,12 @@ export const DEFAULT_APP_SETTINGS = {
   // ─── Room & Map Environment ───────────────────────────────────────────────
   roomWidthFt: 18,                 // Room width in feet (X axis)
   roomHeightFt: 15,                // Room height in feet (Y axis)
+
+  // ─── Experimental RTT Ranging ──────────────────────────────────────────────
+  rttOffsetNs: 50000.0,            // Hardware/system turnaround delay offset in nanoseconds
+  rttAveragingWindow: 5,           // Rolling average filter sample window size
+  rttOutlierFilterEnabled: true,   // Enable MAD / Hampel outlier rejection
+  groundTruthDistanceM: 1.0,       // Default ground truth benchmark distance in meters
 };
 
 // In-memory active cache for immediate synchronous access by high-frequency loops

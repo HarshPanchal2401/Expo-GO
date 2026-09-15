@@ -21,6 +21,11 @@ export const DEFAULT_CONFIG = {
   beacon2X: 18,
   beacon2Y: 15,
 
+  // Room / Test Area Dimensions (feet)
+  roomWidthFt:       18,
+  roomHeightFt:      15,
+  askAreaBeforeTest: true,
+
   // Calibration (RSSI at 1m, i.e. txPower)
   beacon1TxPower: -59,
   beacon2TxPower: -59,

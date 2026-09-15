@@ -16,6 +16,7 @@ import {
   Alert,
   Switch,
   ActivityIndicator,
+  Modal,
 } from "react-native";
 
 import { useTwoBeaconPositioning } from "../hooks/useTwoBeaconPositioning.js";
@@ -37,6 +38,46 @@ const STAGES = [
   { id: "position",  label: "4. Position\nTest"   },
 ];
 
+class TwoBeaconErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error, errorInfo) {
+    console.warn("[TwoBeaconErrorBoundary error caught]:", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <View style={{ padding: 16, backgroundColor: "#fff0f0", borderRadius: 12, borderWidth: 1, borderColor: "#ffc9c9", margin: 16 }}>
+          <Text style={{ fontSize: 16, fontWeight: "bold", color: "#cf222e", marginBottom: 6 }}>
+            ⚠️ Positioning Screen Recovered
+          </Text>
+          <Text style={{ fontSize: 13, color: "#57606a", marginBottom: 12, lineHeight: 18 }}>
+            A render error was safely prevented from closing your app. Tap below to resume testing cleanly.
+          </Text>
+          <Pressable
+            style={{ backgroundColor: "#1f6feb", paddingVertical: 10, paddingHorizontal: 16, borderRadius: 8, alignItems: "center" }}
+            onPress={() => {
+              this.setState({ hasError: false, error: null });
+              this.props.onReset?.();
+            }}
+          >
+            <Text style={{ color: "#ffffff", fontWeight: "700", fontSize: 13 }}>↺ Resume Positioning</Text>
+          </Pressable>
+        </View>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function TwoBeaconPositionScreen({ pdrStepCallbackRef, heading = 0 }) {
   // ─── Config state (persisted) ─────────────────────────────────────────────
   const [config, setConfig] = useState(DEFAULT_CONFIG);
@@ -48,8 +89,15 @@ export default function TwoBeaconPositionScreen({ pdrStepCallbackRef, heading = 
   // ─── Drag state to lock scroll during beacon placement ────────────────────
   const [isDraggingMap, setIsDraggingMap] = useState(false);
 
-  // ─── Debug overlays ───────────────────────────────────────────────────────
-  const [showOverlays, setShowOverlays] = useState(false);
+  // ─── Debug overlays (BLE, PDR, Fused markers) ───────────────────────────
+  const [showOverlays, setShowOverlays] = useState(true);
+
+  // ─── Area Size Modal state ────────────────────────────────────────────────
+  const [showAreaModal, setShowAreaModal] = useState(false);
+  const [areaModalMode, setAreaModalMode] = useState("startTest"); // "startTest" | "editOnly"
+
+  const roomW = (typeof config.roomWidthFt === "number" && isFinite(config.roomWidthFt) && config.roomWidthFt > 0) ? config.roomWidthFt : 18;
+  const roomH = (typeof config.roomHeightFt === "number" && isFinite(config.roomHeightFt) && config.roomHeightFt > 0) ? config.roomHeightFt : 15;
 
   // ─── Hook ─────────────────────────────────────────────────────────────────
   const {
@@ -94,6 +142,49 @@ export default function TwoBeaconPositionScreen({ pdrStepCallbackRef, heading = 
       return next;
     });
   }, []);
+
+  // ─── Area Size Modal Handlers ─────────────────────────────────────────────
+  function handleOpenAreaModal(mode = "startTest") {
+    setAreaModalMode(mode);
+    setShowAreaModal(true);
+  }
+
+  function handleSaveAreaDimensions({ width, height, askEveryTime, autoStart }) {
+    const newW = Math.max(4, Math.min(150, width));
+    const newH = Math.max(4, Math.min(150, height));
+
+    // Clamp beacon placements if they were placed outside the new room
+    const clampedB1X = Math.min(newW, config.beacon1X ?? 0);
+    const clampedB1Y = Math.min(newH, config.beacon1Y ?? newH);
+    const clampedB2X = Math.min(newW, config.beacon2X ?? newW);
+    const clampedB2Y = Math.min(newH, config.beacon2Y ?? newH);
+
+    updateConfig({
+      roomWidthFt: newW,
+      roomHeightFt: newH,
+      askAreaBeforeTest: askEveryTime,
+      beacon1X: clampedB1X,
+      beacon1Y: clampedB1Y,
+      beacon2X: clampedB2X,
+      beacon2Y: clampedB2Y,
+    }, true);
+
+    setShowAreaModal(false);
+
+    if (autoStart) {
+      setTimeout(() => {
+        actions.startPositioning?.();
+      }, 150);
+    }
+  }
+
+  function handlePressStartTest() {
+    if (config.askAreaBeforeTest !== false) {
+      handleOpenAreaModal("startTest");
+    } else {
+      actions.startPositioning?.();
+    }
+  }
 
   // ─── Device list helpers ──────────────────────────────────────────────────
   const sortedDevices = Object.values(devices).sort((a, b) => (b.rssi ?? -999) - (a.rssi ?? -999));
@@ -152,7 +243,7 @@ export default function TwoBeaconPositionScreen({ pdrStepCallbackRef, heading = 
       <View style={styles.header}>
         <View>
           <Text style={styles.title}>2-Beacon Position Test</Text>
-          <Text style={styles.sub}>BLE ranging + PDR + Adaptive Kalman • 18 × 15 ft room</Text>
+          <Text style={styles.sub}>BLE ranging + PDR + Adaptive Kalman • {roomW} × {roomH} ft room</Text>
         </View>
         <Pressable style={styles.resetBtn} onPress={handleReset}>
           <Text style={styles.resetBtnText}>Reset</Text>
@@ -195,7 +286,8 @@ export default function TwoBeaconPositionScreen({ pdrStepCallbackRef, heading = 
           onBeacon2Commit={(x, y) => updateConfig({ beacon2X: x, beacon2Y: y }, true)}
           onApplyPreset={(p) => updateConfig(p, true)}
           onDragStateChange={setIsDraggingMap}
-          onResetLayout={() => updateConfig({ beacon1X: 0, beacon1Y: 15, beacon2X: 18, beacon2Y: 15 }, true)}
+          onResetLayout={() => updateConfig({ beacon1X: 0, beacon1Y: roomH, beacon2X: roomW, beacon2Y: roomH }, true)}
+          onOpenAreaModal={() => handleOpenAreaModal("editOnly")}
           heightCorrectionOn={config.heightCorrectionOn}
           onToggleHeight={(v) => updateConfig({ heightCorrectionOn: v }, true)}
           onUpdateHeight={(key, v) => updateConfig({ [key]: parseFloat(v) || 0 }, true)}
@@ -223,19 +315,34 @@ export default function TwoBeaconPositionScreen({ pdrStepCallbackRef, heading = 
           STAGE 4 — POSITION TEST
       ══════════════════════════════════════════════════ */}
       {activeStage === "position" && (
-        <PositionTestStage
-          config={config}
-          moduleState={moduleState}
-          positionState={positionState}
-          trail={trail}
-          heading={heading}
-          debugInfo={debugInfo}
-          showOverlays={showOverlays}
-          onToggleOverlays={() => setShowOverlays(v => !v)}
-          actions={actions}
-          onGoToPlace={() => setActiveStage("place")}
-        />
+        <TwoBeaconErrorBoundary onReset={() => actions.resetPosition?.()}>
+          <PositionTestStage
+            config={config}
+            moduleState={moduleState}
+            positionState={positionState}
+            trail={trail}
+            heading={heading}
+            debugInfo={debugInfo}
+            showOverlays={showOverlays}
+            onToggleOverlays={() => setShowOverlays(v => !v)}
+            actions={actions}
+            onGoToPlace={() => setActiveStage("place")}
+            onOpenAreaModal={() => handleOpenAreaModal("editOnly")}
+            onPressStart={handlePressStartTest}
+          />
+        </TwoBeaconErrorBoundary>
       )}
+
+      {/* ── Pre-Test / Edit Area Size Modal ── */}
+      <AreaSizeModal
+        visible={showAreaModal}
+        mode={areaModalMode}
+        currentWidth={roomW}
+        currentHeight={roomH}
+        askBeforeTest={config.askAreaBeforeTest !== false}
+        onSave={handleSaveAreaDimensions}
+        onClose={() => setShowAreaModal(false)}
+      />
     </ScrollView>
   );
 }
@@ -388,13 +495,24 @@ function DeviceCard({ device, isBeacon1, isBeacon2, onSetBeacon1, onSetBeacon2 }
   return (
     <View style={[styles.deviceCard, selected && styles.deviceCardSelected]}>
       <View style={{ flex: 1 }}>
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
           <Text style={styles.deviceName}>{device.name}</Text>
+          {device.beaconInfo?.isBeacon && <Tag label={device.beaconInfo.beaconType || "iBeacon"} color="#1a7f37" />}
           {isBeacon1 && <Tag label="B1" color="#0369a1" />}
           {isBeacon2 && <Tag label="B2" color="#6d28d9" />}
         </View>
-        <Text style={styles.deviceId} numberOfLines={1}>{device.id}</Text>
-        <View style={{ flexDirection: "row", gap: 10 }}>
+        <Text style={styles.deviceId} numberOfLines={1}>MAC: {device.id}</Text>
+        {device.beaconInfo?.uuid && (
+          <Text style={{ fontSize: 11, color: "#0969da", fontWeight: "600", marginTop: 1 }} numberOfLines={1}>
+            UUID: {device.beaconInfo.uuid}
+          </Text>
+        )}
+        {device.beaconInfo?.major !== null && device.beaconInfo?.major !== undefined && (
+          <Text style={{ fontSize: 11, color: "#57606a", marginTop: 1 }}>
+            Major: {device.beaconInfo.major} | Minor: {device.beaconInfo.minor} | Calibrated: {device.beaconInfo.calibratedTxPower} dBm
+          </Text>
+        )}
+        <View style={{ flexDirection: "row", gap: 10, marginTop: 2 }}>
           <Text style={[styles.deviceRssi, { color: qual }]}>{rssi} dBm</Text>
           <Text style={styles.deviceAge}>{ageSec}s ago</Text>
         </View>
@@ -434,11 +552,15 @@ function PlaceBeaconsStage({
   onApplyPreset,
   onDragStateChange,
   onResetLayout,
+  onOpenAreaModal,
   heightCorrectionOn,
   onToggleHeight,
   onUpdateHeight,
   onAdvance,
 }) {
+  const roomW = (typeof config.roomWidthFt === "number" && isFinite(config.roomWidthFt) && config.roomWidthFt > 0) ? config.roomWidthFt : 18;
+  const roomH = (typeof config.roomHeightFt === "number" && isFinite(config.roomHeightFt) && config.roomHeightFt > 0) ? config.roomHeightFt : 15;
+
   return (
     <>
       <View style={styles.card}>
@@ -452,6 +574,21 @@ function PlaceBeaconsStage({
           Drag B1 and B2 directly on the map, use Room Presets, or nudge with +/- steppers below.
         </Text>
 
+        {/* Room Area Size Card */}
+        <View style={styles.areaConfigCard}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.areaConfigTitle}>
+              📐 Room Dimensions: {roomW} × {roomH} ft
+            </Text>
+            <Text style={styles.areaConfigSub}>
+              {((roomW * 0.3048)).toFixed(1)} × {((roomH * 0.3048)).toFixed(1)} m • {(roomW * roomH).toFixed(0)} sq ft
+            </Text>
+          </View>
+          <Pressable style={styles.changeAreaBtn} onPress={onOpenAreaModal}>
+            <Text style={styles.changeAreaBtnText}>Change Size</Text>
+          </Pressable>
+        </View>
+
         {/* Room Presets */}
         <Text style={[styles.cardTitle, { fontSize: 12, marginTop: 4, marginBottom: 6 }]}>
           Room Layout Presets
@@ -459,27 +596,27 @@ function PlaceBeaconsStage({
         <View style={styles.presetRow}>
           <PresetChip
             label="Top Wall (Standard)"
-            sub="B1: (0, 15)  •  B2: (18, 15)"
-            active={config.beacon1X === 0 && config.beacon1Y === 15 && config.beacon2X === 18 && config.beacon2Y === 15}
-            onPress={() => onApplyPreset?.({ beacon1X: 0, beacon1Y: 15, beacon2X: 18, beacon2Y: 15 })}
+            sub={`B1: (0, ${roomH})  •  B2: (${roomW}, ${roomH})`}
+            active={config.beacon1X === 0 && config.beacon1Y === roomH && config.beacon2X === roomW && config.beacon2Y === roomH}
+            onPress={() => onApplyPreset?.({ beacon1X: 0, beacon1Y: roomH, beacon2X: roomW, beacon2Y: roomH })}
           />
           <PresetChip
             label="Diagonal Corners"
-            sub="B1: (0, 0)  •  B2: (18, 15)"
-            active={config.beacon1X === 0 && config.beacon1Y === 0 && config.beacon2X === 18 && config.beacon2Y === 15}
-            onPress={() => onApplyPreset?.({ beacon1X: 0, beacon1Y: 0, beacon2X: 18, beacon2Y: 15 })}
+            sub={`B1: (0, 0)  •  B2: (${roomW}, ${roomH})`}
+            active={config.beacon1X === 0 && config.beacon1Y === 0 && config.beacon2X === roomW && config.beacon2Y === roomH}
+            onPress={() => onApplyPreset?.({ beacon1X: 0, beacon1Y: 0, beacon2X: roomW, beacon2Y: roomH })}
           />
           <PresetChip
             label="Side Wall Centers"
-            sub="B1: (0, 7.5)  •  B2: (18, 7.5)"
-            active={config.beacon1X === 0 && config.beacon1Y === 7.5 && config.beacon2X === 18 && config.beacon2Y === 7.5}
-            onPress={() => onApplyPreset?.({ beacon1X: 0, beacon1Y: 7.5, beacon2X: 18, beacon2Y: 7.5 })}
+            sub={`B1: (0, ${(roomH / 2).toFixed(1)})  •  B2: (${roomW}, ${(roomH / 2).toFixed(1)})`}
+            active={config.beacon1X === 0 && Math.abs(config.beacon1Y - roomH / 2) < 0.2 && config.beacon2X === roomW && Math.abs(config.beacon2Y - roomH / 2) < 0.2}
+            onPress={() => onApplyPreset?.({ beacon1X: 0, beacon1Y: Number((roomH / 2).toFixed(2)), beacon2X: roomW, beacon2Y: Number((roomH / 2).toFixed(2)) })}
           />
           <PresetChip
             label="Front Wall"
-            sub="B1: (0, 0)  •  B2: (18, 0)"
-            active={config.beacon1X === 0 && config.beacon1Y === 0 && config.beacon2X === 18 && config.beacon2Y === 0}
-            onPress={() => onApplyPreset?.({ beacon1X: 0, beacon1Y: 0, beacon2X: 18, beacon2Y: 0 })}
+            sub={`B1: (0, 0)  •  B2: (${roomW}, 0)`}
+            active={config.beacon1X === 0 && config.beacon1Y === 0 && config.beacon2X === roomW && config.beacon2Y === 0}
+            onPress={() => onApplyPreset?.({ beacon1X: 0, beacon1Y: 0, beacon2X: roomW, beacon2Y: 0 })}
           />
         </View>
       </View>
@@ -487,7 +624,9 @@ function PlaceBeaconsStage({
       <TestAreaMap
         beacon1={{ x: config.beacon1X, y: config.beacon1Y }}
         beacon2={{ x: config.beacon2X, y: config.beacon2Y }}
-        userPosition={{ fusedX: 9, fusedY: 7.5 }}
+        userPosition={{ fusedX: roomW / 2, fusedY: roomH / 2 }}
+        roomWidthFt={roomW}
+        roomHeightFt={roomH}
         isSetupMode={true}
         showDebugOverlays={false}
         onBeacon1Move={onBeacon1Move}
@@ -508,14 +647,14 @@ function PlaceBeaconsStage({
         <CoordStepper
           axis="X"
           value={config.beacon1X}
-          max={18}
+          max={roomW}
           color="#0369a1"
           onChange={(v) => onBeacon1Commit(v, config.beacon1Y)}
         />
         <CoordStepper
           axis="Y"
           value={config.beacon1Y}
-          max={15}
+          max={roomH}
           color="#0369a1"
           onChange={(v) => onBeacon1Commit(config.beacon1X, v)}
         />
@@ -531,14 +670,14 @@ function PlaceBeaconsStage({
         <CoordStepper
           axis="X"
           value={config.beacon2X}
-          max={18}
+          max={roomW}
           color="#6d28d9"
           onChange={(v) => onBeacon2Commit(v, config.beacon2Y)}
         />
         <CoordStepper
           axis="Y"
           value={config.beacon2Y}
-          max={15}
+          max={roomH}
           color="#6d28d9"
           onChange={(v) => onBeacon2Commit(config.beacon2X, v)}
         />
@@ -695,13 +834,26 @@ function CalibrateStage({
 function PositionTestStage({
   config, moduleState, positionState, trail, heading, debugInfo,
   showOverlays, onToggleOverlays, actions, onGoToPlace,
+  onOpenAreaModal, onPressStart,
 }) {
+  const roomW = (typeof config.roomWidthFt === "number" && isFinite(config.roomWidthFt) && config.roomWidthFt > 0) ? config.roomWidthFt : 18;
+  const roomH = (typeof config.roomHeightFt === "number" && isFinite(config.roomHeightFt) && config.roomHeightFt > 0) ? config.roomHeightFt : 15;
+
   const isPositioning = moduleState === "POSITIONING";
   const isPaused      = moduleState === "PAUSED";
   const isStopped     = !isPositioning && !isPaused;
 
-  const { bleX = 9, bleY = 7.5, pdrX = 9, pdrY = 7.5,
-          fusedX = 9, fusedY = 7.5, activeX = 9, activeY = 7.5, confidence = 0 } = positionState || {};
+  const rawActiveX = positionState?.activeX ?? positionState?.fusedX ?? (roomW / 2);
+  const rawActiveY = positionState?.activeY ?? positionState?.fusedY ?? (roomH / 2);
+  const safeActiveX = (typeof rawActiveX === "number" && isFinite(rawActiveX)) ? rawActiveX : (roomW / 2);
+  const safeActiveY = (typeof rawActiveY === "number" && isFinite(rawActiveY)) ? rawActiveY : (roomH / 2);
+  const safeConf = (typeof positionState?.confidence === "number" && isFinite(positionState.confidence)) ? positionState.confidence : 0;
+  const safeBleX = (typeof positionState?.bleX === "number" && isFinite(positionState.bleX)) ? positionState.bleX : (roomW / 2);
+  const safeBleY = (typeof positionState?.bleY === "number" && isFinite(positionState.bleY)) ? positionState.bleY : (roomH / 2);
+  const safePdrX = (typeof positionState?.pdrX === "number" && isFinite(positionState.pdrX)) ? positionState.pdrX : (roomW / 2);
+  const safePdrY = (typeof positionState?.pdrY === "number" && isFinite(positionState.pdrY)) ? positionState.pdrY : (roomH / 2);
+  const safeFusedX = (typeof positionState?.fusedX === "number" && isFinite(positionState.fusedX)) ? positionState.fusedX : (roomW / 2);
+  const safeFusedY = (typeof positionState?.fusedY === "number" && isFinite(positionState.fusedY)) ? positionState.fusedY : (roomH / 2);
 
   const b1Available = debugInfo?.b1Available;
   const b2Available = debugInfo?.b2Available;
@@ -737,14 +889,27 @@ function PositionTestStage({
         </View>
       </View>
 
-      {/* Positioning Mode Switcher */}
+      {/* Test Area Status & Reconfiguration Row */}
+      <View style={styles.areaRow}>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+          <Text style={styles.areaRowLabel}>📐 Test Area:</Text>
+          <Text style={styles.areaRowValue}>
+            {roomW} × {roomH} ft ({((roomW * 0.3048)).toFixed(1)} × {((roomH * 0.3048)).toFixed(1)} m)
+          </Text>
+        </View>
+        <Pressable style={styles.areaChangeBtn} onPress={onOpenAreaModal}>
+          <Text style={styles.areaChangeBtnText}>Change Area</Text>
+        </Pressable>
+      </View>
+
+      {/* Positioning Mode Switcher (4 Modes) */}
       <View style={styles.modeContainer}>
         <Pressable
-          style={[styles.modeTab, mode === "fused" && styles.modeTabActive]}
-          onPress={() => actions.setPositioningMode?.("fused")}
+          style={[styles.modeTab, (mode === "kalman" || mode === "fused") && styles.modeTabActive]}
+          onPress={() => actions.setPositioningMode?.("kalman")}
         >
-          <Text style={[styles.modeTabText, mode === "fused" && styles.modeTabTextActive]}>
-            🛰️ Fused (BLE+PDR)
+          <Text style={[styles.modeTabText, (mode === "kalman" || mode === "fused") && styles.modeTabTextActive]}>
+            🛰️ Kalman
           </Text>
         </Pressable>
         <Pressable
@@ -763,6 +928,14 @@ function PositionTestStage({
             🚶 PDR Only
           </Text>
         </Pressable>
+        <Pressable
+          style={[styles.modeTab, mode === "complementary" && styles.modeTabActive]}
+          onPress={() => actions.setPositioningMode?.("complementary")}
+        >
+          <Text style={[styles.modeTabText, mode === "complementary" && styles.modeTabTextActive]}>
+            ⚖️ BLE+PDR
+          </Text>
+        </Pressable>
       </View>
 
       {/* Interactive Ground Truth Accuracy Card */}
@@ -771,7 +944,7 @@ function PositionTestStage({
           <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
             <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
               <View style={styles.gtDot} />
-              <Text style={styles.gtTitle}>Ground Truth Benchmark</Text>
+              <Text style={styles.gtTitle}>Ground Truth Benchmark ({mode.toUpperCase()})</Text>
             </View>
             <Pressable onPress={() => actions.setGroundTruth?.(null)} style={styles.gtClearBtn}>
               <Text style={styles.gtClearText}>Clear Target</Text>
@@ -781,20 +954,27 @@ function PositionTestStage({
           <View style={styles.gtStatsRow}>
             <View style={styles.gtStatItem}>
               <Text style={styles.gtStatLabel}>Target Point</Text>
-              <Text style={styles.gtStatVal}>({gt.x.toFixed(1)}, {gt.y.toFixed(1)}) ft</Text>
+              <Text style={styles.gtStatVal}>
+                ({(typeof gt.x === "number" && isFinite(gt.x)) ? gt.x.toFixed(1) : "—"}, {(typeof gt.y === "number" && isFinite(gt.y)) ? gt.y.toFixed(1) : "—"}) ft
+              </Text>
             </View>
             <View style={styles.gtStatItem}>
-              <Text style={styles.gtStatLabel}>Distance Error</Text>
-              <Text style={[styles.gtStatVal, { color: gtError < 2.0 ? "#16a34a" : gtError < 4.0 ? "#d97706" : "#dc2626" }]}>
-                {gtError != null ? `${gtError.toFixed(2)} ft` : "--"}
+              <Text style={styles.gtStatLabel}>Current Error</Text>
+              <Text style={[styles.gtStatVal, { color: (typeof gtError === "number" && isFinite(gtError)) ? (gtError < 2.0 ? "#16a34a" : gtError < 4.0 ? "#d97706" : "#dc2626") : "#57606a" }]}>
+                {(typeof gtError === "number" && isFinite(gtError)) ? `${gtError.toFixed(2)} ft` : "--"}
               </Text>
-              {gtError != null && <Text style={styles.gtStatSub}>({(gtError / 3.28084).toFixed(2)} m)</Text>}
+              {(typeof gtError === "number" && isFinite(gtError)) && <Text style={styles.gtStatSub}>({(gtError / 3.28084).toFixed(2)} m)</Text>}
             </View>
             <View style={styles.gtStatItem}>
-              <Text style={styles.gtStatLabel}>Accuracy Score</Text>
-              <Text style={[styles.gtStatVal, { color: accScore > 80 ? "#16a34a" : accScore > 60 ? "#d97706" : "#dc2626" }]}>
-                {accScore != null ? `${accScore}%` : "--"}
+              <Text style={styles.gtStatLabel}>MAE / RMSE</Text>
+              <Text style={[styles.gtStatVal, { fontSize: 12, color: "#1e293b" }]}>
+                {(typeof debugInfo?.benchmarkStats?.mae === "number" && isFinite(debugInfo.benchmarkStats.mae) && typeof debugInfo?.benchmarkStats?.rmse === "number" && isFinite(debugInfo.benchmarkStats.rmse))
+                  ? `${debugInfo.benchmarkStats.mae.toFixed(2)} / ${debugInfo.benchmarkStats.rmse.toFixed(2)} ft`
+                  : "--"}
               </Text>
+              {debugInfo?.benchmarkStats?.count > 0 && (
+                <Text style={styles.gtStatSub}>({debugInfo.benchmarkStats.count} pts)</Text>
+              )}
             </View>
           </View>
         </View>
@@ -802,11 +982,43 @@ function PositionTestStage({
 
       {/* Live position metrics */}
       <View style={styles.metricsRow}>
-        <MetricTile label="X Position" value={`${activeX.toFixed(2)} ft`} highlight sub={`${(activeX / 3.28084).toFixed(2)} m`} />
-        <MetricTile label="Y Position" value={`${activeY.toFixed(2)} ft`} highlight sub={`${(activeY / 3.28084).toFixed(2)} m`} />
-        <MetricTile label="Confidence" value={`${(confidence * 100).toFixed(0)}%`}
-          color={confidence > 0.6 ? "#1a7f37" : confidence > 0.3 ? "#d29922" : "#cf222e"}
+        <MetricTile label="X Position" value={`${safeActiveX.toFixed(2)} ft`} highlight sub={`${(safeActiveX / 3.28084).toFixed(2)} m`} />
+        <MetricTile label="Y Position" value={`${safeActiveY.toFixed(2)} ft`} highlight sub={`${(safeActiveY / 3.28084).toFixed(2)} m`} />
+        <MetricTile label="Confidence" value={`${(safeConf * 100).toFixed(0)}%`}
+          color={safeConf > 0.6 ? "#1a7f37" : safeConf > 0.3 ? "#d29922" : "#cf222e"}
           sub={debugInfo?.isStationary ? "Stationary" : "Active Motion"}
+        />
+      </View>
+
+      {/* Live PDR Metrics Row */}
+      <View style={styles.metricsRow}>
+        <MetricTile
+          label="PDR Steps"
+          value={String(positionState?.stepCount ?? 0)}
+          color="#15803d"
+          sub="Detected Steps"
+        />
+        <MetricTile
+          label="Step Length"
+          value={(() => {
+            const slM = (typeof positionState?.stepLength === "number" && isFinite(positionState.stepLength)) ? positionState.stepLength : 0.70;
+            return `${(slM * 3.28084).toFixed(2)} ft`;
+          })()}
+          color="#047857"
+          sub={(() => {
+            const slM = (typeof positionState?.stepLength === "number" && isFinite(positionState.stepLength)) ? positionState.stepLength : 0.70;
+            return `${slM.toFixed(2)} m (Weinberg)`;
+          })()}
+        />
+        <MetricTile
+          label="Heading"
+          value={(() => {
+            const hVal = (positionState?.heading ?? heading);
+            const safeH = (typeof hVal === "number" && isFinite(hVal)) ? hVal : 0;
+            return `${safeH.toFixed(0)}°`;
+          })()}
+          color="#0369a1"
+          sub={positionState?.cardinal || "North (N)"}
         />
       </View>
 
@@ -814,13 +1026,13 @@ function PositionTestStage({
       <View style={styles.metricsRow}>
         <MetricTile
           label={`Dist to B1 (${config.beacon1Name || "B1"})`}
-          value={debugInfo?.b1?.distanceFt != null ? `${debugInfo.b1.distanceFt.toFixed(1)} ft` : "Searching…"}
+          value={(typeof debugInfo?.b1?.distanceFt === "number" && isFinite(debugInfo.b1.distanceFt)) ? `${debugInfo.b1.distanceFt.toFixed(1)} ft` : "Searching…"}
           color="#0369a1"
           sub={debugInfo?.b1?.filteredRssi != null ? `${debugInfo.b1.filteredRssi} dBm` : undefined}
         />
         <MetricTile
           label={`Dist to B2 (${config.beacon2Name || "B2"})`}
-          value={debugInfo?.b2?.distanceFt != null ? `${debugInfo.b2.distanceFt.toFixed(1)} ft` : "Searching…"}
+          value={(typeof debugInfo?.b2?.distanceFt === "number" && isFinite(debugInfo.b2.distanceFt)) ? `${debugInfo.b2.distanceFt.toFixed(1)} ft` : "Searching…"}
           color="#6d28d9"
           sub={debugInfo?.b2?.filteredRssi != null ? `${debugInfo.b2.filteredRssi} dBm` : undefined}
         />
@@ -832,12 +1044,14 @@ function PositionTestStage({
         beacon2={{ x: config.beacon2X, y: config.beacon2Y }}
         beacon1Dist={debugInfo?.b1?.distanceFt}
         beacon2Dist={debugInfo?.b2?.distanceFt}
-        userPosition={{ fusedX, fusedY, activeX, activeY }}
-        blePosition={showOverlays ? { bleX, bleY } : null}
-        pdrPosition={showOverlays ? { pdrX, pdrY } : null}
+        userPosition={{ fusedX: safeFusedX, fusedY: safeFusedY, activeX: safeActiveX, activeY: safeActiveY }}
+        blePosition={showOverlays ? { bleX: safeBleX, bleY: safeBleY } : null}
+        pdrPosition={showOverlays ? { pdrX: safePdrX, pdrY: safePdrY } : null}
         trail={trail}
         heading={heading}
         groundTruth={gt}
+        roomWidthFt={roomW}
+        roomHeightFt={roomH}
         isSetupMode={false}
         showDebugOverlays={showOverlays}
         onBeacon1Move={() => {}}
@@ -852,7 +1066,7 @@ function PositionTestStage({
         {isStopped && (
           <ActionBtn
             label="▶ Start Position Test"
-            onPress={actions.startPositioning}
+            onPress={onPressStart}
             style={styles.btnGreen}
           />
         )}
@@ -875,15 +1089,31 @@ function PositionTestStage({
           style={[styles.btnOutline, { borderColor: "#1f6feb", backgroundColor: "#f0f8ff" }]}
         />
         <ActionBtn
-          label="↺ Reset to Center"
-          onPress={() => { actions.resetPosition?.(9, 7.5); actions.resetPipelines?.(); }}
+          label="↺ Reset Position"
+          onPress={() => { actions.resetPosition?.(); actions.resetPipelines?.(); }}
           style={styles.btnOutline}
         />
         <ActionBtn label="✕ Clear Trail" onPress={actions.clearTrail} style={styles.btnOutline} />
       </View>
 
+      {/* Export & Placement Controls */}
       <View style={styles.controlRow}>
-        <ActionBtn label="✎ Edit Beacon Placement" onPress={onGoToPlace} style={styles.btnOutline} />
+        <ActionBtn
+          label={`📥 Export Trajectory (${debugInfo?.trajectoryCount || 0} pts)`}
+          onPress={() => {
+            Alert.alert(
+              "Export Trajectory Data",
+              "Choose format to export recorded telemetry points:",
+              [
+                { text: "Cancel", style: "cancel" },
+                { text: "CSV (.csv)", onPress: actions.exportTrajectoryCsv },
+                { text: "JSON (.json)", onPress: actions.exportTrajectoryJson },
+              ]
+            );
+          }}
+          style={[styles.btnOutline, { borderColor: "#059669", backgroundColor: "#ecfdf5" }]}
+        />
+        <ActionBtn label="✎ Edit Beacons" onPress={onGoToPlace} style={styles.btnOutline} />
       </View>
 
       {/* Debug panel */}
@@ -1091,4 +1321,405 @@ const styles = StyleSheet.create({
 
   // Scan status dot
   scanDot: { width: 8, height: 8, borderRadius: 4 },
+
+  // Area config & status badges
+  areaConfigCard: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", backgroundColor: "#f0f6fc", padding: 10, borderRadius: 8, borderWidth: 1, borderColor: "#c8e1ff", marginBottom: 10 },
+  areaConfigTitle: { fontSize: 13, fontWeight: "700", color: "#0969da" },
+  areaConfigSub: { fontSize: 11, color: "#57606a", marginTop: 2 },
+  changeAreaBtn: { backgroundColor: "#0969da", paddingVertical: 6, paddingHorizontal: 12, borderRadius: 6 },
+  changeAreaBtnText: { color: "#ffffff", fontWeight: "700", fontSize: 12 },
+
+  areaRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", backgroundColor: "#eff6ff", borderWidth: 1, borderColor: "#bfdbfe", borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8, marginBottom: 10 },
+  areaRowLabel: { fontSize: 12, fontWeight: "700", color: "#1d4ed8" },
+  areaRowValue: { fontSize: 12, fontWeight: "600", color: "#1e40af" },
+  areaChangeBtn: { paddingVertical: 3, paddingHorizontal: 8, borderRadius: 5, backgroundColor: "#ffffff", borderWidth: 1, borderColor: "#93c5fd" },
+  areaChangeBtnText: { fontSize: 11, fontWeight: "700", color: "#1d4ed8" },
+});
+
+// ============================================================================
+// Area Size Modal Component (Prompt before testing or on-demand editing)
+// ============================================================================
+function AreaSizeModal({
+  visible,
+  mode = "startTest",
+  currentWidth = 18,
+  currentHeight = 15,
+  askBeforeTest = true,
+  onSave,
+  onClose,
+}) {
+  const [width, setWidth] = useState(String(currentWidth));
+  const [height, setHeight] = useState(String(currentHeight));
+  const [askEveryTime, setAskEveryTime] = useState(askBeforeTest);
+
+  useEffect(() => {
+    if (visible) {
+      setWidth(String(currentWidth));
+      setHeight(String(currentHeight));
+      setAskEveryTime(askBeforeTest);
+    }
+  }, [visible, currentWidth, currentHeight, askBeforeTest]);
+
+  const numW = parseFloat(width) || currentWidth;
+  const numH = parseFloat(height) || currentHeight;
+  const widthM = (numW * 0.3048).toFixed(2);
+  const heightM = (numH * 0.3048).toFixed(2);
+
+  const presets = [
+    { label: "18 × 15 ft (Standard)", w: 18, h: 15 },
+    { label: "20 × 20 ft (Square)",   w: 20, h: 20 },
+    { label: "30 × 20 ft (Large)",    w: 30, h: 20 },
+    { label: "15 × 10 ft (Small)",    w: 15, h: 10 },
+    { label: "10 × 10 ft (Compact)",  w: 10, h: 10 },
+  ];
+
+  function applyPreset(p) {
+    setWidth(String(p.w));
+    setHeight(String(p.h));
+  }
+
+  function handleConfirm() {
+    const parsedW = parseFloat(width);
+    const parsedH = parseFloat(height);
+    if (!parsedW || isNaN(parsedW) || parsedW < 4 || parsedW > 150) {
+      Alert.alert("Invalid Width", "Please enter a valid room width between 4 and 150 feet.");
+      return;
+    }
+    if (!parsedH || isNaN(parsedH) || parsedH < 4 || parsedH > 150) {
+      Alert.alert("Invalid Height", "Please enter a valid room height between 4 and 150 feet.");
+      return;
+    }
+    onSave({
+      width: Number(parsedW.toFixed(1)),
+      height: Number(parsedH.toFixed(1)),
+      askEveryTime,
+      autoStart: mode === "startTest",
+    });
+  }
+
+  return (
+    <Modal visible={visible} animationType="fade" transparent onRequestClose={onClose}>
+      <View style={modalStyles.backdrop}>
+        <View style={modalStyles.dialog}>
+          {/* Dialog Header */}
+          <View style={modalStyles.headerRow}>
+            <View style={{ flex: 1, paddingRight: 8 }}>
+              <Text style={modalStyles.title}>
+                {mode === "startTest" ? "🚀 Start Position Test" : "📐 Configure Room Area"}
+              </Text>
+              <Text style={modalStyles.subtitle}>
+                {mode === "startTest"
+                  ? "Confirm your test room dimensions before starting:"
+                  : "Set test room width & height for mapping and scaling:"}
+              </Text>
+            </View>
+            <Pressable onPress={onClose} hitSlop={10}>
+              <Text style={modalStyles.closeIcon}>✕</Text>
+            </Pressable>
+          </View>
+
+          {/* Quick Presets */}
+          <Text style={modalStyles.sectionTitle}>Quick Area Presets</Text>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={modalStyles.presetsRow}>
+            {presets.map(p => {
+              const isActive = Math.abs(numW - p.w) < 0.1 && Math.abs(numH - p.h) < 0.1;
+              return (
+                <Pressable
+                  key={p.label}
+                  style={[modalStyles.presetChip, isActive && modalStyles.presetChipActive]}
+                  onPress={() => applyPreset(p)}
+                >
+                  <Text style={[modalStyles.presetChipText, isActive && modalStyles.presetChipTextActive]}>
+                    {p.label}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </ScrollView>
+
+          {/* Width & Height Steppers / Inputs */}
+          <View style={modalStyles.inputsGrid}>
+            <View style={modalStyles.inputBlock}>
+              <Text style={modalStyles.inputLabel}>Room Width (X)</Text>
+              <View style={modalStyles.stepperRow}>
+                <Pressable
+                  style={modalStyles.stepBtn}
+                  onPress={() => setWidth(String(Math.max(4, Number((numW - 1).toFixed(1)))))}
+                >
+                  <Text style={modalStyles.stepBtnText}>−</Text>
+                </Pressable>
+                <TextInput
+                  style={modalStyles.textInput}
+                  value={width}
+                  onChangeText={setWidth}
+                  keyboardType="numeric"
+                  returnKeyType="done"
+                />
+                <Text style={modalStyles.unitText}>ft</Text>
+                <Pressable
+                  style={modalStyles.stepBtn}
+                  onPress={() => setWidth(String(Math.min(150, Number((numW + 1).toFixed(1)))))}
+                >
+                  <Text style={modalStyles.stepBtnText}>+</Text>
+                </Pressable>
+              </View>
+            </View>
+
+            <View style={modalStyles.inputBlock}>
+              <Text style={modalStyles.inputLabel}>Room Height (Y)</Text>
+              <View style={modalStyles.stepperRow}>
+                <Pressable
+                  style={modalStyles.stepBtn}
+                  onPress={() => setHeight(String(Math.max(4, Number((numH - 1).toFixed(1)))))}
+                >
+                  <Text style={modalStyles.stepBtnText}>−</Text>
+                </Pressable>
+                <TextInput
+                  style={modalStyles.textInput}
+                  value={height}
+                  onChangeText={setHeight}
+                  keyboardType="numeric"
+                  returnKeyType="done"
+                />
+                <Text style={modalStyles.unitText}>ft</Text>
+                <Pressable
+                  style={modalStyles.stepBtn}
+                  onPress={() => setHeight(String(Math.min(150, Number((numH + 1).toFixed(1)))))}
+                >
+                  <Text style={modalStyles.stepBtnText}>+</Text>
+                </Pressable>
+              </View>
+            </View>
+          </View>
+
+          {/* Metric conversion pill */}
+          <View style={modalStyles.metricBanner}>
+            <Text style={modalStyles.metricText}>
+              📐 Metric: <Text style={{ fontWeight: "700" }}>{widthM} m × {heightM} m</Text> ({(numW * numH).toFixed(0)} sq ft / {(numW * numH * 0.0929).toFixed(1)} m²)
+            </Text>
+          </View>
+
+          {/* Ask every time switch */}
+          <View style={modalStyles.switchRow}>
+            <View style={{ flex: 1, marginRight: 8 }}>
+              <Text style={modalStyles.switchTitle}>Ask size before starting test</Text>
+              <Text style={modalStyles.switchSub}>Prompt to confirm dimensions each time you start</Text>
+            </View>
+            <Switch
+              value={askEveryTime}
+              onValueChange={setAskEveryTime}
+              trackColor={{ false: "#d0d7de", true: "#54aeff" }}
+              thumbColor="#ffffff"
+            />
+          </View>
+
+          {/* Action buttons */}
+          <View style={modalStyles.actionsRow}>
+            <Pressable style={modalStyles.cancelBtn} onPress={onClose}>
+              <Text style={modalStyles.cancelBtnText}>Cancel</Text>
+            </Pressable>
+            <Pressable style={modalStyles.confirmBtn} onPress={handleConfirm}>
+              <Text style={modalStyles.confirmBtnText}>
+                {mode === "startTest" ? "▶ Confirm & Start Test" : "✓ Save Dimensions"}
+              </Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+const modalStyles = StyleSheet.create({
+  backdrop: {
+    flex: 1,
+    backgroundColor: "rgba(15, 23, 42, 0.65)",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 18,
+  },
+  dialog: {
+    backgroundColor: "#ffffff",
+    borderRadius: 16,
+    width: "100%",
+    maxWidth: 420,
+    padding: 20,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.25,
+    shadowRadius: 16,
+    elevation: 10,
+  },
+  headerRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    marginBottom: 14,
+  },
+  title: {
+    fontSize: 17,
+    fontWeight: "700",
+    color: "#0f172a",
+  },
+  subtitle: {
+    fontSize: 12,
+    color: "#64748b",
+    marginTop: 3,
+    lineHeight: 16,
+  },
+  closeIcon: {
+    fontSize: 18,
+    color: "#94a3b8",
+    padding: 4,
+  },
+  sectionTitle: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#475569",
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+    marginBottom: 8,
+  },
+  presetsRow: {
+    gap: 8,
+    paddingBottom: 14,
+  },
+  presetChip: {
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 8,
+    backgroundColor: "#f1f5f9",
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+  },
+  presetChipActive: {
+    backgroundColor: "#eff6ff",
+    borderColor: "#3b82f6",
+  },
+  presetChipText: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#334155",
+  },
+  presetChipTextActive: {
+    color: "#1d4ed8",
+    fontWeight: "700",
+  },
+  inputsGrid: {
+    flexDirection: "row",
+    gap: 12,
+    marginBottom: 12,
+  },
+  inputBlock: {
+    flex: 1,
+  },
+  inputLabel: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#334155",
+    marginBottom: 6,
+  },
+  stepperRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#f8fafc",
+    borderWidth: 1,
+    borderColor: "#cbd5e1",
+    borderRadius: 8,
+    paddingHorizontal: 4,
+    height: 42,
+  },
+  stepBtn: {
+    width: 32,
+    height: 32,
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: "#e2e8f0",
+    borderRadius: 6,
+  },
+  stepBtnText: {
+    fontSize: 18,
+    fontWeight: "700",
+    color: "#1e293b",
+    lineHeight: 20,
+  },
+  textInput: {
+    flex: 1,
+    textAlign: "center",
+    fontSize: 15,
+    fontWeight: "700",
+    color: "#0f172a",
+    paddingVertical: 0,
+  },
+  unitText: {
+    fontSize: 12,
+    color: "#64748b",
+    fontWeight: "600",
+    marginRight: 4,
+  },
+  metricBanner: {
+    backgroundColor: "#f0fdf4",
+    borderWidth: 1,
+    borderColor: "#bbf7d0",
+    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    marginBottom: 14,
+  },
+  metricText: {
+    fontSize: 12,
+    color: "#15803d",
+    textAlign: "center",
+  },
+  switchRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingVertical: 10,
+    borderTopWidth: 1,
+    borderTopColor: "#f1f5f9",
+    marginBottom: 16,
+  },
+  switchTitle: {
+    fontSize: 13,
+    fontWeight: "600",
+    color: "#1e293b",
+  },
+  switchSub: {
+    fontSize: 11,
+    color: "#64748b",
+    marginTop: 1,
+  },
+  actionsRow: {
+    flexDirection: "row",
+    gap: 10,
+  },
+  cancelBtn: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#cbd5e1",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#ffffff",
+  },
+  cancelBtnText: {
+    fontSize: 13,
+    fontWeight: "600",
+    color: "#475569",
+  },
+  confirmBtn: {
+    flex: 2,
+    paddingVertical: 12,
+    borderRadius: 8,
+    backgroundColor: "#1f6feb",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  confirmBtnText: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#ffffff",
+  },
 });

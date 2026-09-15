@@ -93,6 +93,102 @@ export function getBleManager() {
   return bleManagerInstance;
 }
 
+/**
+ * Helper to decode base64 string to a raw byte array
+ */
+export function base64ToBytes(base64) {
+  if (!base64 || typeof base64 !== "string") return [];
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+  let bytes = [];
+  let str = base64.replace(/=+$/, "");
+  for (
+    let bc = 0, bs = 0, buffer, idx = 0;
+    (buffer = str.charAt(idx++));
+    ~buffer && ((bs = bc % 4 ? bs * 64 + buffer : buffer), bc++ % 4)
+      ? bytes.push(255 & (bs >> ((-2 * bc) & 6)))
+      : 0
+  ) {
+    buffer = chars.indexOf(buffer);
+  }
+  return bytes;
+}
+
+/**
+ * Parses Apple iBeacon and Eddystone advertising packets from BLE payload
+ */
+export function parseBeaconPayload(manufacturerDataBase64, serviceData, localName) {
+  const result = {
+    isBeacon: false,
+    beaconType: null, // "iBeacon" | "Eddystone"
+    uuid: null,
+    major: null,
+    minor: null,
+    calibratedTxPower: null,
+    displayName: localName || null,
+  };
+
+  if (manufacturerDataBase64) {
+    try {
+      const bytes = base64ToBytes(manufacturerDataBase64);
+
+      // Standard Apple iBeacon: Length >= 25, starts with 0x4C 0x00 0x02 0x15
+      if (bytes.length >= 25 && bytes[0] === 0x4c && bytes[1] === 0x00 && bytes[2] === 0x02 && bytes[3] === 0x15) {
+        let hex = [];
+        for (let i = 0; i < 16; i++) {
+          hex.push((bytes[4 + i] || 0).toString(16).padStart(2, "0").toUpperCase());
+        }
+        const uuid = `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`;
+        const major = ((bytes[20] || 0) << 8) | (bytes[21] || 0);
+        const minor = ((bytes[22] || 0) << 8) | (bytes[23] || 0);
+        const rawTx = bytes[24] !== undefined ? bytes[24] : 197;
+        const tx = rawTx < 128 ? rawTx : rawTx - 256;
+
+        result.isBeacon = true;
+        result.beaconType = "iBeacon";
+        result.uuid = uuid;
+        result.major = major;
+        result.minor = minor;
+        result.calibratedTxPower = tx;
+        result.displayName = localName || `iBeacon (M:${major} m:${minor})`;
+      } else if (bytes.length >= 23 && bytes[0] === 0x02 && bytes[1] === 0x15) {
+        // iBeacon without Company ID: starts with 0x02 0x15
+        let hex = [];
+        for (let i = 0; i < 16; i++) {
+          hex.push((bytes[2 + i] || 0).toString(16).padStart(2, "0").toUpperCase());
+        }
+        const uuid = `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`;
+        const major = ((bytes[18] || 0) << 8) | (bytes[19] || 0);
+        const minor = ((bytes[20] || 0) << 8) | (bytes[21] || 0);
+        const rawTx = bytes[22] !== undefined ? bytes[22] : 197;
+        const tx = rawTx < 128 ? rawTx : rawTx - 256;
+
+        result.isBeacon = true;
+        result.beaconType = "iBeacon";
+        result.uuid = uuid;
+        result.major = major;
+        result.minor = minor;
+        result.calibratedTxPower = tx;
+        result.displayName = localName || `iBeacon (M:${major} m:${minor})`;
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  // Check Eddystone via serviceData
+  if (!result.isBeacon && serviceData && typeof serviceData === "object") {
+    const keys = Object.keys(serviceData);
+    const eddystoneKey = keys.find((k) => k.toLowerCase().includes("feaa"));
+    if (eddystoneKey) {
+      result.isBeacon = true;
+      result.beaconType = "Eddystone";
+      result.displayName = localName || "Eddystone Beacon";
+    }
+  }
+
+  return result;
+}
+
 // ============================================================================
 // LOW-PASS & ONE-EURO FILTER IMPLEMENTATION
 // Reference: Casiez et al., "1€ Filter: A Simple Speed-based Low-pass Filter for Noisy Input"
@@ -233,8 +329,8 @@ export class DeviceDistanceTracker {
   addPacket(rawRssi, timestamp = Date.now()) {
     if (typeof rawRssi !== "number" || isNaN(rawRssi)) return;
 
-    // Gated outlier rejection for impossible BLE RSSI values
-    if (rawRssi < -105 || rawRssi > -15) return;
+    // Gated outlier rejection for impossible BLE RSSI values (close contact can reach -8 to -14 dBm)
+    if (rawRssi < -105 || rawRssi > -5) return;
 
     this.rawRssi = rawRssi;
     this.lastPacketTime = timestamp;
@@ -517,28 +613,51 @@ export async function requestBluetoothPermissions() {
 
     // Android 12+ (API level 31+)
     if (apiLevel >= 31) {
-      const granted = await PermissionsAndroid.requestMultiple([
-        PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
-        PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
-        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-      ]);
+      try {
+        const scanCheck = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN);
+        const connectCheck = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT);
+        const fineCheck = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION);
+        const coarseCheck = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION);
 
-      const scanGranted = granted[PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN] === PermissionsAndroid.RESULTS.GRANTED;
-      const connectGranted = granted[PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT] === PermissionsAndroid.RESULTS.GRANTED;
-      const locationGranted = granted[PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION] === PermissionsAndroid.RESULTS.GRANTED;
+        if (scanCheck && connectCheck && (fineCheck || coarseCheck)) {
+          return true;
+        }
 
-      return scanGranted && connectGranted && locationGranted;
+        const granted = await PermissionsAndroid.requestMultiple([
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+        ]);
+
+        const scanGranted = granted[PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN] === PermissionsAndroid.RESULTS.GRANTED || scanCheck;
+        const connectGranted = granted[PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT] === PermissionsAndroid.RESULTS.GRANTED || connectCheck;
+        const locationGranted = granted[PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION] === PermissionsAndroid.RESULTS.GRANTED || fineCheck || coarseCheck;
+
+        return scanGranted && connectGranted && locationGranted;
+      } catch (e) {
+        console.warn("Permission check error:", e);
+        return false;
+      }
     } else {
       // Android < 12 requires Location permission to scan for BLE beacons
-      const granted = await PermissionsAndroid.requestMultiple([
-        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-        PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION,
-      ]);
+      try {
+        const fineCheck = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION);
+        const coarseCheck = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION);
+        if (fineCheck || coarseCheck) return true;
 
-      const fineGranted = granted[PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION] === PermissionsAndroid.RESULTS.GRANTED;
-      const coarseGranted = granted[PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION] === PermissionsAndroid.RESULTS.GRANTED;
+        const granted = await PermissionsAndroid.requestMultiple([
+          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+          PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION,
+        ]);
 
-      return fineGranted || coarseGranted;
+        const fineGranted = granted[PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION] === PermissionsAndroid.RESULTS.GRANTED;
+        const coarseGranted = granted[PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION] === PermissionsAndroid.RESULTS.GRANTED;
+
+        return fineGranted || coarseGranted;
+      } catch (e) {
+        console.warn("Permission check error:", e);
+        return false;
+      }
     }
   }
 
@@ -553,7 +672,29 @@ export async function ensureBluetoothEnabled() {
   const manager = getBleManager();
   if (!manager) return false;
   try {
-    const state = await manager.state();
+    let state = await manager.state();
+
+    // If adapter is starting up, wait up to 1.5s for state to settle
+    if (state === "Unknown" || state === "Resetting") {
+      state = await new Promise((resolve) => {
+        let resolved = false;
+        const sub = manager.onStateChange((newState) => {
+          if (newState !== "Unknown" && newState !== "Resetting" && !resolved) {
+            resolved = true;
+            sub?.remove?.();
+            resolve(newState);
+          }
+        }, true);
+        setTimeout(() => {
+          if (!resolved) {
+            resolved = true;
+            sub?.remove?.();
+            resolve(state);
+          }
+        }, 1500);
+      });
+    }
+
     if (state === "PoweredOff") {
       return new Promise((resolve) => {
         Alert.alert(

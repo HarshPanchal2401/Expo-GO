@@ -13,6 +13,7 @@ import Svg, { Polyline, Circle, Line, Polygon, Text as SvgText, Rect } from "rea
 import { Pedometer, DeviceMotion, Accelerometer, Magnetometer } from "expo-sensors";
 import { getSavedPaths, savePath, deleteSavedPath, clearAllSavedPaths } from "./PathStorage.js";
 import BleScannerSection from "./components/BleScannerSection.js";
+import TwoBeaconPositionScreen from "./components/TwoBeaconPositionScreen.js";
 import OtaUpdateCard from "./components/OtaUpdateCard.js";
 import AppSettingsScreen from "./components/AppSettingsScreen.js";
 import { getAppSettings, subscribeAppSettings } from "./services/appSettingsStorage.js";
@@ -71,6 +72,7 @@ export default function AppIOS() {
   const lastStepTimeRef = useRef(0);
   const gravityRef = useRef(1.0);
   const hasMotionRotationRef = useRef(false);
+  const pdrStepCallbackRef = useRef(null);
 
   // Robust Peak-Valley Step Detector State Machine
   const stepStateRef = useRef({
@@ -130,6 +132,11 @@ export default function AppIOS() {
       console.log(`[iOS Dynamic PDR Step #${nextCount}] Dynamic SL: ${len.toFixed(2)}m (Bounce: ${bounceAmp.toFixed(2)}g) | Heading: ${curHeading.toFixed(1)}° | Pos: (${next.x}, ${next.y})`);
       return nextCount;
     });
+
+    // Feed step into 2-beacon module if it is listening
+    if (pdrStepCallbackRef.current) {
+      pdrStepCallbackRef.current({ stepLengthMeters: len, heading: curHeading });
+    }
   };
 
   // --------------------------------------------------------------------------
@@ -204,7 +211,7 @@ export default function AppIOS() {
         // 3. High-Precision Accelerometer Step Detector with Energy Gate & Peak-Valley State Machine
         Accelerometer.setUpdateInterval(30);
         accelSub = Accelerometer.addListener(data => {
-          if (!runningRef.current) return;
+          if (!runningRef.current && !pdrStepCallbackRef.current) return;
           const { x, y, z } = data;
           const rawMag = Math.sqrt(x * x + y * y + z * z);
 
@@ -292,7 +299,7 @@ export default function AppIOS() {
         // 4. Native Hardware Pedometer Fusion (Sensor Hub backup)
         let lastPedometerTotal = null;
         pedSub = Pedometer.watchStepCount(result => {
-          if (!runningRef.current) return;
+          if (!runningRef.current && !pdrStepCallbackRef.current) return;
           if (!result || typeof result.steps !== "number") return;
 
           if (lastPedometerTotal === null) {
@@ -480,6 +487,14 @@ export default function AppIOS() {
             </Text>
           </Pressable>
           <Pressable
+            onPress={() => setActiveTab("beacon")}
+            style={[s.tabBtn, activeTab === "beacon" && s.tabBtnActive]}
+          >
+            <Text style={[s.tabBtnText, activeTab === "beacon" && s.tabBtnTextActive]}>
+              🛰️ 2-Beacon
+            </Text>
+          </Pressable>
+          <Pressable
             onPress={() => setActiveTab("settings")}
             style={[s.tabBtn, activeTab === "settings" && s.tabBtnActive]}
           >
@@ -491,6 +506,8 @@ export default function AppIOS() {
 
         {activeTab === "settings" ? (
           <AppSettingsScreen />
+        ) : activeTab === "beacon" ? (
+          <TwoBeaconPositionScreen pdrStepCallbackRef={pdrStepCallbackRef} heading={heading} />
         ) : activeTab === "ble" ? (
           <BleScannerSection />
         ) : (

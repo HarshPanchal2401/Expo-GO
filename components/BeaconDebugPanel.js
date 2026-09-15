@@ -1,5 +1,5 @@
 // ============================================================================
-// BeaconDebugPanel — Live positioning debug info
+// BeaconDebugPanel — Live R&D Diagnostics & Sensor Fusion Telemetry
 // ============================================================================
 
 import React, { useState } from "react";
@@ -25,32 +25,48 @@ export default function BeaconDebugPanel({
   const [expanded,    setExpanded]    = useState(true);
   const [unit,        setUnit]        = useState("ft"); // "ft" | "m" | "in"
 
-  const { b1 = {}, b2 = {},
+  const {
+    b1 = {}, b2 = {},
     bleX = 0, bleY = 0,
     pdrX = 0, pdrY = 0,
     fusedX = 0, fusedY = 0,
     confidence = 0,
+    bleAccepted = true,
+    bleResidual = 0,
+    kalmanGain = 0.5,
+    stepCount = 0,
+    stepLength = 0.70,
+    heading = 0,
+    cardinal = "North (N)",
+    isStationary = false,
+    positioningMode = "kalman",
     b1Available = false, b2Available = false,
+    gtErrorFt = null,
+    bleErrorFt = null,
+    pdrErrorFt = null,
+    fusedErrorFt = null,
+    benchmarkStats = null,
+    trajectoryCount = 0,
   } = debugInfo || {};
-
-  const errorFt = (groundTruth.x !== null && groundTruth.y !== null)
-    ? Math.hypot(fusedX - groundTruth.x, fusedY - groundTruth.y).toFixed(2)
-    : null;
 
   function applyGroundTruth() {
     const x = parseFloat(gtXInput);
     const y = parseFloat(gtYInput);
-    if (isFinite(x) && isFinite(y)) setGroundTruth({ x, y });
+    if (isFinite(x) && isFinite(y)) {
+      setGroundTruth({ x, y });
+    }
   }
 
-  const confPct = (confidence * 100).toFixed(0);
+  const confPct = ((Number(confidence) || 0) * 100).toFixed(0);
   const confColor = confidence > 0.65 ? "#1a7f37" : confidence > 0.35 ? "#d29922" : "#cf222e";
 
   function formatCoord(feetVal) {
     if (feetVal === null || feetVal === undefined || isNaN(feetVal)) return "—";
-    if (unit === "m") return `${(feetVal * 0.3048).toFixed(2)}m`;
-    if (unit === "in") return `${(feetVal * 12).toFixed(1)}in`;
-    return `${feetVal.toFixed(2)}ft`;
+    const num = Number(feetVal);
+    if (!isFinite(num)) return "—";
+    if (unit === "m") return `${(num * 0.3048).toFixed(2)}m`;
+    if (unit === "in") return `${(num * 12).toFixed(1)}in`;
+    return `${num.toFixed(2)}ft`;
   }
 
   return (
@@ -58,7 +74,7 @@ export default function BeaconDebugPanel({
       {/* Header with Unit Selector */}
       <View style={styles.headerRow}>
         <Pressable onPress={() => setExpanded(e => !e)} style={{ flexDirection: "row", alignItems: "center", gap: 6, flex: 1 }}>
-          <Text style={styles.title}>🔍 Live Debug Panel</Text>
+          <Text style={styles.title}>🔬 R&D Fusion Diagnostics</Text>
           <Text style={styles.chevron}>{expanded ? "▲" : "▼"}</Text>
         </Pressable>
 
@@ -84,6 +100,11 @@ export default function BeaconDebugPanel({
 
       {expanded && (
         <>
+          {/* ════════════════════════════════════════════════════
+              SECTION 1 — BLE SUBSYSTEM & BEACONS
+          ════════════════════════════════════════════════════ */}
+          <Text style={styles.subSectionTitle}>📶 BLE SUBSYSTEM & MEASUREMENTS</Text>
+
           {/* Beacon 1 */}
           <BeaconRow
             label={`B1 — ${beacon1Name || "Beacon 1"}`}
@@ -108,40 +129,125 @@ export default function BeaconDebugPanel({
             unit={unit}
           />
 
-          {/* Position table */}
-          <View style={styles.posTable}>
-            <View style={styles.posRow}>
-              <Text style={styles.posLabel}>BLE Position</Text>
-              <Text style={styles.posValue}>
-                X: {formatCoord(bleX)}  Y: {formatCoord(bleY)}
-              </Text>
-            </View>
-            <View style={styles.posRow}>
-              <Text style={styles.posLabel}>PDR Position</Text>
-              <Text style={styles.posValue}>
-                X: {formatCoord(pdrX)}  Y: {formatCoord(pdrY)}
-              </Text>
-            </View>
-            <View style={[styles.posRow, { borderBottomWidth: 0 }]}>
-              <Text style={[styles.posLabel, { fontWeight: "800", color: "#1d4ed8" }]}>Fused Position</Text>
-              <Text style={[styles.posValue, { fontWeight: "800", color: "#1d4ed8" }]}>
-                X: {formatCoord(fusedX)}  Y: {formatCoord(fusedY)}
-              </Text>
-            </View>
+          {/* BLE Diagnostics Block */}
+          <View style={styles.diagGrid}>
+            <DiagItem
+              label="BLE Position"
+              value={`(${formatCoord(bleX)}, ${formatCoord(bleY)})`}
+              color="#0369a1"
+            />
+            <DiagItem
+              label="BLE Innovation Residual"
+              value={`${formatCoord(bleResidual)}`}
+              color={bleResidual > 6.0 ? "#cf222e" : "#1e293b"}
+            />
+            <DiagItem
+              label="BLE Measurement Status"
+              value={bleAccepted ? "ACCEPTED ✓" : "REJECTED (Outlier) ✗"}
+              color={bleAccepted ? "#1a7f37" : "#cf222e"}
+            />
+            <DiagItem
+              label="Confidence Score"
+              value={`${confPct}%`}
+              color={confColor}
+            />
           </View>
 
           {/* Confidence bar */}
           <View style={styles.confRow}>
-            <Text style={styles.confLabel}>Confidence</Text>
+            <Text style={styles.confLabel}>BLE Confidence</Text>
             <View style={styles.confTrack}>
               <View style={[styles.confFill, { width: `${confPct}%`, backgroundColor: confColor }]} />
             </View>
             <Text style={[styles.confPct, { color: confColor }]}>{confPct}%</Text>
           </View>
 
-          {/* Ground truth error */}
+          {/* ════════════════════════════════════════════════════
+              SECTION 2 — PEDESTRIAN DEAD RECKONING (PDR)
+          ════════════════════════════════════════════════════ */}
+          <Text style={[styles.subSectionTitle, { marginTop: 10 }]}>🚶 PEDESTRIAN DEAD RECKONING (PDR)</Text>
+
+          <View style={styles.diagGrid}>
+            <DiagItem
+              label="Detected Steps"
+              value={`${stepCount}`}
+              color="#15803d"
+            />
+            <DiagItem
+              label="Weinberg Step Length"
+              value={(() => {
+                const slM = typeof stepLength === "number" && isFinite(stepLength) ? stepLength : 0.70;
+                return `${(slM * 3.28084).toFixed(2)} ft (${slM.toFixed(2)}m)`;
+              })()}
+              color="#047857"
+            />
+            <DiagItem
+              label="Walking Heading"
+              value={(() => {
+                const hDeg = typeof heading === "number" && isFinite(heading) ? heading : 0;
+                return `${hDeg.toFixed(1)}° • ${cardinal || "North (N)"}`;
+              })()}
+              color="#0369a1"
+            />
+            <DiagItem
+              label="PDR Dead-Reckoned Pos"
+              value={`(${formatCoord(pdrX)}, ${formatCoord(pdrY)})`}
+              color="#15803d"
+            />
+          </View>
+
+          {/* ════════════════════════════════════════════════════
+              SECTION 3 — SENSOR FUSION ENGINE (KALMAN FILTER)
+          ════════════════════════════════════════════════════ */}
+          <Text style={[styles.subSectionTitle, { marginTop: 10 }]}>🛰️ SENSOR FUSION & ADAPTIVE KALMAN</Text>
+
+          <View style={styles.posTable}>
+            <View style={styles.posRow}>
+              <Text style={styles.posLabel}>BLE Absolute Ranging</Text>
+              <Text style={styles.posValue}>X: {formatCoord(bleX)}  Y: {formatCoord(bleY)}</Text>
+            </View>
+            <View style={styles.posRow}>
+              <Text style={styles.posLabel}>PDR Dead Reckoning</Text>
+              <Text style={styles.posValue}>X: {formatCoord(pdrX)}  Y: {formatCoord(pdrY)}</Text>
+            </View>
+            <View style={[styles.posRow, { borderBottomWidth: 0, backgroundColor: "#eff6ff" }]}>
+              <Text style={[styles.posLabel, { fontWeight: "800", color: "#1d4ed8" }]}>Kalman Fused Position</Text>
+              <Text style={[styles.posValue, { fontWeight: "800", color: "#1d4ed8" }]}>
+                X: {formatCoord(fusedX)}  Y: {formatCoord(fusedY)}
+              </Text>
+            </View>
+          </View>
+
+          <View style={styles.diagGrid}>
+            <DiagItem
+              label="Active Positioning Mode"
+              value={positioningMode.toUpperCase()}
+              color="#1d4ed8"
+            />
+            <DiagItem
+              label="Kalman Weight (Gain K)"
+              value={typeof kalmanGain === "number" && isFinite(kalmanGain) ? kalmanGain.toFixed(2) : "0.50"}
+              color="#0369a1"
+            />
+            <DiagItem
+              label="Kinematic State"
+              value={isStationary ? "Stationary Lock 🔒" : "Active Walking 🚶"}
+              color={isStationary ? "#64748b" : "#1a7f37"}
+            />
+            <DiagItem
+              label="Recorded Trajectory"
+              value={`${trajectoryCount} points`}
+              color="#6d28d9"
+            />
+          </View>
+
+          {/* ════════════════════════════════════════════════════
+              SECTION 4 — GROUND TRUTH BENCHMARK ANALYSIS
+          ════════════════════════════════════════════════════ */}
+          <Text style={[styles.subSectionTitle, { marginTop: 10 }]}>🎯 GROUND TRUTH & BENCHMARK ANALYSIS</Text>
+
           <View style={styles.gtRow}>
-            <Text style={styles.gtLabel}>Ground Truth ({unit})</Text>
+            <Text style={styles.gtLabel}>Set Ground Truth Target ({unit})</Text>
             <View style={styles.gtInputs}>
               <TextInput
                 style={styles.gtInput}
@@ -167,20 +273,52 @@ export default function BeaconDebugPanel({
             </View>
           </View>
 
-          {errorFt !== null && (
-            <View style={{ marginTop: 6, marginBottom: 2 }}>
-              <Text style={styles.errorText}>
-                📏 Position Error: <Text style={{ color: "#cf222e", fontWeight: "800" }}>{formatCoord(parseFloat(errorFt))}</Text>
-              </Text>
-              <Text style={{ fontSize: 10, color: "#57606a", marginTop: 1 }}>
-                Conversions: {unit !== "ft" ? `${parseFloat(errorFt).toFixed(2)}ft ` : ""}{unit !== "m" ? `• ${(parseFloat(errorFt) * 0.3048).toFixed(2)}m ` : ""}{unit !== "in" ? `• ${(parseFloat(errorFt) * 12).toFixed(1)}in` : ""}
-              </Text>
+          {(gtErrorFt !== null || fusedErrorFt !== null) && (
+            <View style={styles.benchmarkCard}>
+              <Text style={styles.benchmarkHeader}>Comparative Real-Time Error</Text>
+              <View style={styles.errorComparisonRow}>
+                <ErrorBadge
+                  label="Fused Error"
+                  errorFt={fusedErrorFt ?? gtErrorFt}
+                  highlight
+                />
+                <ErrorBadge
+                  label="BLE-Only"
+                  errorFt={bleErrorFt}
+                />
+                <ErrorBadge
+                  label="PDR-Only"
+                  errorFt={pdrErrorFt}
+                />
+              </View>
+
+              {/* Running Statistics */}
+              {benchmarkStats && benchmarkStats.count > 0 && (
+                <View style={styles.statsTable}>
+                  <View style={styles.statCell}>
+                    <Text style={styles.statCellLabel}>Samples (N)</Text>
+                    <Text style={styles.statCellVal}>{benchmarkStats.count}</Text>
+                  </View>
+                  <View style={styles.statCell}>
+                    <Text style={styles.statCellLabel}>MAE</Text>
+                    <Text style={styles.statCellVal}>{formatCoord(benchmarkStats.mae)}</Text>
+                  </View>
+                  <View style={styles.statCell}>
+                    <Text style={styles.statCellLabel}>RMSE</Text>
+                    <Text style={styles.statCellVal}>{formatCoord(benchmarkStats.rmse)}</Text>
+                  </View>
+                  <View style={styles.statCell}>
+                    <Text style={styles.statCellLabel}>Max Err</Text>
+                    <Text style={[styles.statCellVal, { color: "#cf222e" }]}>{formatCoord(benchmarkStats.max)}</Text>
+                  </View>
+                </View>
+              )}
             </View>
           )}
 
           {/* Debug overlays toggle */}
           <View style={styles.toggleRow}>
-            <Text style={styles.toggleLabel}>Show Raw BLE & PDR on map</Text>
+            <Text style={styles.toggleLabel}>Show Raw BLE & PDR markers on map</Text>
             <Switch
               value={showOverlays}
               onValueChange={onToggleOverlays}
@@ -196,9 +334,10 @@ export default function BeaconDebugPanel({
 
 function BeaconRow({ label, available, rawRssi, filteredRssi, distanceFt, weight, color, unit = "ft" }) {
   const dot = available ? "#1a7f37" : "#cf222e";
+  const validDist = typeof distanceFt === "number" && isFinite(distanceFt);
 
   let distLabel = "—";
-  if (distanceFt !== null && distanceFt !== undefined) {
+  if (validDist) {
     if (unit === "m") distLabel = `${(distanceFt * 0.3048).toFixed(2)}m`;
     else if (unit === "in") distLabel = `${(distanceFt * 12).toFixed(1)}in`;
     else distLabel = `${distanceFt.toFixed(1)}ft`;
@@ -215,9 +354,9 @@ function BeaconRow({ label, available, rawRssi, filteredRssi, distanceFt, weight
         <MiniCell label="Raw RSSI"   value={rawRssi      != null ? `${rawRssi} dBm`      : "—"} />
         <MiniCell label="Filtered"   value={filteredRssi != null ? `${filteredRssi} dBm` : "—"} />
         <MiniCell label={`Dist (${unit})`} value={distLabel} />
-        <MiniCell label="Weight"     value={weight       != null ? weight.toFixed(2)      : "—"} />
+        <MiniCell label="Weight"     value={typeof weight === "number" && isFinite(weight) ? weight.toFixed(2) : "—"} />
       </View>
-      {distanceFt !== null && distanceFt !== undefined && (
+      {validDist && (
         <View style={{ flexDirection: "row", justifyContent: "flex-end", marginTop: 4, gap: 6 }}>
           <Text style={{ fontSize: 9, color: "#57606a" }}>
             {unit !== "ft" ? `${distanceFt.toFixed(1)}ft  ` : ""}
@@ -230,7 +369,33 @@ function BeaconRow({ label, available, rawRssi, filteredRssi, distanceFt, weight
   );
 }
 
+function DiagItem({ label, value, color = "#24292f" }) {
+  return (
+    <View style={styles.diagItem}>
+      <Text style={styles.diagItemLabel}>{label}</Text>
+      <Text style={[styles.diagItemVal, { color }]}>{value}</Text>
+    </View>
+  );
+}
 
+function ErrorBadge({ label, errorFt, highlight = false }) {
+  const valid = typeof errorFt === "number" && isFinite(errorFt);
+  const isGood = valid && errorFt < 2.0;
+  const isMed  = valid && errorFt >= 2.0 && errorFt < 4.0;
+  const col    = isGood ? "#16a34a" : isMed ? "#d97706" : "#dc2626";
+
+  return (
+    <View style={[styles.errorBadge, highlight && styles.errorBadgeHighlight]}>
+      <Text style={styles.errorBadgeLabel}>{label}</Text>
+      <Text style={[styles.errorBadgeVal, { color: col }]}>
+        {valid ? `${errorFt.toFixed(2)} ft` : "—"}
+      </Text>
+      {valid && (
+        <Text style={styles.errorBadgeSub}>({(errorFt * 0.3048).toFixed(2)}m)</Text>
+      )}
+    </View>
+  );
+}
 
 function MiniCell({ label, value }) {
   return (
@@ -254,6 +419,15 @@ const styles = StyleSheet.create({
   title:        { fontWeight: "800", fontSize: 13, color: "#24292f" },
   chevron:      { color: "#8c959f", fontSize: 13 },
 
+  subSectionTitle: {
+    fontSize: 10.5,
+    fontWeight: "800",
+    color: "#64748b",
+    letterSpacing: 0.5,
+    marginBottom: 6,
+    marginTop: 4,
+  },
+
   beaconRow:    { backgroundColor: "#f6f8fa", borderRadius: 8, padding: 10, marginBottom: 8 },
   beaconLabel:  { fontWeight: "700", fontSize: 12 },
   dot:          { width: 8, height: 8, borderRadius: 4 },
@@ -264,14 +438,40 @@ const styles = StyleSheet.create({
   miniLabel:    { fontSize: 9,  color: "#8c959f", fontWeight: "600" },
   miniValue:    { fontSize: 11, color: "#24292f", fontWeight: "700", marginTop: 2 },
 
-  posTable:     { borderWidth: 1, borderColor: "#e1e4e8", borderRadius: 8, overflow: "hidden", marginBottom: 10 },
+  diagGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+    backgroundColor: "#f8fafc",
+    padding: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    marginBottom: 8,
+  },
+  diagItem: {
+    width: "48%",
+    paddingVertical: 3,
+  },
+  diagItemLabel: {
+    fontSize: 9,
+    color: "#64748b",
+    fontWeight: "600",
+  },
+  diagItemVal: {
+    fontSize: 11,
+    fontWeight: "800",
+    marginTop: 1,
+  },
+
+  posTable:     { borderWidth: 1, borderColor: "#e1e4e8", borderRadius: 8, overflow: "hidden", marginBottom: 8 },
   posRow:       { flexDirection: "row", justifyContent: "space-between", alignItems: "center",
-                  paddingHorizontal: 10, paddingVertical: 7, borderBottomWidth: 1, borderBottomColor: "#e1e4e8" },
+                  paddingHorizontal: 10, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: "#e1e4e8" },
   posLabel:     { fontSize: 11, color: "#57606a", fontWeight: "600" },
   posValue:     { fontSize: 11, color: "#24292f", fontWeight: "700", fontFamily: "monospace" },
 
-  confRow:      { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 10 },
-  confLabel:    { fontSize: 11, color: "#57606a", fontWeight: "600", width: 80 },
+  confRow:      { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 8 },
+  confLabel:    { fontSize: 11, color: "#57606a", fontWeight: "600", width: 95 },
   confTrack:    { flex: 1, height: 8, backgroundColor: "#e1e4e8", borderRadius: 4, overflow: "hidden" },
   confFill:     { height: "100%", borderRadius: 4 },
   confPct:      { fontSize: 11, fontWeight: "800", width: 36, textAlign: "right" },
@@ -285,7 +485,76 @@ const styles = StyleSheet.create({
   gtBtn:        { backgroundColor: "#1f6feb", borderRadius: 8, paddingHorizontal: 14, paddingVertical: 8 },
   gtBtnText:    { color: "#fff", fontWeight: "700", fontSize: 12 },
 
-  errorText:    { fontSize: 12, fontWeight: "700", color: "#24292f", marginBottom: 8 },
+  benchmarkCard: {
+    backgroundColor: "#fdf2f8",
+    borderWidth: 1,
+    borderColor: "#fbcfe8",
+    borderRadius: 8,
+    padding: 8,
+    marginBottom: 8,
+  },
+  benchmarkHeader: {
+    fontSize: 10.5,
+    fontWeight: "800",
+    color: "#9d174d",
+    marginBottom: 6,
+  },
+  errorComparisonRow: {
+    flexDirection: "row",
+    gap: 6,
+    marginBottom: 6,
+  },
+  errorBadge: {
+    flex: 1,
+    backgroundColor: "#fff",
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    borderRadius: 6,
+    padding: 6,
+    alignItems: "center",
+  },
+  errorBadgeHighlight: {
+    borderColor: "#2563eb",
+    backgroundColor: "#eff6ff",
+  },
+  errorBadgeLabel: {
+    fontSize: 9,
+    color: "#64748b",
+    fontWeight: "600",
+  },
+  errorBadgeVal: {
+    fontSize: 12,
+    fontWeight: "800",
+    marginTop: 2,
+  },
+  errorBadgeSub: {
+    fontSize: 8.5,
+    color: "#94a3b8",
+  },
+
+  statsTable: {
+    flexDirection: "row",
+    borderTopWidth: 1,
+    borderTopColor: "#fbcfe8",
+    paddingTop: 6,
+    marginTop: 4,
+    justifyContent: "space-between",
+  },
+  statCell: {
+    alignItems: "center",
+    flex: 1,
+  },
+  statCellLabel: {
+    fontSize: 8.5,
+    color: "#9d174d",
+    fontWeight: "600",
+  },
+  statCellVal: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: "#831843",
+    marginTop: 1,
+  },
 
   toggleRow:    { flexDirection: "row", alignItems: "center", justifyContent: "space-between",
                   marginTop: 4, paddingTop: 8, borderTopWidth: 1, borderTopColor: "#e1e4e8" },

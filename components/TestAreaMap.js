@@ -42,6 +42,8 @@ export default function TestAreaMap({
   trail,             // [{ x, y }, ...] in feet
   heading = 0,       // compass heading in degrees
   groundTruth,       // { x, y } ground truth pin in feet
+  roomWidthFt = ROOM_WIDTH_FT,   // custom room width (ft)
+  roomHeightFt = ROOM_HEIGHT_FT, // custom room height (ft)
   isSetupMode,       // true → beacons draggable
   showDebugOverlays, // show raw BLE + PDR dots
   onBeacon1Move,     // (x, y) live updates during drag
@@ -54,27 +56,39 @@ export default function TestAreaMap({
   const [activeDrag, setActiveDrag] = useState(null); // 'b1' | 'b2' | null
   const dragStartFeetRef = useRef({ x: 0, y: 0 });
 
-  // Compute map size — maintain 18:15 aspect ratio and fit inside screen
+  const safeRoomW = (typeof roomWidthFt === "number" && isFinite(roomWidthFt) && roomWidthFt > 0) ? roomWidthFt : ROOM_WIDTH_FT;
+  const safeRoomH = (typeof roomHeightFt === "number" && isFinite(roomHeightFt) && roomHeightFt > 0) ? roomHeightFt : ROOM_HEIGHT_FT;
+
+  // Compute map size — maintain room aspect ratio and fit inside screen
   const screenWidth = Dimensions.get("window").width;
   const PAD = 24;  // label padding inside the SVG canvas
   const availableWidth = screenWidth - 32;  // 16px padding each side from parent
   const svgW    = availableWidth;
   const mapWidth  = Math.max(100, svgW - PAD * 2);
-  const mapHeight = mapWidth * (ROOM_HEIGHT_FT / ROOM_WIDTH_FT);
+  const mapHeight = Math.max(100, Math.min(mapWidth * 1.8, mapWidth * (safeRoomH / safeRoomW)));
   const svgH    = mapHeight + PAD * 2;
 
   // Conversion helpers (room coordinates, not canvas)
   const toScreen = useCallback(
     (rx, ry) => {
-      const s = feetToScreen(rx, ry, mapWidth, mapHeight);
-      return { sx: s.sx + PAD, sy: s.sy + PAD };
+      const safeX = (typeof rx === "number" && isFinite(rx)) ? rx : safeRoomW / 2;
+      const safeY = (typeof ry === "number" && isFinite(ry)) ? ry : safeRoomH / 2;
+      const s = feetToScreen(safeX, safeY, mapWidth, mapHeight, safeRoomW, safeRoomH);
+      return {
+        sx: (typeof s?.sx === "number" && isFinite(s.sx)) ? s.sx + PAD : PAD + 100,
+        sy: (typeof s?.sy === "number" && isFinite(s.sy)) ? s.sy + PAD : PAD + 100,
+      };
     },
-    [mapWidth, mapHeight],
+    [mapWidth, mapHeight, safeRoomW, safeRoomH],
   );
 
   const fromScreen = useCallback(
-    (sx, sy) => screenToFeet(sx - PAD, sy - PAD, mapWidth, mapHeight),
-    [mapWidth, mapHeight],
+    (sx, sy) => {
+      const safeSX = (typeof sx === "number" && isFinite(sx)) ? sx - PAD : 0;
+      const safeSY = (typeof sy === "number" && isFinite(sy)) ? sy - PAD : 0;
+      return screenToFeet(safeSX, safeSY, mapWidth, mapHeight, safeRoomW, safeRoomH);
+    },
+    [mapWidth, mapHeight, safeRoomW, safeRoomH],
   );
 
   // ─── PanResponder for Beacon 1 (Kinematic Delta Math) ────────────────────
@@ -87,25 +101,25 @@ export default function TestAreaMap({
       onPanResponderGrant: () => {
         dragStartFeetRef.current = {
           x: beacon1?.x ?? 0,
-          y: beacon1?.y ?? ROOM_HEIGHT_FT,
+          y: beacon1?.y ?? safeRoomH,
         };
         setActiveDrag("b1");
         onDragStateChange?.(true);
       },
       onPanResponderMove: (_, gestureState) => {
-        const deltaX_ft = (gestureState.dx / mapWidth) * ROOM_WIDTH_FT;
-        const deltaY_ft = -(gestureState.dy / mapHeight) * ROOM_HEIGHT_FT;
+        const deltaX_ft = (gestureState.dx / mapWidth) * safeRoomW;
+        const deltaY_ft = -(gestureState.dy / mapHeight) * safeRoomH;
         const newX = dragStartFeetRef.current.x + deltaX_ft;
         const newY = dragStartFeetRef.current.y + deltaY_ft;
-        const clamped = clampToRoom(newX, newY);
+        const clamped = clampToRoom(newX, newY, safeRoomW, safeRoomH);
         onBeacon1Move?.(Number(clamped.x.toFixed(2)), Number(clamped.y.toFixed(2)));
       },
       onPanResponderRelease: (_, gestureState) => {
-        const deltaX_ft = (gestureState.dx / mapWidth) * ROOM_WIDTH_FT;
-        const deltaY_ft = -(gestureState.dy / mapHeight) * ROOM_HEIGHT_FT;
+        const deltaX_ft = (gestureState.dx / mapWidth) * safeRoomW;
+        const deltaY_ft = -(gestureState.dy / mapHeight) * safeRoomH;
         const newX = dragStartFeetRef.current.x + deltaX_ft;
         const newY = dragStartFeetRef.current.y + deltaY_ft;
-        const clamped = clampToRoom(newX, newY);
+        const clamped = clampToRoom(newX, newY, safeRoomW, safeRoomH);
         setActiveDrag(null);
         onDragStateChange?.(false);
         const finalX = Number(clamped.x.toFixed(2));
@@ -129,26 +143,26 @@ export default function TestAreaMap({
       onMoveShouldSetPanResponderCapture: () => isSetupMode,
       onPanResponderGrant: () => {
         dragStartFeetRef.current = {
-          x: beacon2?.x ?? ROOM_WIDTH_FT,
-          y: beacon2?.y ?? ROOM_HEIGHT_FT,
+          x: beacon2?.x ?? safeRoomW,
+          y: beacon2?.y ?? safeRoomH,
         };
         setActiveDrag("b2");
         onDragStateChange?.(true);
       },
       onPanResponderMove: (_, gestureState) => {
-        const deltaX_ft = (gestureState.dx / mapWidth) * ROOM_WIDTH_FT;
-        const deltaY_ft = -(gestureState.dy / mapHeight) * ROOM_HEIGHT_FT;
+        const deltaX_ft = (gestureState.dx / mapWidth) * safeRoomW;
+        const deltaY_ft = -(gestureState.dy / mapHeight) * safeRoomH;
         const newX = dragStartFeetRef.current.x + deltaX_ft;
         const newY = dragStartFeetRef.current.y + deltaY_ft;
-        const clamped = clampToRoom(newX, newY);
+        const clamped = clampToRoom(newX, newY, safeRoomW, safeRoomH);
         onBeacon2Move?.(Number(clamped.x.toFixed(2)), Number(clamped.y.toFixed(2)));
       },
       onPanResponderRelease: (_, gestureState) => {
-        const deltaX_ft = (gestureState.dx / mapWidth) * ROOM_WIDTH_FT;
-        const deltaY_ft = -(gestureState.dy / mapHeight) * ROOM_HEIGHT_FT;
+        const deltaX_ft = (gestureState.dx / mapWidth) * safeRoomW;
+        const deltaY_ft = -(gestureState.dy / mapHeight) * safeRoomH;
         const newX = dragStartFeetRef.current.x + deltaX_ft;
         const newY = dragStartFeetRef.current.y + deltaY_ft;
-        const clamped = clampToRoom(newX, newY);
+        const clamped = clampToRoom(newX, newY, safeRoomW, safeRoomH);
         setActiveDrag(null);
         onDragStateChange?.(false);
         const finalX = Number(clamped.x.toFixed(2));
@@ -164,46 +178,71 @@ export default function TestAreaMap({
   ).current;
 
   // ─── Screen space points ──────────────────────────────────────────────────
-  const b1s   = toScreen(beacon1?.x ?? 0, beacon1?.y ?? ROOM_HEIGHT_FT);
-  const b2s   = toScreen(beacon2?.x ?? ROOM_WIDTH_FT, beacon2?.y ?? ROOM_HEIGHT_FT);
-  const curX  = userPosition?.activeX ?? userPosition?.fusedX ?? 9;
-  const curY  = userPosition?.activeY ?? userPosition?.fusedY ?? 7.5;
-  const userS = toScreen(curX, curY);
-  const bleS  = blePosition  ? toScreen(blePosition.bleX,  blePosition.bleY)  : null;
-  const pdrS  = pdrPosition  ? toScreen(pdrPosition.pdrX,  pdrPosition.pdrY)  : null;
-  const gtS   = groundTruth  ? toScreen(groundTruth.x, groundTruth.y)         : null;
+  const b1X   = (typeof beacon1?.x === "number" && isFinite(beacon1.x)) ? beacon1.x : 0;
+  const b1Y   = (typeof beacon1?.y === "number" && isFinite(beacon1.y)) ? beacon1.y : safeRoomH;
+  const b1s   = toScreen(b1X, b1Y);
 
-  // Trail polyline
+  const b2X   = (typeof beacon2?.x === "number" && isFinite(beacon2.x)) ? beacon2.x : safeRoomW;
+  const b2Y   = (typeof beacon2?.y === "number" && isFinite(beacon2.y)) ? beacon2.y : safeRoomH;
+  const b2s   = toScreen(b2X, b2Y);
+
+  const rawCurX = userPosition?.activeX ?? userPosition?.fusedX ?? (safeRoomW / 2);
+  const rawCurY = userPosition?.activeY ?? userPosition?.fusedY ?? (safeRoomH / 2);
+  const curX  = (typeof rawCurX === "number" && isFinite(rawCurX)) ? rawCurX : (safeRoomW / 2);
+  const curY  = (typeof rawCurY === "number" && isFinite(rawCurY)) ? rawCurY : (safeRoomH / 2);
+  const userS = toScreen(curX, curY);
+
+  const hasBle = blePosition && typeof blePosition.bleX === "number" && isFinite(blePosition.bleX) && typeof blePosition.bleY === "number" && isFinite(blePosition.bleY);
+  const bleS  = hasBle ? toScreen(blePosition.bleX, blePosition.bleY) : null;
+
+  const hasPdr = pdrPosition && typeof pdrPosition.pdrX === "number" && isFinite(pdrPosition.pdrX) && typeof pdrPosition.pdrY === "number" && isFinite(pdrPosition.pdrY);
+  const pdrS  = hasPdr ? toScreen(pdrPosition.pdrX, pdrPosition.pdrY) : null;
+
+  const hasGt = groundTruth && typeof groundTruth.x === "number" && isFinite(groundTruth.x) && typeof groundTruth.y === "number" && isFinite(groundTruth.y);
+  const gtS   = hasGt ? toScreen(groundTruth.x, groundTruth.y) : null;
+
+  // Trail polyline (filter valid coordinates only to prevent SVG crashes)
   const trailPts = (trail || [])
-    .map(p => { const s = toScreen(p.x, p.y); return `${s.sx.toFixed(1)},${s.sy.toFixed(1)}`; })
+    .filter(p => p && typeof p.x === "number" && isFinite(p.x) && typeof p.y === "number" && isFinite(p.y))
+    .map(p => {
+      const s = toScreen(p.x, p.y);
+      return `${s.sx.toFixed(1)},${s.sy.toFixed(1)}`;
+    })
     .join(" ");
 
-  // Grid lines
+  // Dynamic grid lines based on room dimensions
   const gridLines = [];
-  for (let gx = 0; gx <= ROOM_WIDTH_FT; gx += GRID_STEP_FT) {
-    const { sx } = toScreen(gx, 0);
+  const xGridStep = safeRoomW > 25 ? 5 : safeRoomW <= 12 ? 2 : 3;
+  const yGridStep = safeRoomH > 25 ? 5 : safeRoomH <= 12 ? 2 : 3;
+
+  for (let gx = 0; gx <= safeRoomW + 0.05; gx += xGridStep) {
+    const safeGx = Math.min(safeRoomW, Number(gx.toFixed(1)));
+    const { sx } = toScreen(safeGx, 0);
     gridLines.push(
-      <Line key={`vg${gx}`} x1={sx} y1={PAD} x2={sx} y2={PAD + mapHeight}
-        stroke="#e2e8f0" strokeWidth={gx === 0 || gx === ROOM_WIDTH_FT ? 1.5 : 0.8} />,
+      <Line key={`vg${safeGx}`} x1={sx} y1={PAD} x2={sx} y2={PAD + mapHeight}
+        stroke="#e2e8f0" strokeWidth={safeGx === 0 || Math.abs(safeGx - safeRoomW) < 0.2 ? 1.5 : 0.8} />,
     );
   }
-  for (let gy = 0; gy <= ROOM_HEIGHT_FT; gy += GRID_STEP_FT) {
-    const { sy } = toScreen(0, gy);
+  for (let gy = 0; gy <= safeRoomH + 0.05; gy += yGridStep) {
+    const safeGy = Math.min(safeRoomH, Number(gy.toFixed(1)));
+    const { sy } = toScreen(0, safeGy);
     gridLines.push(
-      <Line key={`hg${gy}`} x1={PAD} y1={sy} x2={PAD + mapWidth} y2={sy}
-        stroke="#e2e8f0" strokeWidth={gy === 0 || gy === ROOM_HEIGHT_FT ? 1.5 : 0.8} />,
+      <Line key={`hg${safeGy}`} x1={PAD} y1={sy} x2={PAD + mapWidth} y2={sy}
+        stroke="#e2e8f0" strokeWidth={safeGy === 0 || Math.abs(safeGy - safeRoomH) < 0.2 ? 1.5 : 0.8} />,
     );
   }
 
-  // Axis labels
-  const xLabels = [0, 6, 12, 18].map(ft => {
+  // Axis labels (4-5 ticks evenly spaced)
+  const xTicks = [0, Math.round(safeRoomW / 3), Math.round((2 * safeRoomW) / 3), safeRoomW];
+  const xLabels = [...new Set(xTicks)].map(ft => {
     const { sx } = toScreen(ft, 0);
     return (
       <SvgText key={`xl${ft}`} x={sx} y={PAD + mapHeight + 16}
         fontSize="9" fill="#94a3b8" textAnchor="middle">{ft}ft</SvgText>
     );
   });
-  const yLabels = [0, 5, 10, 15].map(ft => {
+  const yTicks = [0, Math.round(safeRoomH / 3), Math.round((2 * safeRoomH) / 3), safeRoomH];
+  const yLabels = [...new Set(yTicks)].map(ft => {
     const { sy } = toScreen(0, ft);
     return (
       <SvgText key={`yl${ft}`} x={PAD - 4} y={sy + 4}
@@ -216,14 +255,16 @@ export default function TestAreaMap({
     if (isSetupMode || !onMapTap) return;
     const { locationX, locationY } = e.nativeEvent;
     const { realX, realY } = fromScreen(locationX, locationY);
-    const clamped = clampToRoom(realX, realY);
+    const clamped = clampToRoom(realX, realY, safeRoomW, safeRoomH);
     onMapTap(Number(clamped.x.toFixed(2)), Number(clamped.y.toFixed(2)));
   };
 
   return (
     <View style={styles.container}>
       <View style={styles.header}>
-        <Text style={styles.title}>18 × 15 ft Indoor Room</Text>
+        <Text style={styles.title}>
+          {safeRoomW.toFixed(0)} × {safeRoomH.toFixed(0)} ft Room ({((safeRoomW * 0.3048)).toFixed(1)} × {((safeRoomH * 0.3048)).toFixed(1)} m)
+        </Text>
         {isSetupMode ? (
           <Text style={styles.hint}>Drag B1 / B2 to place beacons</Text>
         ) : (
@@ -245,12 +286,12 @@ export default function TestAreaMap({
           {yLabels}
 
           {/* Distance ranging circle from Beacon 1 */}
-          {beacon1Dist && beacon1Dist > 0 && (
+          {typeof beacon1Dist === "number" && isFinite(beacon1Dist) && beacon1Dist > 0 && (
             <G>
               <Circle
                 cx={b1s.sx}
                 cy={b1s.sy}
-                r={(beacon1Dist / ROOM_WIDTH_FT) * mapWidth}
+                r={Math.max(1, (beacon1Dist / safeRoomW) * mapWidth)}
                 stroke="#0ea5e9"
                 strokeWidth="1.5"
                 strokeDasharray="4,4"
@@ -259,7 +300,7 @@ export default function TestAreaMap({
               />
               <SvgText
                 x={b1s.sx}
-                y={Math.max(PAD + 12, b1s.sy - (beacon1Dist / ROOM_WIDTH_FT) * mapWidth - 4)}
+                y={Math.max(PAD + 12, b1s.sy - (beacon1Dist / safeRoomW) * mapWidth - 4)}
                 fontSize="8.5"
                 fill="#0284c7"
                 fontWeight="700"
@@ -271,12 +312,12 @@ export default function TestAreaMap({
           )}
 
           {/* Distance ranging circle from Beacon 2 */}
-          {beacon2Dist && beacon2Dist > 0 && (
+          {typeof beacon2Dist === "number" && isFinite(beacon2Dist) && beacon2Dist > 0 && (
             <G>
               <Circle
                 cx={b2s.sx}
                 cy={b2s.sy}
-                r={(beacon2Dist / ROOM_WIDTH_FT) * mapWidth}
+                r={Math.max(1, (beacon2Dist / safeRoomW) * mapWidth)}
                 stroke="#8b5cf6"
                 strokeWidth="1.5"
                 strokeDasharray="4,4"
@@ -285,7 +326,7 @@ export default function TestAreaMap({
               />
               <SvgText
                 x={b2s.sx}
-                y={Math.max(PAD + 12, b2s.sy - (beacon2Dist / ROOM_WIDTH_FT) * mapWidth - 4)}
+                y={Math.max(PAD + 12, b2s.sy - (beacon2Dist / safeRoomW) * mapWidth - 4)}
                 fontSize="8.5"
                 fill="#7c3aed"
                 fontWeight="700"
@@ -297,7 +338,7 @@ export default function TestAreaMap({
           )}
 
           {/* Ground Truth Validation Target & Line */}
-          {gtS && (
+          {gtS && hasGt && (
             <G>
               <Line
                 x1={userS.sx}
@@ -319,7 +360,7 @@ export default function TestAreaMap({
           )}
 
           {/* Trail */}
-          {trail && trail.length > 1 && (
+          {trail && trail.length > 1 && trailPts.length > 0 && (
             <Polyline
               points={trailPts}
               fill="none"
@@ -331,24 +372,60 @@ export default function TestAreaMap({
             />
           )}
 
-          {/* Debug overlays — raw BLE & PDR dots */}
-          {showDebugOverlays && bleS && (
+          {/* Debug overlays — raw BLE (hollow dashed circle) & PDR (emerald rounded rect) */}
+          {showDebugOverlays && bleS && hasBle && (
             <G>
-              <Circle cx={bleS.sx} cy={bleS.sy} r="5" fill="#f59e0b" opacity={0.75} />
-              <SvgText x={bleS.sx + 7} y={bleS.sy + 4} fontSize="9" fill="#b45309" fontWeight="600">BLE</SvgText>
+              <Circle
+                cx={bleS.sx}
+                cy={bleS.sy}
+                r="9"
+                fill="none"
+                stroke="#f59e0b"
+                strokeWidth="2"
+                strokeDasharray="3,3"
+              />
+              <Circle cx={bleS.sx} cy={bleS.sy} r="3" fill="#f59e0b" />
+              <SvgText
+                x={bleS.sx}
+                y={bleS.sy - 12}
+                fontSize="8.5"
+                fill="#b45309"
+                fontWeight="700"
+                textAnchor="middle"
+              >
+                BLE {blePosition.bleX.toFixed(1)},{blePosition.bleY.toFixed(1)}
+              </SvgText>
             </G>
           )}
-          {showDebugOverlays && pdrS && (
+          {showDebugOverlays && pdrS && hasPdr && (
             <G>
-              <Circle cx={pdrS.sx} cy={pdrS.sy} r="5" fill="#10b981" opacity={0.75} />
-              <SvgText x={pdrS.sx + 7} y={pdrS.sy + 4} fontSize="9" fill="#047857" fontWeight="600">PDR</SvgText>
+              <Rect
+                x={pdrS.sx - 6}
+                y={pdrS.sy - 6}
+                width="12"
+                height="12"
+                rx="2"
+                fill="#10b981"
+                stroke="#ffffff"
+                strokeWidth="1.5"
+              />
+              <SvgText
+                x={pdrS.sx}
+                y={pdrS.sy - 10}
+                fontSize="8.5"
+                fill="#047857"
+                fontWeight="700"
+                textAnchor="middle"
+              >
+                PDR {pdrPosition.pdrX.toFixed(1)},{pdrPosition.pdrY.toFixed(1)}
+              </SvgText>
             </G>
           )}
 
           {/* User Position Marker with Heading Cone */}
           <G>
             {/* Heading Pointer Arrow */}
-            <G transform={`rotate(${heading || 0}, ${userS.sx}, ${userS.sy})`}>
+            <G transform={`rotate(${typeof heading === "number" && isFinite(heading) ? heading : 0}, ${userS.sx}, ${userS.sy})`}>
               <Polygon
                 points={`${userS.sx},${userS.sy - 18} ${userS.sx - 5.5},${userS.sy - 7} ${userS.sx + 5.5},${userS.sy - 7}`}
                 fill="#2563eb"
@@ -385,7 +462,7 @@ export default function TestAreaMap({
               fill="#ffffff" fontWeight="bold" textAnchor="middle">B1</SvgText>
             <SvgText x={b1s.sx} y={b1s.sy + 22} fontSize="8.5"
               fill="#0369a1" fontWeight="600" textAnchor="middle">
-              {(beacon1?.x ?? 0).toFixed(1)},{(beacon1?.y ?? 0).toFixed(1)}ft
+              {b1X.toFixed(1)},{b1Y.toFixed(1)}ft
             </SvgText>
           </G>
 
@@ -405,7 +482,7 @@ export default function TestAreaMap({
               fill="#ffffff" fontWeight="bold" textAnchor="middle">B2</SvgText>
             <SvgText x={b2s.sx} y={b2s.sy + 22} fontSize="8.5"
               fill="#6d28d9" fontWeight="600" textAnchor="middle">
-              {(beacon2?.x ?? 0).toFixed(1)},{(beacon2?.y ?? 0).toFixed(1)}ft
+              {b2X.toFixed(1)},{b2Y.toFixed(1)}ft
             </SvgText>
           </G>
         </Svg>
