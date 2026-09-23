@@ -13,7 +13,7 @@ try {
   console.log("[AppSettingsStorage] Native AsyncStorage not available, using memory fallback.");
 }
 
-const STORAGE_KEY = "@app_config_settings_v1";
+const STORAGE_KEY = "@app_config_settings_v2";
 
 export const DEFAULT_APP_SETTINGS = {
   // ─── BLE Distance & Filtering ─────────────────────────────────────────────
@@ -32,12 +32,12 @@ export const DEFAULT_APP_SETTINGS = {
 
   // ─── PDR & Step Detector ──────────────────────────────────────────────────
   weinbergK: 0.74,                 // Weinberg dynamic step length coefficient (0.50 - 1.20)
-  zuptVariance: 0.005,             // ZUPT stationary gate (g²) — lowered to avoid dropping steps
-  peakThreshold: 0.12,             // Accelerometer heel-strike peak threshold (g) — sensitive for handheld
-  valleyThreshold: -0.09,          // Accelerometer swing-phase valley threshold (g)
-  bounceDiffMin: 0.18,             // Minimum peak-valley bounce amplitude (g)
-  minCadenceMs: 250,               // Fastest allowable step cadence (~4.0 steps/sec)
-  maxCadenceMs: 1600,              // Slowest allowable step cadence (~0.6 steps/sec)
+  zuptVariance: 0.0008,            // ZUPT stationary gate (g²) — sensitive for natural handheld walking
+  peakThreshold: 0.04,             // Accelerometer heel-strike peak threshold (g)
+  valleyThreshold: -0.02,          // Accelerometer swing-phase valley threshold (g)
+  bounceDiffMin: 0.06,             // Minimum peak-valley bounce amplitude (g)
+  minCadenceMs: 240,               // Fastest allowable step cadence (~4.1 steps/sec)
+  maxCadenceMs: 1800,              // Slowest allowable step cadence (~0.55 steps/sec)
 
   // ─── Room & Map Environment ───────────────────────────────────────────────
   roomWidthFt: 18,                 // Room width in feet (X axis)
@@ -73,6 +73,12 @@ function normalizeSettings(raw) {
     s.distanceUnit = s.preferredUnit;
   }
   s.preferredUnit = s.distanceUnit;
+
+  // Sanitize thresholds to ensure old cached high values never block handheld walking
+  if (s.peakThreshold > 0.05) s.peakThreshold = 0.04;
+  if (s.bounceDiffMin > 0.07) s.bounceDiffMin = 0.06;
+  if (s.zuptVariance > 0.0015) s.zuptVariance = 0.0008;
+
   return s;
 }
 

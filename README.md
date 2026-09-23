@@ -5,6 +5,7 @@ A production-grade cross-platform mobile application combining **Pedestrian Dead
 ---
 
 ## 🌟 Table of Contents
+
 1. [System Architecture & Core Modules](#-system-architecture--core-modules)
 2. [Module 1: Pedestrian Dead Reckoning (PDR)](#-1-pedestrian-dead-reckoning-pdr)
 3. [Module 2: Fast & Smooth BLE Scanner & Proximity Engine](#-2-fast--smooth-ble-scanner--proximity-engine)
@@ -89,7 +90,7 @@ A diagnostic suite for scanning, decoding, and estimating physical distance to n
 - **Dedicated Target Testing Dashboard ("Focus Target")**:
   - Isolates a single selected beacon and hides all surrounding background devices.
   - Live distance telemetry formatted in **Meters (`m`)**, **Feet (`ft`)**, or **Inches (`in`)**.
-  - Live SVG sparklines, real-time RSSI signal quality meters, and trend indicators (*Approaching*, *Stationary*, *Moving Away*).
+  - Live SVG sparklines, real-time RSSI signal quality meters, and trend indicators (_Approaching_, _Stationary_, _Moving Away_).
 - **Live Search & Strongest-First Sorting**:
   - Live search bar supporting queries by Device Name, MAC address, or full UUID.
   - Closest beacons with the strongest RSSI automatically prioritize to position #1.
@@ -101,12 +102,13 @@ A diagnostic suite for scanning, decoding, and estimating physical distance to n
 A dedicated 4-stage positioning engine fusing BLE trilateral intersection with continuous PDR dead reckoning:
 
 ### The 4-Stage Workflow:
+
 1. **Stage 1 — Select Beacons**:
    - Auto-discovers nearby BLE beacons, identifies iBeacon payloads, and allows 1-tap assignment for **Beacon 1 (B1)** and **Beacon 2 (B2)**.
 2. **Stage 2 — Place Beacons**:
    - Interactive SVG room map (default $18\text{ ft} \times 15\text{ ft}$, customizable up to $150\text{ ft}$).
    - Smooth `PanResponder` drag-and-drop beacon placement with live coordinates.
-   - Quick placement presets: *Opposite Corners*, *Front Wall*, *Center Baseline*, or *Custom*.
+   - Quick placement presets: _Opposite Corners_, _Front Wall_, _Center Baseline_, or _Custom_.
    - **3D Height Slant-Range Correction**: Converts 3D direct-line distance to true 2D floor distance using phone height ($3.5\text{ ft}$) and beacon ceiling height ($9.0\text{ ft}$):
      $$d_{2D} = \sqrt{\max\left(0, d_{3D}^2 - (h_{\text{beacon}} - h_{\text{phone}})^2\right)}$$
 3. **Stage 3 — Calibrate**:
@@ -145,6 +147,26 @@ Centralized runtime configuration accessible through the **⚙️ Settings** tab
 
 ---
 
+## ⚡ 6. Version 2 (V2): Pure Beacon Signal Lab
+
+A dedicated experimental environment for empirical RF signal observation and beacon antenna analysis with **zero PDR / sensor overhead**:
+
+- **App Version Switcher Dropdown**: Toggle instantly between `Version 1 (PDR + Hybrid)` and `Version 2 (Beacon Signal Lab)`. Choice is saved in persistent storage (`@app_version_mode`).
+- **Strict UUID Filter**: Evaluates incoming Apple iBeacon packets against the configured target 16-byte UUID. All surrounding non-matching devices (smartwatches, TVs, unauthorized BLE radios) are **100% discarded and forgotten**.
+- **Dual-Beacon Tracking**: Distinguishes Beacon 1 and Beacon 2 via their Major/Minor numbers or device MAC address.
+- **Real-Time SVG Raw RSSI Spectrum Graph**:
+  - Live rolling time-series chart (`15s`, `20s`, `30s` window) built with native `react-native-svg`.
+  - Reference dBm grid lines from $-30\text{ dBm}$ down to $-95\text{ dBm}$ with dashed markings.
+  - Dual colored traces with packet arrival markers (Blue/Cyan for B1, Purple/Magenta for B2).
+  - Multi-mode plotting: `Raw Only`, `Raw + Smooth`, and `Smooth`.
+- **Live Signal Analytics & Jitter Diagnostics**:
+  - **Packet Frequency (Hz)**: Actual received rate (e.g. $9.8\text{ Hz}$ vs $1.0\text{ Hz}$) to confirm hardware advertising interval.
+  - **Environmental Jitter ($\Delta\text{ dBm}$)**: Peak-to-peak swing and standard deviation ($\sigma$).
+  - **Inline TxPower Calibration**: Test and adjust 1-meter reference values directly on screen.
+- **Live Terminal-Style Packet Stream Log**: Inspect raw arriving packets with millisecond timestamps and Major/Minor tags.
+
+---
+
 ## 📡 Hardware & Beacon Configuration (MOKO Smart H2)
 
 If you are using the **MOKO Smart H2 Navigation Beacon** (or any generic BLE iBeacon), configure the following parameters using the official **BeaconX Pro** app (Google Play / Apple App Store):
@@ -171,6 +193,7 @@ If you are using the **MOKO Smart H2 Navigation Beacon** (or any generic BLE iBe
 
 > [!TIP]
 > **Power Button States:**
+>
 > - **Power ON:** Press and hold button for 3 seconds $\rightarrow$ Red LED flashes rapidly 3–4 times.
 > - **Power OFF:** Press and hold button for 3 seconds $\rightarrow$ Red LED illuminates solid for 3 seconds then shuts down.
 
@@ -179,10 +202,13 @@ If you are using the **MOKO Smart H2 Navigation Beacon** (or any generic BLE iBe
 ## 📐 Mathematical & Algorithmic Formulations
 
 ### 1. Log-Distance Path Loss Model
+
 $$\text{Distance} = 10^{\frac{\text{TxPower}_{1\text{m}} - \text{RSSI}}{10 \cdot n}}$$
 
 ### 2. Analytical 2-Circle Intersection
+
 Given beacons at $B_1(x_1, y_1)$ with distance $r_1$, and $B_2(x_2, y_2)$ with distance $r_2$:
+
 - Baseline distance: $d = \sqrt{(x_2 - x_1)^2 + (y_2 - y_1)^2}$
 - Distance to chord intersection: $a = \frac{r_1^2 - r_2^2 + d^2}{2d}$
 - Orthogonal chord offset: $h = \sqrt{\max(0, r_1^2 - a^2)}$
@@ -191,6 +217,7 @@ Given beacons at $B_1(x_1, y_1)$ with distance $r_1$, and $B_2(x_2, y_2)$ with d
   $$P_{1,2} = \left( x_0 \pm \frac{h}{d}(y_2 - y_1), \; y_0 \mp \frac{h}{d}(x_2 - x_1) \right)$$
 
 ### 3. Adaptive 2D Kalman Filter
+
 - **State Vector**: $\mathbf{x}_k = [x, y, v_x, v_y]^T$
 - **Prediction**: $\mathbf{x}_{k|k-1} = \mathbf{F} \mathbf{x}_{k-1} + \mathbf{B} \mathbf{u}_k$ where $\mathbf{u}_k = [dx_{\text{PDR}}, dy_{\text{PDR}}]^T$
 - **Update**: $\mathbf{y}_k = \mathbf{z}_{\text{BLE}} - \mathbf{H} \mathbf{x}_{k|k-1}$
@@ -202,8 +229,8 @@ Given beacons at $B_1(x_1, y_1)$ with distance $r_1$, and $B_2(x_2, y_2)$ with d
 
 ```text
 c:\Users\harsh.p\Desktop\Indoor Navigation\PDR_ExpoGo\
-├── App.android.js                     # Main Android application hub & PDR step detector
-├── App.ios.js                         # iOS application hub
+├── App.android.js                     # Android application hub (V2 Navigation: Fusion Map, PDR, Signal Lab, Settings)
+├── App.ios.js                         # iOS application hub (V2 Navigation: Fusion Map, PDR, Signal Lab, Settings)
 ├── App.js                             # Cross-platform entry router
 ├── PathStorage.js                     # Local AsyncStorage engine for recorded paths
 ├── app.json                           # Expo app configuration, bundle IDs, and permissions
@@ -212,25 +239,24 @@ c:\Users\harsh.p\Desktop\Indoor Navigation\PDR_ExpoGo\
 │
 ├── components/
 │   ├── AppSettingsScreen.js           # Live in-app parameter tuning panel (⚙️ Settings tab)
-│   ├── BeaconDebugPanel.js            # Real-time mathematical diagnostic panel
-│   ├── BleDistanceRssiTestPanel.js    # Distance vs RSSI testing & scatter/time-series suite
-│   ├── BleScannerSection.js           # Full BLE scanner, 1€ filter, search bar & focused mode
-│   ├── CalibrationPanel.js            # 1-meter live RSSI calibration panel
+│   ├── ErrorBoundary.js               # Error boundary crash handler and reload wrapper
 │   ├── OtaUpdateCard.js               # Global EAS OTA update card
-│   ├── TestAreaMap.js                 # Interactive SVG indoor room map with PanResponder
-│   └── TwoBeaconPositionScreen.js     # 4-stage 2-Beacon Indoor Positioning wizard
-│
-├── hooks/
-│   └── useTwoBeaconPositioning.js     # Master hook driving 10Hz calculation loop & sensor fusion
+│   └── v2/                            # 🚀 VERSION 2 ARCHITECTURE
+│       ├── FusionMapScreen.js         # Real-time room map fusing PDR steps with BLE proximity via Async EKF
+│       ├── PdrTrackerScreen.js        # Accurate PDR screen (Weinberg stride, compass/gyro heading, 2D map, loop closure)
+│       ├── BeaconSignalLabScreen.js   # Multi-beacon lab: 1m calibration studio, OLS regression, radar & spectrum
+│       └── RssiSignalGraph.js         # Real-time SVG dual-beacon raw/filtered RSSI spectrum graph
 │
 ├── services/
+│   ├── AdaptiveBeaconEngine.js        # Per-beacon profile, dynamic Q/R Kalman, OLS path-loss regression
 │   ├── BleScannerService.js           # BLE native manager, iBeacon decoder, One-Euro filter
+│   ├── FusionEngine.js                # Async 2D EKF fusing PDR prediction with BLE proximity correction
+│   ├── PdrEngine.js                   # Standalone inertial step accumulator & positional covariance model
 │   ├── RttRangingService.js           # RTT ranging simulation & hardware offset calibrator
 │   ├── appSettingsStorage.js          # Persistent storage for live tuning settings
-│   ├── beaconConfigStorage.js         # Configuration storage for 2-beacon map positions
-│   └── twoBeaconServices.js           # Mathematical positioning models, 2-circle solver, Kalman
+│   └── v2BeaconScannerService.js      # Multi-beacon 6-stage signal smoothing & distance pipeline
 │
-└── knowledge base/                    # Complete architectural and algorithm specifications
+└── knowledge base/                    # Architectural and algorithm specifications
     ├── 01_architecture_file_connections_and_wireframes.md
     ├── 02_core_logic_algorithms_and_math.md
     └── 03_codebase_critique_and_improvements.md
@@ -241,12 +267,14 @@ c:\Users\harsh.p\Desktop\Indoor Navigation\PDR_ExpoGo\
 ## 🚀 Getting Started & Build Guide
 
 ### Prerequisites
+
 - **Node.js**: v20.x or higher
 - **Expo CLI**: `npx expo`
 - **EAS CLI**: `npm install -g eas-cli`
 - Android phone with Bluetooth 4.2+ and Location enabled.
 
 ### 1. Installation
+
 ```bash
 git clone https://github.com/harshpanchal-241/Expo-GO.git
 cd Expo-GO
@@ -254,20 +282,25 @@ npm install
 ```
 
 ### 2. Running in Native Development
+
 Because `react-native-ble-plx` requires native Bluetooth LE code, native scanning must be run as a development build rather than standard Expo Go:
+
 ```bash
 # Run directly on an Android device via USB debugging
 npx expo run:android
 ```
 
 ### 3. Building Standalone Test APK with EAS
+
 ```bash
 # Build internal preview APK via EAS Cloud
 eas build --profile preview --platform android
 ```
 
 ### 4. Deploying Over-The-Air (OTA) Updates
+
 To push updates directly to installed test devices without reinstalling the APK:
+
 ```bash
 eas update --branch preview --message "Your release description"
 ```
@@ -275,4 +308,5 @@ eas update --branch preview --message "Your release description"
 ---
 
 ## 📄 License
+
 Internal research and development project for Indoor Navigation and Pedestrian Dead Reckoning.
