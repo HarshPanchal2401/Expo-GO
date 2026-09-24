@@ -17,6 +17,13 @@ import FusionMapScreen from "./components/v2/FusionMapScreen.js";
 import PdrTrackerScreen from "./components/v2/PdrTrackerScreen.js";
 import ErrorBoundary from "./components/ErrorBoundary.js";
 import { getAppSettings, subscribeAppSettings } from "./services/appSettingsStorage.js";
+import { v2Scanner } from "./services/v2BeaconScannerService.js";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { stepLengthModel, STEP_MODEL_CONFIG } from "./services/StepLengthModel.js";
+
+// Which sensor heading corresponds to the floor plan's "up". A property of
+// the building, so it is persisted rather than re-established each launch.
+const HEADING_ZERO_KEY = "@pdr_heading_zero_deg";
 
 let ExpoUpdates = null;
 try {
@@ -77,7 +84,15 @@ export default function AppIOS() {
 
   const runningRef = useRef(true);
   const headingRef = useRef(0);
-  const headingZeroRef = useRef(null);
+  // 0 by default = uncalibrated heading reads as raw sensor azimuth. This is
+  // ONLY ever changed by the explicit setZero() action below — nothing else
+  // (mount, Start) silently recalibrates it.
+  const headingZeroRef = useRef(0);
+  // Whether the user has ever told the app which way the floor plan's "up" is.
+  // Until they have, heading 0 means "whatever direction the sensor calls zero",
+  // which has no relationship to the map. Persisted, because it is a property of
+  // the BUILDING and does not change between sessions.
+  const [headingCalibrated, setHeadingCalibrated] = useState(false);
   const smoothedHeadingRef = useRef(0);
   const positionRef = useRef({ x: 0, y: 0 });
   const totalDistanceRef = useRef(0);
@@ -101,6 +116,25 @@ export default function AppIOS() {
   // Load saved paths and subscribe to in-app settings on mount
   useEffect(() => {
     loadSavedPathsHistory();
+
+    // Restore the personal step-length calibration. Without this the user would
+    // have to re-walk their calibration distance on every app start.
+    stepLengthModel.load();
+
+    // Restore which real-world direction counts as the map's forward.
+    (async () => {
+      try {
+        const saved = await AsyncStorage.getItem(HEADING_ZERO_KEY);
+        const v = saved === null ? NaN : Number(saved);
+        if (Number.isFinite(v)) {
+          headingZeroRef.current = v;
+          setHeadingZero(v);
+          setHeadingCalibrated(true);
+        }
+      } catch (err) {
+        console.warn("Heading zero restore failed:", err);
+      }
+    })();
 
     const unsub = subscribeAppSettings((newSettings) => {
       appSettingsRef.current = newSettings;
@@ -147,8 +181,17 @@ export default function AppIOS() {
   };
 
   const addStep = (dynamicLen = null, bounceAmp = 0) => {
+    // Accept anything the step-length model is willing to emit. These bounds
+    // used to be a separate hard-coded pair, which meant a legitimately short
+    // stride from a calibrated model could fall outside them and be silently
+    // replaced by a 0.70 m guess — quietly discarding the calibration for
+    // exactly the users who needed it most. Sourcing the range from the model
+    // keeps one definition of what counts as a plausible step.
     const len =
-      dynamicLen && isFinite(dynamicLen) && dynamicLen >= 0.45 && dynamicLen <= 1.15
+      dynamicLen &&
+      isFinite(dynamicLen) &&
+      dynamicLen >= STEP_MODEL_CONFIG.MIN_STEP_LENGTH_M &&
+      dynamicLen <= STEP_MODEL_CONFIG.MAX_STEP_LENGTH_M
         ? dynamicLen
         : 0.70;
 
@@ -173,6 +216,11 @@ export default function AppIOS() {
     setPosition(next);
     setPath((p) => [...p, next]);
     setSteps((s) => s + 1);
+
+    // Tell the BLE ranging engine the user is genuinely walking. It uses this
+    // to distinguish real movement from a signal fade, which it cannot do from
+    // RSSI alone. Reported on every step regardless of which screen is open.
+    v2Scanner.notifyStep();
 
     if (pdrStepCallbackRef.current) {
       pdrStepCallbackRef.current({ stepLengthMeters: len, heading: curHeading });
@@ -203,10 +251,17 @@ export default function AppIOS() {
           magDeg = norm(magDeg);
           setRawHeading(magDeg);
 
-          if (headingZeroRef.current === null) {
-            headingZeroRef.current = magDeg;
-          }
-          const rel = signed(headingZeroRef.current - magDeg);
+          // NOTE THE SIGN, it differs from the DeviceMotion branch below on
+          // purpose. These two sensors report rotation in OPPOSITE directions:
+          //   magDeg  = atan2(-x, y)  increases CLOCKWISE (a compass bearing)
+          //   rotation.alpha (W3C)    increases COUNTER-clockwise
+          // The app's heading convention is clockwise (0 = +Y forward,
+          // 90 = +X right), matching the compass. So the magnetometer needs
+          // (reading - zero) while alpha needs (zero - reading) to flip it.
+          // Applying the same subtraction to both mirrored this branch: turning
+          // right swung the map left, and because PDR places each step with
+          // x += len*sin(heading), every sideways step landed on the wrong side.
+          const rel = signed(magDeg - headingZeroRef.current);
           headingRef.current = rel;
           setHeading(rel);
         }
@@ -224,9 +279,9 @@ export default function AppIOS() {
         const raw = norm(alphaDeg(data.rotation.alpha));
         setRawHeading(raw);
 
-        if (headingZeroRef.current === null) {
-          headingZeroRef.current = raw;
-        }
+        // rotation.alpha increases counter-clockwise, so subtracting it from
+        // the zero reference is what converts it into the app's clockwise
+        // heading. See the sign note in the magnetometer branch above.
         const rel = signed(headingZeroRef.current - raw);
         let diff = rel - smoothedHeadingRef.current;
         if (diff > 180) diff -= 360;
@@ -243,7 +298,7 @@ export default function AppIOS() {
 
     // ── 3. Accelerometer Step Detector with Weinberg Stride Model ──
     try {
-      Accelerometer.setUpdateInterval(30);
+      Accelerometer.setUpdateInterval(STEP_MODEL_CONFIG.SAMPLE_INTERVAL_MS);
       accelSub = Accelerometer.addListener((data) => {
         if (!runningRef.current && !pdrStepCallbackRef.current) return;
         if (!data) return;
@@ -257,7 +312,15 @@ export default function AppIOS() {
         const ss = stepStateRef.current;
         const now = Date.now();
 
-        ss.filteredMag = 0.70 * ss.filteredMag + 0.30 * rawMag;
+        // Widened deliberately. The old coefficients (0.70/0.30) put this
+        // filter's -3 dB cutoff at ~1.9 Hz, i.e. INSIDE the 1.2-2.6 Hz band a
+        // human walks in, so it shrank the very peak-to-valley swing the step
+        // length model measures — and shrank it more the faster the user
+        // walked, making distance read short by 3% when strolling and 13% when
+        // hurrying. STEP_MODEL_CONFIG.LPF_ALPHA moves the cutoff above the gait
+        // band; whatever attenuation is left is divided back out analytically
+        // inside stepLengthModel.estimate().
+        ss.filteredMag += STEP_MODEL_CONFIG.LPF_ALPHA * (rawMag - ss.filteredMag);
         gravityRef.current = 0.98 * gravityRef.current + 0.02 * ss.filteredMag;
         const dynamicAccel = ss.filteredMag - gravityRef.current;
 
@@ -318,11 +381,19 @@ export default function AppIOS() {
               peakToValleyDuration >= 30 &&
               peakToValleyDuration <= 700
             ) {
+              const prevStepTime = ss.lastConfirmedStepTime;
               ss.lastConfirmedStepTime = now;
               lastStepTimeRef.current = now;
 
-              const estimated = kVal * Math.pow(bounceDiff, 0.25);
-              const dynamicStepLen = Number(Math.min(1.10, Math.max(0.48, estimated)).toFixed(2));
+              // Step length now comes from StepLengthModel, which corrects the
+              // filter's speed-dependent attenuation and applies the personal
+              // scale learned from a measured calibration walk. The step
+              // INTERVAL is what makes the correction possible: it gives the
+              // gait frequency, and the attenuation is a known function of it.
+              stepLengthModel.cfg.WEINBERG_K = kVal;
+              const stepInterval = isFirstStep ? null : now - prevStepTime;
+              const stepEst = stepLengthModel.estimate(bounceDiff, stepInterval);
+              const dynamicStepLen = Number(stepEst.lengthM.toFixed(2));
               addStep(dynamicStepLen, bounceDiff);
               setStatus(`Step: ${dynamicStepLen.toFixed(2)}m (bounce ${bounceDiff.toFixed(2)}g)`);
             }
@@ -392,6 +463,10 @@ export default function AppIOS() {
   const setZero = () => {
     headingZeroRef.current = rawHeading;
     setHeadingZero(rawHeading);
+    setHeadingCalibrated(true);
+    AsyncStorage.setItem(HEADING_ZERO_KEY, String(rawHeading)).catch((err) =>
+      console.warn("Heading zero save failed:", err)
+    );
     smoothedHeadingRef.current = 0;
     headingRef.current = 0;
     setHeading(0);
@@ -399,13 +474,8 @@ export default function AppIOS() {
   };
 
   const start = () => {
-    if (headingZeroRef.current === null) {
-      headingZeroRef.current = rawHeading;
-      setHeadingZero(rawHeading);
-      smoothedHeadingRef.current = 0;
-      headingRef.current = 0;
-      setHeading(0);
-    }
+    // Deliberately does NOT touch heading calibration — only the explicit
+    // "Set Zero" button (setZero) changes what counts as forward/0°.
     runningRef.current = true;
     setRunning(true);
     setStatus("Tracking active (Dynamic Step Length active)...");
@@ -588,6 +658,8 @@ export default function AppIOS() {
           <FusionMapScreen
             pdrStepCallbackRef={pdrStepCallbackRef}
             headingRef={headingRef}
+            onZeroHeading={setZero}
+            headingCalibrated={headingCalibrated}
           />
         ) : activeTab === "pdr" ? (
           <PdrTrackerScreen

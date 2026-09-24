@@ -233,6 +233,43 @@ export default function BeaconSignalLabScreen() {
     setApplied1mSuccess(null);
   };
 
+  const handleSwapBeacons = () => {
+    const res = v2Scanner.swapBeacons();
+    if (!res?.success) {
+      Alert.alert("Cannot Swap", res?.error || "Select both B1 and B2 first.");
+      return;
+    }
+    // Graph history is per-slot, so clear the local copy to avoid briefly
+    // drawing the old slot's trace under the new label.
+    setGraphData({ b1: [], b2: [] });
+  };
+
+  const handleMatchBeacons = () => {
+    Alert.alert(
+      "Match Both Beacons",
+      "Stand where BOTH beacons are the same distance away (e.g. exactly midway between them), hold still, then tap Match.\n\nThis cancels the hardware power difference between the two units so equal distances read equal.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Match Now",
+          onPress: () => {
+            const res = v2Scanner.matchBeaconPair();
+            if (!res?.success) {
+              Alert.alert("Cannot Match", res?.error || "Both beacons need a live signal.");
+              return;
+            }
+            Alert.alert(
+              "Beacons Matched",
+              `Measured power difference: ${res.deltaDb} dB\n\n` +
+                `B1 Tx@1m → ${res.b1TxPower} dBm\nB2 Tx@1m → ${res.b2TxPower} dBm\n\n` +
+                `Both should now report the same distance from this spot.`
+            );
+          },
+        },
+      ]
+    );
+  };
+
   const handleTxChange = (beaconNum, val) => {
     const num = parseFloat(val);
     if (!isNaN(num) && num < 0 && num > -100) {
@@ -861,6 +898,78 @@ export default function BeaconSignalLabScreen() {
               B2: {b2.name || (stats.beacon2Id ? stats.beacon2Id.slice(-5) : "Not chosen")}
             </Text>
           </View>
+        )}
+      </View>
+
+      {/* ── SLOT ASSIGNMENT — which PHYSICAL beacon is B1 vs B2 ── */}
+      {/* The MAC is the only unambiguous identifier (two beacons often share a
+          model name), so it is always shown next to the slot label. */}
+      <View style={styles.card}>
+        <View style={styles.listHeaderRow}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.cardTitle}>🔗 Beacon Slot Assignment</Text>
+            <Text style={styles.cardSub}>Which physical beacon is B1 and which is B2</Text>
+          </View>
+          <Pressable
+            style={[
+              styles.swapBeaconsBtn,
+              (!stats.beacon1Id || !stats.beacon2Id) && styles.swapBeaconsBtnDisabled,
+            ]}
+            onPress={handleSwapBeacons}
+            disabled={!stats.beacon1Id || !stats.beacon2Id}
+          >
+            <Text style={styles.swapBeaconsBtnText}>⇄ Swap B1 / B2</Text>
+          </Pressable>
+        </View>
+
+        <View style={styles.slotRow}>
+          <View style={[styles.slotChip, { borderColor: "#38bdf8" }]}>
+            <Text style={[styles.slotChipTitle, { color: "#38bdf8" }]}>B1</Text>
+            <Text style={styles.slotChipName} numberOfLines={1}>
+              {b1.name || "Not chosen"}
+            </Text>
+            <Text style={styles.slotChipMac}>{stats.beacon1Id || "—"}</Text>
+            <Text style={styles.slotChipRssi}>
+              {Number.isFinite(b1.rawRssi) ? `${b1.rawRssi} dBm` : "no signal"}
+            </Text>
+          </View>
+
+          <View style={[styles.slotChip, { borderColor: "#c084fc" }]}>
+            <Text style={[styles.slotChipTitle, { color: "#c084fc" }]}>B2</Text>
+            <Text style={styles.slotChipName} numberOfLines={1}>
+              {b2.name || "Not chosen"}
+            </Text>
+            <Text style={styles.slotChipMac}>{stats.beacon2Id || "—"}</Text>
+            <Text style={styles.slotChipRssi}>
+              {Number.isFinite(b2.rawRssi) ? `${b2.rawRssi} dBm` : "no signal"}
+            </Text>
+          </View>
+        </View>
+
+        {stats.beacon1Id && stats.beacon1Id === stats.beacon2Id && (
+          <Text style={styles.slotConflictWarning}>
+            ⚠ Both slots point at the same beacon. Pick a different device for one of them.
+          </Text>
+        )}
+
+        {/* Cancels the hardware TxPower difference between the two units, so
+            an equal physical distance reads as an equal number on both. */}
+        <Pressable
+          style={[
+            styles.matchBeaconsBtn,
+            (!stats.beacon1Id || !stats.beacon2Id) && styles.swapBeaconsBtnDisabled,
+          ]}
+          onPress={handleMatchBeacons}
+          disabled={!stats.beacon1Id || !stats.beacon2Id}
+        >
+          <Text style={styles.matchBeaconsBtnText}>⚖ Match Both Beacons (equal distance)</Text>
+        </Pressable>
+        {Number.isFinite(b1.rawRssi) && Number.isFinite(b2.rawRssi) && (
+          <Text style={styles.matchHintText}>
+            Live gap: B1 is {Math.abs(b1.rawRssi - b2.rawRssi)} dB{" "}
+            {b1.rawRssi > b2.rawRssi ? "stronger" : "weaker"} than B2. If you're standing
+            equidistant, that gap is hardware difference — tap Match to cancel it.
+          </Text>
         )}
       </View>
 
@@ -3116,5 +3225,80 @@ const styles = StyleSheet.create({
   lockedBeaconsBadge: {
     fontSize: 10,
     fontWeight: "800",
+  },
+  swapBeaconsBtn: {
+    backgroundColor: "#21262d",
+    borderWidth: 1,
+    borderColor: "#30363d",
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  swapBeaconsBtnDisabled: {
+    opacity: 0.4,
+  },
+  swapBeaconsBtnText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#e6edf3",
+  },
+  slotRow: {
+    flexDirection: "row",
+    gap: 10,
+    marginTop: 10,
+  },
+  slotChip: {
+    flex: 1,
+    borderWidth: 1,
+    borderRadius: 10,
+    padding: 10,
+    backgroundColor: "#0d1117",
+  },
+  slotChipTitle: {
+    fontSize: 13,
+    fontWeight: "800",
+    marginBottom: 4,
+  },
+  slotChipName: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#e6edf3",
+  },
+  slotChipMac: {
+    fontSize: 10,
+    color: "#8b949e",
+    marginTop: 2,
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+  },
+  slotChipRssi: {
+    fontSize: 11,
+    color: "#8b949e",
+    marginTop: 4,
+    fontWeight: "600",
+  },
+  slotConflictWarning: {
+    marginTop: 10,
+    fontSize: 11,
+    color: "#f85149",
+    fontWeight: "600",
+    lineHeight: 16,
+  },
+  matchBeaconsBtn: {
+    marginTop: 12,
+    backgroundColor: "#1f6feb",
+    borderRadius: 8,
+    paddingVertical: 11,
+    alignItems: "center",
+  },
+  matchBeaconsBtnText: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#ffffff",
+  },
+  matchHintText: {
+    marginTop: 8,
+    fontSize: 11,
+    color: "#8b949e",
+    lineHeight: 16,
   },
 });

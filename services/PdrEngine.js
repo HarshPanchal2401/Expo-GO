@@ -4,31 +4,50 @@
 // Self-contained, framework-free position accumulator driven by step events.
 // Used by FusionEngine as the "prediction" side of the async EKF.
 //
+// UNITS: this engine operates entirely in FEET. Callers (App.android.js's
+// accelerometer step detector) compute step length in metres via the Weinberg
+// model — convert once, at the call site, with metresToFeet() before calling
+// applyStep(). Every other spatial value here (x, y, uncertaintyRadius,
+// totalDistanceFt) is feet, matching the office floor plan's foot-based grid,
+// so there is exactly one conversion point and no unit ambiguity downstream.
+//
 // Usage:
 //   const pdr = new PdrEngine();
 //   pdr.reset(0, 0);
-//   pdr.applyStep(0.75, 45.0);  // 75 cm step toward NE
+//   pdr.applyStep(2.3, 45.0);  // ~2.3 ft step toward NE
 //   const { x, y, uncertaintyRadius } = pdr.getState();
 // ============================================================================
 
+const M_TO_FT = 3.280839895;
+
+/** Converts metres to feet — the single conversion helper shared across the app. */
+export function metresToFeet(m) {
+  return m * M_TO_FT;
+}
+
+/** Converts feet to metres. */
+export function feetToMetres(ft) {
+  return ft / M_TO_FT;
+}
+
 // ============================================================================
-// CONFIGURABLE CONSTANTS
+// CONFIGURABLE CONSTANTS (all spatial values in FEET)
 // ============================================================================
 
 export const PDR_CONFIG = {
   // Uncertainty grows per step as a fraction of step length.
-  // 10% means every 1 m step adds 0.10 m of positional uncertainty.
+  // 10% means every 1 ft step adds 0.10 ft of positional uncertainty.
   STEP_UNCERTAINTY_FACTOR: 0.10,
 
   // Uncertainty grows passively (per second while standing still) due to
-  // sensor drift and heading noise even when not walking.
-  PASSIVE_DRIFT_M_PER_S: 0.005,
+  // sensor drift and heading noise even when not walking. (0.005 m/s)
+  PASSIVE_DRIFT_FT_PER_S: 0.0164,
 
-  // Maximum uncertainty radius the tracker will report (caps the growing halo).
-  MAX_UNCERTAINTY_M: 8.0,
+  // Maximum uncertainty radius the tracker will report (caps the growing halo). (8.0 m)
+  MAX_UNCERTAINTY_FT: 26.25,
 
-  // Initial uncertainty at reset (small — we know our start position).
-  INITIAL_UNCERTAINTY_M: 0.3,
+  // Initial uncertainty at reset (small — we know our start position). (~0.3 m)
+  INITIAL_UNCERTAINTY_FT: 1.0,
 
   // Confidence decays from 1.0 toward this floor as time since last step grows.
   MIN_CONFIDENCE: 0.15,
@@ -38,6 +57,11 @@ export const PDR_CONFIG = {
 
   // Time in milliseconds over which confidence decays from 1.0 to MIN_CONFIDENCE.
   CONFIDENCE_DECAY_DURATION_MS: 20000,
+
+  // Human step length clamp in feet (~0.45 - 1.05 m).
+  MIN_STEP_LENGTH_FT: 1.48,
+  MAX_STEP_LENGTH_FT: 3.44,
+  DEFAULT_STEP_LENGTH_FT: 2.3,
 };
 
 // ============================================================================
@@ -56,10 +80,10 @@ export class PdrEngine {
       y: 0,
       headingDeg: 0,
       stepCount: 0,
-      totalDistanceM: 0,
+      totalDistanceFt: 0,
       lastStepTime: null,       // timestamp of most recent step (ms)
       resetTime: Date.now(),    // timestamp of last reset
-      uncertaintyRadius: this._cfg.INITIAL_UNCERTAINTY_M,
+      uncertaintyRadius: this._cfg.INITIAL_UNCERTAINTY_FT,
     };
   }
 
@@ -69,8 +93,8 @@ export class PdrEngine {
 
   /**
    * Reset PDR to a known position (cold start or BLE-corrected anchor).
-   * @param {number} x - Initial X coordinate in metres
-   * @param {number} y - Initial Y coordinate in metres
+   * @param {number} x - Initial X coordinate in feet
+   * @param {number} y - Initial Y coordinate in feet
    */
   reset(x = 0, y = 0) {
     const now = Date.now();
@@ -93,25 +117,25 @@ export class PdrEngine {
    *   Heading -90° → -X (West / Left)
    *   Heading 180° → -Y (South / Backward)
    *
-   * @param {number} stepLengthM - Weinberg-estimated step length in metres [0.45, 1.05]
-   * @param {number} headingDeg  - Current smoothed heading in degrees (relative to calibrated zero)
+   * @param {number} stepLengthFt - Weinberg-estimated step length in FEET (already converted from metres)
+   * @param {number} headingDeg   - Current smoothed heading in degrees (relative to calibrated zero)
    */
-  applyStep(stepLengthM, headingDeg) {
-    const len = this._clampStepLength(stepLengthM);
+  applyStep(stepLengthFt, headingDeg) {
+    const len = this._clampStepLength(stepLengthFt);
     const rad = (headingDeg * Math.PI) / 180;
 
     this._state.x += len * Math.sin(rad);
     this._state.y += len * Math.cos(rad);
     this._state.headingDeg = headingDeg;
     this._state.stepCount++;
-    this._state.totalDistanceM += len;
+    this._state.totalDistanceFt += len;
     this._state.lastStepTime = Date.now();
 
     // Accumulate positional uncertainty: σ grows by 10% of step length per step.
     // This models step-length estimation error and heading noise.
     const stepSigma = this._cfg.STEP_UNCERTAINTY_FACTOR * len;
     this._state.uncertaintyRadius = Math.min(
-      this._cfg.MAX_UNCERTAINTY_M,
+      this._cfg.MAX_UNCERTAINTY_FT,
       Math.sqrt(this._state.uncertaintyRadius ** 2 + stepSigma ** 2)
     );
   }
@@ -126,8 +150,8 @@ export class PdrEngine {
   tickPassiveDrift(dtSec) {
     const safeDt = Math.max(0, Math.min(dtSec, 5.0));
     this._state.uncertaintyRadius = Math.min(
-      this._cfg.MAX_UNCERTAINTY_M,
-      this._state.uncertaintyRadius + this._cfg.PASSIVE_DRIFT_M_PER_S * safeDt
+      this._cfg.MAX_UNCERTAINTY_FT,
+      this._state.uncertaintyRadius + this._cfg.PASSIVE_DRIFT_FT_PER_S * safeDt
     );
   }
 
@@ -136,15 +160,15 @@ export class PdrEngine {
    * after an EKF BLE correction step). Also shrinks the uncertainty radius
    * because BLE has anchored the position.
    *
-   * @param {number} correctedX
-   * @param {number} correctedY
-   * @param {number} newUncertaintyM - Updated uncertainty radius from EKF
+   * @param {number} correctedX - feet
+   * @param {number} correctedY - feet
+   * @param {number} newUncertaintyFt - Updated uncertainty radius from EKF, in feet
    */
-  applyCorrection(correctedX, correctedY, newUncertaintyM) {
+  applyCorrection(correctedX, correctedY, newUncertaintyFt) {
     this._state.x = Number.isFinite(correctedX) ? correctedX : this._state.x;
     this._state.y = Number.isFinite(correctedY) ? correctedY : this._state.y;
-    this._state.uncertaintyRadius = Number.isFinite(newUncertaintyM)
-      ? Math.max(this._cfg.INITIAL_UNCERTAINTY_M, newUncertaintyM)
+    this._state.uncertaintyRadius = Number.isFinite(newUncertaintyFt)
+      ? Math.max(this._cfg.INITIAL_UNCERTAINTY_FT, newUncertaintyFt)
       : this._state.uncertaintyRadius;
   }
 
@@ -173,8 +197,8 @@ export class PdrEngine {
   }
 
   /**
-   * Returns the current full state snapshot.
-   * @returns {{ x, y, headingDeg, stepCount, totalDistanceM, uncertaintyRadius, confidence }}
+   * Returns the current full state snapshot (all spatial values in feet).
+   * @returns {{ x, y, headingDeg, stepCount, totalDistanceFt, uncertaintyRadius, confidence }}
    */
   getState() {
     return {
@@ -182,7 +206,7 @@ export class PdrEngine {
       y: Number(this._state.y.toFixed(3)),
       headingDeg: this._state.headingDeg,
       stepCount: this._state.stepCount,
-      totalDistanceM: Number(this._state.totalDistanceM.toFixed(2)),
+      totalDistanceFt: Number(this._state.totalDistanceFt.toFixed(2)),
       lastStepTime: this._state.lastStepTime,
       uncertaintyRadius: Number(this._state.uncertaintyRadius.toFixed(3)),
       confidence: Number(this.getConfidence().toFixed(3)),
@@ -194,8 +218,8 @@ export class PdrEngine {
   // --------------------------------------------------------------------------
 
   _clampStepLength(len) {
-    if (!Number.isFinite(len)) return 0.70; // safe fallback
-    return Math.max(0.45, Math.min(1.05, len));
+    if (!Number.isFinite(len)) return this._cfg.DEFAULT_STEP_LENGTH_FT;
+    return Math.max(this._cfg.MIN_STEP_LENGTH_FT, Math.min(this._cfg.MAX_STEP_LENGTH_FT, len));
   }
 }
 

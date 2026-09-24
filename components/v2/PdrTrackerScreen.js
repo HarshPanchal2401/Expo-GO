@@ -21,7 +21,9 @@ import {
   ScrollView,
   Dimensions,
   Platform,
+  TextInput,
 } from "react-native";
+import { stepLengthModel } from "../../services/StepLengthModel.js";
 import Svg, {
   Polyline,
   Circle,
@@ -35,6 +37,7 @@ import Svg, {
 } from "react-native-svg";
 
 const SCREEN_WIDTH = Dimensions.get("window").width;
+const FT_PER_M = 3.280839895;
 
 // Theme palette matching V2
 const C = {
@@ -53,6 +56,167 @@ const C = {
   red: "#f85149",
   purple: "#bc8cff",
 };
+
+
+// ============================================================================
+// Step Length Calibration Card
+//
+// This is the control that turns "the path shape is right" into "10 ft walked
+// reads 10 ft". No formula can know a given person's stride, so the model ships
+// with a generic coefficient and learns the personal correction here: the user
+// walks a distance they have measured, and the model back-solves the scale that
+// makes its own summed step lengths equal that distance.
+// ============================================================================
+function StepCalibrationCard() {
+  const [cal, setCal] = React.useState(() => stepLengthModel.toJSON());
+  const [progress, setProgress] = React.useState({ active: false, steps: 0, estimatedDistanceFt: 0 });
+  const [distanceFt, setDistanceFt] = React.useState("50");
+  const [msg, setMsg] = React.useState(null);
+
+  // Poll the walk in progress so the user can see steps accumulating and knows
+  // the walk is actually being recorded before they commit a distance to it.
+  React.useEffect(() => {
+    if (!progress.active) return undefined;
+    const id = setInterval(() => setProgress(stepLengthModel.getCalibrationProgress()), 400);
+    return () => clearInterval(id);
+  }, [progress.active]);
+
+  const begin = () => {
+    stepLengthModel.beginCalibration();
+    setMsg(null);
+    setProgress(stepLengthModel.getCalibrationProgress());
+  };
+
+  const cancel = () => {
+    stepLengthModel.cancelCalibration();
+    setProgress({ active: false, steps: 0, estimatedDistanceFt: 0 });
+    setMsg(null);
+  };
+
+  const finish = async () => {
+    const ft = parseFloat(distanceFt);
+    if (!Number.isFinite(ft) || ft <= 0) {
+      setMsg({ ok: false, text: "Enter the distance you actually walked, in feet." });
+      return;
+    }
+    const res = stepLengthModel.calibrate(ft / FT_PER_M);
+    setProgress(stepLengthModel.getCalibrationProgress());
+    if (res.ok) {
+      await stepLengthModel.save();
+      setCal(stepLengthModel.toJSON());
+      const pct = (res.scale - 1) * 100;
+      setMsg({
+        ok: true,
+        text: `Calibrated over ${res.steps} steps. Your step length is ${(res.impliedStepLengthM * FT_PER_M).toFixed(2)} ft — ${pct >= 0 ? "+" : ""}${pct.toFixed(1)}% vs the default estimate.`,
+      });
+    } else {
+      setMsg({ ok: false, text: res.reason });
+    }
+  };
+
+  const resetCal = async () => {
+    stepLengthModel.resetCalibration();
+    await stepLengthModel.save();
+    setCal(stepLengthModel.toJSON());
+    setMsg({ ok: true, text: "Reset to the uncalibrated default." });
+  };
+
+  const isCal = cal.calibrationK != null;
+  const enoughSteps = progress.steps >= 15;
+
+  return (
+    <View style={styles.card}>
+      <View style={styles.cardHeaderRow}>
+        <Text style={styles.cardLabel}>STEP LENGTH CALIBRATION</Text>
+        <View style={[styles.pillBadge, isCal && { borderColor: C.green }]}>
+          <Text style={[styles.pillBadgeText, isCal && { color: C.green }]}>
+            {isCal ? `${cal.personalScale.toFixed(3)}x` : "DEFAULT"}
+          </Text>
+        </View>
+      </View>
+
+      <Text style={styles.cardNote}>
+        {isCal
+          ? `Calibrated over ${cal.calibrationSamples} steps across ${(cal.calibrationDistanceM * FT_PER_M).toFixed(0)} ft. Distances are scaled to your stride.`
+          : "Not calibrated — distances use a generic stride and may be off by 5–15%. Walk a measured distance once to fix this permanently."}
+      </Text>
+
+      {!progress.active ? (
+        <>
+          <Pressable
+            onPress={begin}
+            style={({ pressed }) => [styles.calPrimaryBtn, pressed && styles.btnPressed]}
+          >
+            <Text style={styles.calPrimaryBtnText}>📏 Start Calibration Walk</Text>
+          </Pressable>
+          {isCal ? (
+            <Pressable
+              onPress={resetCal}
+              style={({ pressed }) => [styles.calGhostBtn, pressed && styles.btnPressed]}
+            >
+              <Text style={styles.calGhostBtnText}>Reset to default</Text>
+            </Pressable>
+          ) : null}
+          <Text style={styles.calHint}>
+            Pick a distance you can measure exactly — a corridor, or a wall-to-wall run on the
+            2 ft floor-plan grid. Use 40 ft or more: a shorter walk does not produce the 15
+            steps this needs, and a miscounted step would skew the result. Walk it at your
+            normal pace, and start and stop exactly on the marks.
+          </Text>
+        </>
+      ) : (
+        <>
+          <View style={styles.calProgressBox}>
+            <Text style={styles.calProgressSteps}>{progress.steps}</Text>
+            <Text style={styles.calProgressLabel}>
+              steps recorded{enoughSteps ? "" : " — keep walking (15 minimum)"}
+            </Text>
+            <Text style={styles.calProgressEst}>
+              current estimate: {progress.estimatedDistanceFt.toFixed(1)} ft
+            </Text>
+          </View>
+
+          <Text style={styles.calInputLabel}>Distance you actually walked (feet)</Text>
+          <TextInput
+            value={distanceFt}
+            onChangeText={setDistanceFt}
+            keyboardType="numeric"
+            placeholder="50"
+            placeholderTextColor={C.textDim}
+            style={styles.calInput}
+          />
+
+          <View style={styles.buttonRow}>
+            <Pressable
+              onPress={cancel}
+              style={({ pressed }) => [styles.actionBtn, styles.btnOutline, pressed && styles.btnPressed]}
+            >
+              <Text style={styles.actionBtnText}>Cancel</Text>
+            </Pressable>
+            <Pressable
+              onPress={finish}
+              disabled={!enoughSteps}
+              style={({ pressed }) => [
+                styles.actionBtn,
+                enoughSteps ? styles.btnSave : styles.btnOutline,
+                !enoughSteps && { opacity: 0.45 },
+                pressed && styles.btnPressed,
+              ]}
+            >
+              <Text style={styles.actionBtnText}>✓ Save Calibration</Text>
+            </Pressable>
+          </View>
+        </>
+      )}
+
+      {msg ? (
+        <Text style={[styles.calMsg, msg.ok ? { color: C.green } : { color: C.orange }]}>
+          {msg.text}
+        </Text>
+      ) : null}
+    </View>
+  );
+}
 
 export default function PdrTrackerScreen({
   steps = 0,
@@ -196,6 +360,8 @@ export default function PdrTrackerScreen({
           <Text style={styles.testStepBtnText}>👣 Add Manual Test Step (0.70m)</Text>
         </Pressable>
       </View>
+
+      <StepCalibrationCard />
 
       {/* ── 2D Path Canvas ── */}
       <View style={styles.card}>
@@ -561,6 +727,57 @@ function PathCanvas({ points, heading, previousPath }) {
 }
 
 const styles = StyleSheet.create({
+  // ── Step length calibration card ──
+  calPrimaryBtn: {
+    backgroundColor: "#1f6feb",
+    borderRadius: 8,
+    paddingVertical: 13,
+    alignItems: "center",
+    marginTop: 12,
+  },
+  calPrimaryBtnText: { color: "#ffffff", fontSize: 14, fontWeight: "700" },
+  calGhostBtn: { paddingVertical: 10, alignItems: "center", marginTop: 6 },
+  calGhostBtnText: { color: "#8b949e", fontSize: 12, fontWeight: "600" },
+  calHint: {
+    color: "#8b949e",
+    fontSize: 11,
+    lineHeight: 16,
+    marginTop: 10,
+  },
+  calProgressBox: {
+    backgroundColor: "#1c2128",
+    borderWidth: 1,
+    borderColor: "#30363d",
+    borderRadius: 8,
+    paddingVertical: 16,
+    alignItems: "center",
+    marginTop: 12,
+  },
+  calProgressSteps: { color: "#58a6ff", fontSize: 34, fontWeight: "800" },
+  calProgressLabel: { color: "#8b949e", fontSize: 12, marginTop: 2 },
+  calProgressEst: { color: "#484f58", fontSize: 11, marginTop: 6 },
+  calInputLabel: {
+    color: "#8b949e",
+    fontSize: 11,
+    fontWeight: "700",
+    letterSpacing: 0.5,
+    marginTop: 14,
+    marginBottom: 6,
+  },
+  calInput: {
+    backgroundColor: "#0d1117",
+    borderWidth: 1,
+    borderColor: "#30363d",
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    color: "#e6edf3",
+    fontSize: 16,
+    fontWeight: "600",
+    marginBottom: 12,
+  },
+  calMsg: { fontSize: 12, lineHeight: 17, marginTop: 12, fontWeight: "600" },
+
   screen: {
     flex: 1,
     backgroundColor: C.bg,

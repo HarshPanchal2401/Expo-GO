@@ -82,6 +82,18 @@ class V2BeaconScannerService {
     this.scanning = false;
     this.totalPacketsReceived = 0;
 
+    // ── Motion state relay (PDR step detector -> AdaptiveBeaconEngine) ──
+    // The ranging engine cannot tell a person walking away from a person being
+    // blocked by a wall or a passing body: both simply lower RSSI. A step
+    // detector can, so the app forwards steps here via notifyStep() and the
+    // scanner keeps the engine continuously informed. Motion reporting stays
+    // OFF until the first step is seen, so a screen that never reports steps
+    // leaves the engine on its own (more conservative) internal estimate rather
+    // than being told it is permanently stationary.
+    this._lastStepAt = null;
+    this._motionReportingActive = false;
+    this.stepIdleTimeoutMs = 1200;
+
     // Discovered devices: Map<deviceId, deviceObject>
     this.discoveredDevices = new Map();
 
@@ -207,54 +219,135 @@ class V2BeaconScannerService {
   }
 
   /**
-   * Explicitly select a beacon as Beacon 1 or Beacon 2 from the discovered list
+   * Writes one slot (1 or 2) without any conflict checking. Internal only —
+   * callers must go through selectBeacon()/swapBeacons(), which guarantee the
+   * two slots never point at the same physical beacon.
+   */
+  _assignSlot(beaconNum, deviceId, displayName, txPower) {
+    const key = beaconNum === 1 ? "b1" : "b2";
+    const device = this.discoveredDevices.get(deviceId);
+
+    this.config[beaconNum === 1 ? "beacon1Id" : "beacon2Id"] = deviceId;
+    this.config[beaconNum === 1 ? "beacon1Name" : "beacon2Name"] = displayName;
+    if (Number.isFinite(txPower)) {
+      this.config[beaconNum === 1 ? "beacon1TxPower" : "beacon2TxPower"] = txPower;
+    }
+
+    this.graphHistory[key] = [];
+    this.timestampWindows[key] = [];
+    this.lastDistanceUpdate[key] = { dist: null, time: null };
+    this.stats[key] = {
+      ...this._createInitialBeaconStats(beaconNum),
+      id: deviceId,
+      mac: deviceId,
+      name: displayName,
+      major: device?.major || null,
+      minor: device?.minor || null,
+      uuid: device?.uuid || null,
+      txPower: this.config[beaconNum === 1 ? "beacon1TxPower" : "beacon2TxPower"],
+    };
+  }
+
+  /**
+   * Explicitly select a beacon as Beacon 1 or Beacon 2 from the discovered list.
+   *
+   * If the chosen device is ALREADY occupying the other slot, the two slots are
+   * SWAPPED rather than both ending up pointing at the same physical beacon.
+   * Without this, tapping "Set B1" on the current B2 left beacon1Id ===
+   * beacon2Id, so both traces/names/RSSI readouts showed one and the same
+   * beacon — which reads as the B1/B2 labels having swapped or duplicated.
+   *
+   * Per-slot calibrated TxPower travels with the device across a swap, since
+   * it is a property of the physical beacon, not of the slot it sits in.
+   * (The OLS path-loss calibration in AdaptiveBeaconEngine is keyed by MAC, so
+   * that already follows the device automatically.)
    */
   selectBeacon(beaconNum, deviceId, customName = null) {
-    if (!deviceId) return;
+    if (!deviceId || (beaconNum !== 1 && beaconNum !== 2)) return;
+
+    const otherNum = beaconNum === 1 ? 2 : 1;
+    const currentOwnId = beaconNum === 1 ? this.config.beacon1Id : this.config.beacon2Id;
+    const otherId = otherNum === 1 ? this.config.beacon1Id : this.config.beacon2Id;
+
+    // Already in the requested slot — nothing to do.
+    if (currentOwnId === deviceId) return;
+
     const device = this.discoveredDevices.get(deviceId);
     const displayName = customName || device?.name || `Beacon (${deviceId.slice(-5)})`;
+    const ownTx = beaconNum === 1 ? this.config.beacon1TxPower : this.config.beacon2TxPower;
+    const otherTx = otherNum === 1 ? this.config.beacon1TxPower : this.config.beacon2TxPower;
 
-    if (beaconNum === 1) {
-      this.config.beacon1Id = deviceId;
-      this.config.beacon1Name = displayName;
-      this.graphHistory.b1 = [];
-      this.timestampWindows.b1 = [];
-      this.lastDistanceUpdate.b1 = { dist: null, time: null };
-      this.stats.b1 = {
-        ...this._createInitialBeaconStats(1),
-        id: deviceId,
-        mac: deviceId,
-        name: displayName,
-        major: device?.major || null,
-        minor: device?.minor || null,
-        uuid: device?.uuid || null,
-        txPower: this.config.beacon1TxPower,
-      };
-      this.saveConfig({ beacon1Id: deviceId, beacon1Name: displayName });
-    } else if (beaconNum === 2) {
-      this.config.beacon2Id = deviceId;
-      this.config.beacon2Name = displayName;
-      this.graphHistory.b2 = [];
-      this.timestampWindows.b2 = [];
-      this.lastDistanceUpdate.b2 = { dist: null, time: null };
-      this.stats.b2 = {
-        ...this._createInitialBeaconStats(2),
-        id: deviceId,
-        mac: deviceId,
-        name: displayName,
-        major: device?.major || null,
-        minor: device?.minor || null,
-        uuid: device?.uuid || null,
-        txPower: this.config.beacon2TxPower,
-      };
-      this.saveConfig({ beacon2Id: deviceId, beacon2Name: displayName });
+    if (otherId && otherId === deviceId) {
+      // ── Conflict: the device lives in the other slot. Swap the two. ──
+      const displacedName =
+        (beaconNum === 1 ? this.config.beacon1Name : this.config.beacon2Name) ||
+        (currentOwnId ? `Beacon (${currentOwnId.slice(-5)})` : null);
+
+      this._assignSlot(beaconNum, deviceId, displayName, otherTx);
+      if (currentOwnId) {
+        this._assignSlot(otherNum, currentOwnId, displacedName, ownTx);
+      } else {
+        this._clearSlot(otherNum);
+      }
+    } else {
+      this._assignSlot(beaconNum, deviceId, displayName, ownTx);
     }
+
+    this.saveConfig({
+      beacon1Id: this.config.beacon1Id,
+      beacon1Name: this.config.beacon1Name,
+      beacon1TxPower: this.config.beacon1TxPower,
+      beacon2Id: this.config.beacon2Id,
+      beacon2Name: this.config.beacon2Name,
+      beacon2TxPower: this.config.beacon2TxPower,
+    });
 
     if (device && Number.isFinite(device.rawRssi)) {
       this._updateBeaconStream(beaconNum, device, device.rawRssi, Date.now());
     } else {
       this.emitStats();
     }
+  }
+
+  /** Empties a slot back to its unassigned placeholder state. */
+  _clearSlot(beaconNum) {
+    const key = beaconNum === 1 ? "b1" : "b2";
+    this.config[beaconNum === 1 ? "beacon1Id" : "beacon2Id"] = null;
+    this.config[beaconNum === 1 ? "beacon1Name" : "beacon2Name"] = `Beacon ${beaconNum}`;
+    this.graphHistory[key] = [];
+    this.timestampWindows[key] = [];
+    this.lastDistanceUpdate[key] = { dist: null, time: null };
+    this.stats[key] = this._createInitialBeaconStats(beaconNum);
+  }
+
+  /**
+   * Swaps which physical beacon is B1 and which is B2, carrying each one's
+   * calibrated TxPower with it. Useful when the auto-assignment (first beacon
+   * seen becomes B1) doesn't match how they're laid out on the floor plan.
+   */
+  swapBeacons() {
+    const id1 = this.config.beacon1Id;
+    const id2 = this.config.beacon2Id;
+    if (!id1 || !id2) return { success: false, error: "Both beacons must be selected first." };
+
+    const name1 = this.config.beacon1Name;
+    const name2 = this.config.beacon2Name;
+    const tx1 = this.config.beacon1TxPower;
+    const tx2 = this.config.beacon2TxPower;
+
+    this._assignSlot(1, id2, name2, tx2);
+    this._assignSlot(2, id1, name1, tx1);
+
+    this.saveConfig({
+      beacon1Id: this.config.beacon1Id,
+      beacon1Name: this.config.beacon1Name,
+      beacon1TxPower: this.config.beacon1TxPower,
+      beacon2Id: this.config.beacon2Id,
+      beacon2Name: this.config.beacon2Name,
+      beacon2TxPower: this.config.beacon2TxPower,
+    });
+    this.emitStats();
+    return { success: true };
   }
 
   /**
@@ -566,6 +659,15 @@ class V2BeaconScannerService {
     // Outlier Gating -> Live Variance -> Adaptive Kalman Filter (Dynamic Q & R)
     // -> Calibrated Path Loss / Near-Field Touch -> Kinematic Slew Limiter
     // -------------------------------------------------------------------------
+    // Relay the current motion verdict before ingesting, so the engine can hold
+    // its shadow envelope firm while standing still and release it the moment
+    // real walking starts. "Moving" means a step landed recently; after
+    // stepIdleTimeoutMs of no steps the user is treated as standing.
+    if (this._motionReportingActive) {
+      const sinceStepMs = now - this._lastStepAt;
+      adaptiveEngine.setMotionState(sinceStepMs < this.stepIdleTimeoutMs, now);
+    }
+
     let adaptiveData = null;
     try {
       adaptiveData = adaptiveEngine.ingestReading(
@@ -690,6 +792,57 @@ class V2BeaconScannerService {
     return { success: true, ...res };
   }
 
+  /**
+   * Equalizes the two beacons so that standing at one spot yields the SAME
+   * reported distance from both.
+   *
+   * WHY THIS IS NEEDED: two beacons of the same model still differ in actual
+   * radiated power by several dB (manufacturing tolerance, antenna orientation,
+   * mounting surface, battery level). In the log-distance model, a TxPower
+   * mismatch of Δ dB turns into a CONSTANT RATIO between the two reported
+   * distances — so one beacon reads e.g. 4 m while the other reads 7 m from the
+   * exact same spot. No amount of filtering fixes that; it is a calibration
+   * offset, not noise.
+   *
+   * The user stands where both beacons are genuinely equidistant and calls
+   * this. Both TxPowers are then moved symmetrically about their mean so the
+   * two agree at that point, while the overall scale (and therefore absolute
+   * distance accuracy) is left untouched:
+   *     tx_i_new = txMean + (rssi_i − rssiMean)
+   *
+   * @returns {{success: boolean, error?: string, b1TxPower?: number, b2TxPower?: number, deltaDb?: number}}
+   */
+  matchBeaconPair() {
+    const s1 = this.stats.b1;
+    const s2 = this.stats.b2;
+    if (!this.config.beacon1Id || !this.config.beacon2Id) {
+      return { success: false, error: "Select both B1 and B2 first." };
+    }
+    const r1 = Number.isFinite(s1.filteredRssi) ? s1.filteredRssi : s1.rawRssi;
+    const r2 = Number.isFinite(s2.filteredRssi) ? s2.filteredRssi : s2.rawRssi;
+    if (!Number.isFinite(r1) || !Number.isFinite(r2)) {
+      return { success: false, error: "Both beacons need a live signal before matching." };
+    }
+
+    const tx1 = Number.isFinite(this.config.beacon1TxPower) ? this.config.beacon1TxPower : -59;
+    const tx2 = Number.isFinite(this.config.beacon2TxPower) ? this.config.beacon2TxPower : -59;
+    const txMean = (tx1 + tx2) / 2;
+    const rssiMean = (r1 + r2) / 2;
+
+    const newTx1 = Number((txMean + (r1 - rssiMean)).toFixed(1));
+    const newTx2 = Number((txMean + (r2 - rssiMean)).toFixed(1));
+
+    this.set1MeterTxPower(1, newTx1);
+    this.set1MeterTxPower(2, newTx2);
+
+    return {
+      success: true,
+      b1TxPower: newTx1,
+      b2TxPower: newTx2,
+      deltaDb: Number((r1 - r2).toFixed(1)),
+    };
+  }
+
   set1MeterTxPower(beaconNum, txPower1m) {
     const val = Number(Number(txPower1m).toFixed(1));
     const isB1 = beaconNum === 1;
@@ -770,6 +923,17 @@ class V2BeaconScannerService {
    * @param {number|null} beaconHeightM
    * @param {number} phoneHeightM
    */
+  /**
+   * Reports a detected footstep from the PDR engine. Call this on every step;
+   * the scanner derives a live moving/standing verdict from the gap between
+   * steps and forwards it to the ranging engine. Knowing this is what lets the
+   * engine reject multi-second signal fades without also lagging real movement.
+   */
+  notifyStep(timestamp = Date.now()) {
+    this._lastStepAt = timestamp;
+    this._motionReportingActive = true;
+  }
+
   setBeaconHeights(beaconHeightM, phoneHeightM = 1.1) {
     adaptiveEngine.setHeights(beaconHeightM, phoneHeightM);
     this.saveConfig({
@@ -778,19 +942,33 @@ class V2BeaconScannerService {
     });
   }
 
+  /**
+   * Caps every beacon's computed distance at this many metres — normally the
+   * real floor plan's diagonal. Nothing legitimate should measure farther
+   * than the deployment space physically allows; without this, a weak
+   * signal combined with an uncalibrated or sparsely-calibrated path-loss
+   * model can extrapolate to a "hallucinated" distance far outside the room.
+   */
+  setMaxPlausibleDistance(maxDistanceM) {
+    adaptiveEngine.setMaxPlausibleDistance(maxDistanceM);
+  }
+
   // =========================================================================
-  // FUSION MAP — PLACE SIZE & BEACON ANCHOR PERSISTENCE
+  // OFFICE MAP — FLOOR-PLAN SIZE & BEACON ANCHOR PERSISTENCE (all in FEET)
+  // Storage keys are versioned "_ft" — distinct from the old metre-based keys
+  // so a prior metre-based room/anchor save is never silently reinterpreted
+  // as feet.
   // =========================================================================
 
   /**
-   * Persist room/place dimensions for the Fusion Map.
-   * @param {{ widthM: number, heightM: number }} size
+   * Persist floor-plan dimensions for the Office Map, in FEET.
+   * @param {{ widthFt: number, heightFt: number }} size
    */
-  async setPlaceSize({ widthM, heightM }) {
+  async setPlaceSize({ widthFt, heightFt }) {
     try {
       await AsyncStorage.setItem(
-        "@v2_fusion_place_size",
-        JSON.stringify({ widthM: Number(widthM), heightM: Number(heightM) })
+        "@v2_fusion_place_size_ft",
+        JSON.stringify({ widthFt: Number(widthFt), heightFt: Number(heightFt) })
       );
     } catch (e) {
       console.warn("[V2Scanner] setPlaceSize error:", e);
@@ -798,19 +976,19 @@ class V2BeaconScannerService {
   }
 
   /**
-   * Load saved room/place dimensions. Returns null if not yet configured.
-   * @returns {Promise<{ widthM: number, heightM: number } | null>}
+   * Load saved floor-plan dimensions. Returns null if not yet configured.
+   * @returns {Promise<{ widthFt: number, heightFt: number } | null>}
    */
   async getPlaceSize() {
     try {
-      const raw = await AsyncStorage.getItem("@v2_fusion_place_size");
+      const raw = await AsyncStorage.getItem("@v2_fusion_place_size_ft");
       if (!raw) return null;
       const parsed = JSON.parse(raw);
       if (
-        Number.isFinite(parsed.widthM) && parsed.widthM > 0 &&
-        Number.isFinite(parsed.heightM) && parsed.heightM > 0
+        Number.isFinite(parsed.widthFt) && parsed.widthFt > 0 &&
+        Number.isFinite(parsed.heightFt) && parsed.heightFt > 0
       ) {
-        return { widthM: parsed.widthM, heightM: parsed.heightM };
+        return { widthFt: parsed.widthFt, heightFt: parsed.heightFt };
       }
       return null;
     } catch (e) {
@@ -819,14 +997,14 @@ class V2BeaconScannerService {
   }
 
   /**
-   * Persist world-coordinate anchor positions for both beacons.
-   * @param {{ x: number, y: number }} b1 - Beacon 1 world position (metres)
-   * @param {{ x: number, y: number }} b2 - Beacon 2 world position (metres)
+   * Persist world-coordinate anchor positions for both beacons, in FEET.
+   * @param {{ x: number, y: number }} b1 - Beacon 1 world position (feet)
+   * @param {{ x: number, y: number }} b2 - Beacon 2 world position (feet)
    */
   async setBeaconAnchors(b1, b2) {
     try {
       await AsyncStorage.setItem(
-        "@v2_fusion_anchors",
+        "@v2_fusion_anchors_ft",
         JSON.stringify({
           b1: { x: Number(b1.x), y: Number(b1.y) },
           b2: { x: Number(b2.x), y: Number(b2.y) },
@@ -838,13 +1016,13 @@ class V2BeaconScannerService {
   }
 
   /**
-   * Load saved beacon anchor positions.
+   * Load saved beacon anchor positions (feet).
    * Returns null if not yet configured.
    * @returns {Promise<{ b1: {x,y}, b2: {x,y} } | null>}
    */
   async getBeaconAnchors() {
     try {
-      const raw = await AsyncStorage.getItem("@v2_fusion_anchors");
+      const raw = await AsyncStorage.getItem("@v2_fusion_anchors_ft");
       if (!raw) return null;
       const parsed = JSON.parse(raw);
       const validCoord = (p) =>
