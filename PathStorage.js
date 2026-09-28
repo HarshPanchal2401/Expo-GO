@@ -32,7 +32,12 @@ export async function savePath(pathData) {
     timestamp: new Date().toLocaleString(),
     steps: pathData.steps || 0,
     distance: pathData.distance || 0,
-    points: pathData.points || []
+    points: pathData.points || [],
+    // Which screen recorded it and in what unit. The PDR tracker saves metres
+    // from its own origin while the Fusion Map saves floor-plan feet, and the
+    // two cannot be drawn on the same map without knowing which is which.
+    ...(pathData.source ? { source: pathData.source } : {}),
+    ...(pathData.units ? { units: pathData.units } : {}),
   };
 
   const existing = await getSavedPaths();

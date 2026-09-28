@@ -18,7 +18,11 @@ const STORAGE_KEY = "@app_config_settings_v2";
 export const DEFAULT_APP_SETTINGS = {
   // ─── BLE Distance & Filtering ─────────────────────────────────────────────
   txPower: -59,                    // Measured RSSI at 1 meter (dBm)
-  pathLossN: 2.2,                  // Environmental path loss exponent n (typically 1.8 - 3.5)
+  // 2.9 = furnished indoor office. 2.0 is free space and 2.2 is an open
+  // corridor; using either indoors inflates every reported distance by more
+  // than 2x at 10 m, because n is the exponent that sets the whole distance
+  // scale. See DEFAULT_PATH_LOSS_N in AdaptiveBeaconEngine.js.
+  pathLossN: 2.9,                  // Environmental path loss exponent n (typically 1.8 - 3.5)
   deadZone: 0.03,                  // Hysteresis dead-band (meters) — 0.03m avoids freezing offset
   oneEuroMinCutoff: 0.35,          // Baseline One-Euro cutoff frequency (Hz)
   oneEuroBeta: 0.06,               // One-Euro speed responsiveness factor
@@ -78,6 +82,20 @@ function normalizeSettings(raw) {
   if (s.peakThreshold > 0.05) s.peakThreshold = 0.04;
   if (s.bounceDiffMin > 0.07) s.bounceDiffMin = 0.06;
   if (s.zuptVariance > 0.0015) s.zuptVariance = 0.0008;
+
+  // One-time correction of the old free-space default. 2.2 shipped as the
+  // default for long enough that it is sitting in most installs' storage, and
+  // it is far too low for an indoor deployment - it was the single largest
+  // contributor to distances reading 2-3x too long. Nobody chose it
+  // deliberately, so migrate it once and record that we did, which leaves a
+  // deliberately chosen 2.2 alone on every subsequent launch.
+  if (!s.pathLossDefaultMigrated) {
+    if (!Number.isFinite(s.pathLossN) || Math.abs(s.pathLossN - 2.2) < 1e-6) {
+      s.pathLossN = DEFAULT_APP_SETTINGS.pathLossN;
+      s.defaultPathLossN = s.pathLossN;
+    }
+    s.pathLossDefaultMigrated = true;
+  }
 
   return s;
 }

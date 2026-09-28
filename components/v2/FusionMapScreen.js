@@ -55,10 +55,32 @@ import Svg, {
 } from "react-native-svg";
 import { fusionEngine } from "../../services/FusionEngine.js";
 import { v2Scanner } from "../../services/v2BeaconScannerService.js";
+import { checkRangeGeometry } from "../../services/BeaconRangingCalibration.js";
 import { metresToFeet, feetToMetres } from "../../services/PdrEngine.js";
 import { savePath, getSavedPaths, deleteSavedPath } from "../../PathStorage.js";
 
 const FLOORPLAN_IMAGE = require("../../assets/floorplans/office-72x72.png");
+
+// Bump with every change to the locating/ranging behaviour. Shown on screen
+// because an OTA update is only APPLIED on the next cold start after it
+// downloads, so "I published the fix and it still fails" is very often the
+// old bundle still running - this makes that visible instead of a guess.
+const ENGINE_TAG = "locate-v5";
+
+let ExpoUpdates = null;
+try {
+  ExpoUpdates = require("expo-updates");
+} catch (e) {}
+
+const describeRunningBundle = () => {
+  const created = ExpoUpdates?.createdAt ? new Date(ExpoUpdates.createdAt) : null;
+  const when = created && !Number.isNaN(created.getTime())
+    ? created.toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })
+    : null;
+  const id = typeof ExpoUpdates?.updateId === "string" ? ExpoUpdates.updateId.slice(0, 8) : null;
+  if (ExpoUpdates?.isEmbeddedLaunch || !id) return `Engine ${ENGINE_TAG} · built-in bundle`;
+  return `Engine ${ENGINE_TAG} · update ${id}${when ? ` (${when})` : ""}`;
+};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -100,6 +122,41 @@ const C = {
   textSecondary: "#8b949e",
   textMuted: "#484f58",
 };
+
+// Colours for saved routes drawn on the map, assigned by age.
+const SAVED_ROUTE_COLORS = ["#f0883e", "#db61a2", "#39c5cf", "#e3b341", "#a371f7", "#ff7b72"];
+
+/**
+ * Only routes recorded on THIS map are in floor-plan feet. The PDR tracker tab
+ * saves into the same store in metres from its own origin, so drawing those
+ * here would put them in the wrong place at the wrong scale. Routes saved
+ * before the source tag existed are recognised by the name this screen gives.
+ */
+const isFusionMapRoute = (r) =>
+  r?.source === "fusionMap" || (typeof r?.name === "string" && r.name.startsWith("Route "));
+
+// A beacon whose last packet is older than this is not used for locating.
+//
+// Was 2.5 s, which assumed every beacon is heard several times a second. A
+// weak or distant beacon - through walls, low transmit power, a 1 s advertising
+// interval with packet loss - routinely goes 3-10 s between packets the phone
+// actually receives, so BOTH beacons were almost never "fresh" at the same
+// moment and locating collected nothing, indefinitely. While locating the user
+// is standing still, so a range from a few seconds ago is still where they are.
+const LOCATE_STALE_MS = 10000;
+
+// Which 1 m reference a beacon's distance is computed from. Shown on the map
+// because every distance scales with it, and "is this beacon calibrated?" is
+// otherwise invisible from here.
+const describeTxSource = (b) => {
+  if (!b?.id) return "";
+  const tx = Number.isFinite(b.txPower1m) ? `${b.txPower1m} dBm` : "?";
+  if (b.txSource === "calibrated") return `✓ Calibrated · 1 m = ${tx} · n ${b.currentN}`;
+  if (b.txSource === "advertised") return `Not calibrated · using beacon's own 1 m = ${tx}`;
+  return `Not calibrated · default 1 m = ${tx} — run Ranging Calibration`;
+};
+const txSourceColor = (b) =>
+  b?.txSource === "calibrated" ? C.accentGreen : b?.txSource === "advertised" ? C.accentOrange : C.accentRed;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -251,6 +308,7 @@ function OfficeMapCanvas({
   onAnimateView,
   onGestureActive,
   navPhase = "idle",
+  savedRoutesOnMap = [],
 }) {
   const {
     x, y, uncertaintyRadius, trail,
@@ -545,6 +603,29 @@ function OfficeMapCanvas({
           />
         )}
 
+        {/* ── Saved routes ─────────────────────────────────────────────────
+            Drawn beneath the live trail, dashed, with a start dot and an end
+            ring, so a recorded route is clearly a record and not the walk in
+            progress. */}
+        {savedRoutesOnMap.map((r) => {
+          if (!r.points || r.points.length < 2) return null;
+          const pts = r.points.map((pt) => toScreen(pt.x, pt.y));
+          const first = pts[0];
+          const last = pts[pts.length - 1];
+          return (
+            <G key={`saved-${r.id}`}>
+              <Polyline
+                points={pts.map((p) => `${p.cx.toFixed(1)},${p.cy.toFixed(1)}`).join(" ")}
+                fill="none" stroke={r.color} strokeWidth={2.5 * inv}
+                strokeDasharray={`${6 * inv},${4 * inv}`}
+                strokeOpacity={0.9} strokeLinecap="round" strokeLinejoin="round"
+              />
+              <Circle cx={first.cx} cy={first.cy} r={4 * inv} fill={r.color} />
+              <Circle cx={last.cx} cy={last.cy} r={5 * inv} fill="none" stroke={r.color} strokeWidth={2 * inv} />
+            </G>
+          );
+        })}
+
         {/* ── PDR path: the route actually walked ──────────────────────────
             Only drawn while navigating. Before that there is no journey to
             show, and rendering a stub of a trail during the locating phase
@@ -763,7 +844,14 @@ export default function FusionMapScreen({
   }, []);
   const [savedRoutes, setSavedRoutes] = useState([]);
   const [showRoutes, setShowRoutes] = useState(false);
+  // Saved routes currently drawn on the map. A just-saved route is added
+  // automatically so the walk stays visible after Stop clears the live trail.
+  const [shownRouteIds, setShownRouteIds] = useState(() => new Set());
   const [locProgress, setLocProgress] = useState(null);
+  // Read from inside sensor callbacks, which would otherwise capture a stale
+  // value from the render they were created in.
+  const headingCalibratedRef = useRef(headingCalibrated);
+  headingCalibratedRef.current = headingCalibrated;
   const isRunning = navPhase !== "idle";
   const [placementMode, setPlacementMode] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -797,6 +885,15 @@ export default function FusionMapScreen({
   // Reset Position so both re-estimate from the beacons instead of reusing
   // a stale or made-up point.
   const coldStartDoneRef = useRef(false);
+  // Current phase for timer callbacks, which would otherwise see a stale one.
+  const navPhaseRef = useRef("idle");
+  navPhaseRef.current = navPhase;
+  // Packet counts when locating began, for the per-beacon diagnostics.
+  const locateStartRef = useRef({ t: 0, p1: 0, p2: 0 });
+  // Re-renders the locating diagnostics once a second.
+  const [locateClock, setLocateClock] = useState(0);
+  // Packet counter at the last locating sample, so each packet is used once.
+  const lastLocatePacketsRef = useRef(-1);
   // Result of the cold-start solve, surfaced so the map can explain an
   // unresolved or low-quality fix instead of silently showing a guess.
   const [initialFix, setInitialFix] = useState(null);
@@ -868,13 +965,21 @@ export default function FusionMapScreen({
       // one packet carries that packet's full range error into every position
       // that follows; a few seconds of packets cuts it from ~5.7 ft to ~2.1 ft.
       if (navPhase === "locating") {
+        // One sample per NEW packet. Stats are re-emitted for every scanned
+        // device, not just the two beacons, so without this the same pair of
+        // ranges was averaged in many times over - which fakes precision and
+        // would let the convergence test commit on far less evidence than it
+        // thinks it has.
+        const packets = (stats.b1?.totalPackets ?? 0) + (stats.b2?.totalPackets ?? 0);
+        if (packets === lastLocatePacketsRef.current) return;
+        lastLocatePacketsRef.current = packets;
+        // A beacon that has gone quiet is reporting where the user WAS.
+        const now = Date.now();
+        const stale = (b) => !Number.isFinite(b?.lastSeen) || now - b.lastSeen > LOCATE_STALE_MS;
+        if (stale(stats.b1) || stale(stats.b2)) return;
         const r = fusionEngine.feedLocatingSample(d1Ft, d2Ft, c1, c2);
         setLocProgress(r);
-        if (r.done && r.fix?.position) {
-          setInitialFix(r.fix);
-          coldStartDoneRef.current = true;
-          setNavPhase("located");
-        }
+        if (r.done && r.fix?.position) completeLocating(r.fix);
         setFusionState({ ...fusionEngine.getState() });
         return;
       }
@@ -918,7 +1023,16 @@ export default function FusionMapScreen({
         // Steps are ignored until navigation starts. While locating, the user is
         // meant to be standing still, and feeding steps in would move the very
         // position being measured.
-        if (navPhase !== "navigating" || placementMode) return;
+        if (placementMode) return;
+        // Walking during locating ends it: from here on the ranges describe a
+        // moving position, so waiting longer would only blur the fix. Commit
+        // what has been collected and let this step be the first one tracked.
+        if (navPhase === "locating") {
+          const fix = fusionEngine.finishLocatingNow();
+          if (!fix || !completeLocating(fix)) return;
+        } else if (navPhase !== "navigating") {
+          return;
+        }
         const stepLengthFt = metresToFeet(stepLengthMeters);
         fusionEngine.predict(stepLengthFt, heading);
         setFusionState({ ...fusionEngine.getState() });
@@ -935,7 +1049,16 @@ export default function FusionMapScreen({
     if (isRunning && !placementMode) {
       tickIntervalRef.current = setInterval(() => {
         fusionEngine.tick();
+        // Time limits must fire even when no new sample arrives.
+        if (navPhaseRef.current === "locating") {
+          const r = fusionEngine.checkLocatingTimeout();
+          if (r) {
+            setLocProgress(r);
+            if (r.done && r.fix?.position) completeLocating(r.fix);
+          }
+        }
         setFusionState({ ...fusionEngine.getState() });
+        setLocateClock(Date.now());
       }, 1000);
     } else if (tickIntervalRef.current) {
       clearInterval(tickIntervalRef.current);
@@ -988,7 +1111,33 @@ export default function FusionMapScreen({
     setInitialFix(null);
     setLocProgress(null);
     fusionEngine.beginLocating();
+    locateStartRef.current = {
+      t: Date.now(),
+      p1: bleStats.b1?.totalPackets ?? 0,
+      p2: bleStats.b2?.totalPackets ?? 0,
+    };
     setNavPhase("locating");
+  };
+
+  /**
+   * Position fixed. Navigation starts straight away when the heading is already
+   * aligned to the map - there is nothing left for the user to confirm, and the
+   * extra button press was pure waiting. Otherwise stop at "located" so the
+   * heading prompt can be answered first.
+   * @returns true when navigation has started.
+   */
+  const completeLocating = (fix) => {
+    setInitialFix(fix);
+    coldStartDoneRef.current = true;
+    setLocProgress(null);
+    if (headingCalibratedRef.current) {
+      fusionEngine.beginNavigation();
+      setFusionState({ ...fusionEngine.getState() });
+      setNavPhase("navigating");
+      return true;
+    }
+    setNavPhase("located");
+    return false;
   };
 
   /** Commits the fix and starts drawing the walked path from it. */
@@ -1018,12 +1167,16 @@ export default function FusionMapScreen({
       return;
     }
     try {
-      await savePath({
+      const updated = await savePath({
         name: `Route ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} · ${st.totalDistanceFt.toFixed(0)} ft`,
         steps: st.stepCount,
         distance: Number(st.totalDistanceFt.toFixed(2)),
         points: st.trail.map((pt) => ({ x: pt.x, y: pt.y })),
+        source: "fusionMap",
+        units: "ft",
       });
+      const newId = updated?.[0]?.id;
+      if (newId) setShownRouteIds((prev) => new Set(prev).add(newId));
       await refreshRoutes();
       Alert.alert("Route Saved", `${st.stepCount} steps · ${st.totalDistanceFt.toFixed(1)} ft walked.`);
     } catch (err) {
@@ -1031,7 +1184,29 @@ export default function FusionMapScreen({
     }
   };
 
+  // Stable colour per route: its position among the map's routes counted from
+  // the oldest, so saving a new route does not recolour the ones already shown.
+  const routeColor = (id) => {
+    const mapRoutes = savedRoutes.filter(isFusionMapRoute);
+    const idx = Math.max(0, mapRoutes.length - 1 - mapRoutes.findIndex((r) => r.id === id));
+    return SAVED_ROUTE_COLORS[idx % SAVED_ROUTE_COLORS.length];
+  };
+
+  const toggleRouteOnMap = (id) => {
+    setShownRouteIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
   const handleDeleteRoute = async (id) => {
+    setShownRouteIds((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
     try { await deleteSavedPath(id); await refreshRoutes(); }
     catch (err) { console.warn("[FusionMap] delete failed:", err); }
   };
@@ -1048,6 +1223,11 @@ export default function FusionMapScreen({
     setInitialFix(null);
     setLocProgress(null);
     fusionEngine.beginLocating();
+    locateStartRef.current = {
+      t: Date.now(),
+      p1: bleStats.b1?.totalPackets ?? 0,
+      p2: bleStats.b2?.totalPackets ?? 0,
+    };
     setNavPhase("locating");
   };
 
@@ -1060,6 +1240,8 @@ export default function FusionMapScreen({
     onZeroHeading();
     setHeadingZeroFlash(true);
     setTimeout(() => setHeadingZeroFlash(false), 2000);
+    // The heading prompt was the only thing holding navigation back.
+    if (navPhase === "located") handleStartNavigation();
   };
 
   const renderConfBar = (value, color) => {
@@ -1082,7 +1264,51 @@ export default function FusionMapScreen({
   const { uncertaintyRadius, bleConfidence, pdrConfidence, stepCount, totalDistanceFt } = fusionState;
   const d1Ft = Number.isFinite(bleStats.b1?.distanceM) ? metresToFeet(bleStats.b1.distanceM) : null;
   const d2Ft = Number.isFinite(bleStats.b2?.distanceM) ? metresToFeet(bleStats.b2.distanceM) : null;
+
+  // What locating is waiting on, per beacon: packets heard since it started
+  // and how long since the last one. Without this a stalled locate looks the
+  // same as a slow one, and the cause - one beacon barely reaching the phone -
+  // was invisible.
+  const locateDiagnostics = (() => {
+    if (navPhase !== "locating") return [];
+    const now = locateClock || Date.now();
+    const start = locateStartRef.current;
+    const lines = [];
+    for (const [k, b, base] of [[1, bleStats.b1, start.p1], [2, bleStats.b2, start.p2]]) {
+      if (!b?.id) {
+        lines.push({ key: k, bad: true, text: `B${k}: not selected — pick it in Signal Lab` });
+        continue;
+      }
+      const heard = Math.max(0, (b.totalPackets ?? 0) - base);
+      const age = Number.isFinite(b.lastSeen) ? (now - b.lastSeen) / 1000 : null;
+      const rate = start.t ? heard / Math.max(1, (now - start.t) / 1000) : 0;
+      const dist = Number.isFinite(b.distanceM) ? `${metresToFeet(b.distanceM).toFixed(1)} ft` : "—";
+      const quiet = age === null || age * 1000 > LOCATE_STALE_MS;
+      lines.push({
+        key: k,
+        bad: quiet || (heard > 0 && rate < 0.5),
+        text: quiet
+          ? `B${k}: not heard ${age === null ? "yet" : `for ${age.toFixed(0)} s`} — check it is on and in range`
+          : `B${k}: ${heard} packets (${rate.toFixed(1)}/s) · ${dist}${rate < 0.5 ? " · very few packets" : ""}`,
+      });
+    }
+    return lines;
+  })();
   const quality = getPositionQuality(uncertaintyRadius);
+
+  // Live geometric self-check on the two ranges. The beacon separation and the
+  // room diagonal are both known exactly from the floor plan, so a range pair
+  // that violates the triangle inequality against them is PROOF of a ranging
+  // calibration fault rather than evidence of one - unlike every other quality
+  // signal here, it cannot be produced by noise. Worth surfacing on this screen
+  // specifically, because a bad range pair is what makes the initial position
+  // land in the wrong place, and the user has no other way to see why.
+  const rangeGeometry = (() => {
+    if (!Number.isFinite(d1Ft) || !Number.isFinite(d2Ft)) return null;
+    const baselineFt = Math.hypot(anchor2.x - anchor1.x, anchor2.y - anchor1.y);
+    if (!(baselineFt > 0)) return null;
+    return checkRangeGeometry(d1Ft, d2Ft, baselineFt, Math.hypot(roomW, roomH), 4.0, "ft");
+  })();
 
   return (
     <ScrollView
@@ -1200,11 +1426,17 @@ export default function FusionMapScreen({
       {navPhase === "locating" && (
         <View style={[styles.statusBanner, styles.fixBannerWaiting]}>
           <Text style={styles.statusBannerText}>
-            ◎ Finding your position — stand still.{" "}
-            {locProgress
+            ◎ Finding your position — stand still ({Math.round((locateStartRef.current.t ? (locateClock || Date.now()) - locateStartRef.current.t : 0) / 1000)} s).{" "}
+            {locProgress?.samples
               ? `${locProgress.samples} readings collected`
               : "waiting for both beacons"}
           </Text>
+          <Text style={styles.locateDiag}>{describeRunningBundle()}</Text>
+          {locateDiagnostics.map((line) => (
+            <Text key={line.key} style={[styles.locateDiag, line.bad && { color: C.accentOrange }]}>
+              {line.text}
+            </Text>
+          ))}
           <View style={styles.locateTrack}>
             <View
               style={[
@@ -1283,13 +1515,33 @@ export default function FusionMapScreen({
             </View>
           );
         }
+        if (rangeGeometry && !rangeGeometry.ok) {
+          const issue = rangeGeometry.issues[0];
+          return (
+            <View style={[styles.statusBanner, styles.fixBannerWarn]}>
+              <Text style={styles.statusBannerText}>
+                ⚠ {issue.kind === "tx-mismatch"
+                  ? "The two beacons disagree by more than the room allows (" +
+                    d1Ft.toFixed(0) + " ft vs " + d2Ft.toFixed(0) + " ft, but they are only " +
+                    rangeGeometry.baseline.toFixed(0) + " ft apart). Beacon " +
+                    issue.suspectBeacon + " is reading far too long."
+                  : issue.kind === "both-short"
+                  ? "Both ranges together are shorter than the gap between the beacons, which " +
+                    "cannot happen. Ranging is reading short."
+                  : "Beacon " + issue.suspectBeacon + " reports further away than the room is big."}
+                {" "}This is a calibration fault, not noise — run Ranging Calibration in Signal Lab
+                (two 20-second stands, no measuring needed).
+              </Text>
+            </View>
+          );
+        }
         if (initialFix?.adjusted && (initialFix.adjustmentFt ?? 0) >= 8) {
           return (
             <View style={[styles.statusBanner, styles.fixBannerWarn]}>
               <Text style={styles.statusBannerText}>
                 ⚠ Beacon distances disagree with their measured spacing by ~{initialFix.adjustmentFt.toFixed(0)} ft.
-                That is a calibration problem, not noise — run the multi-point calibration in Signal Lab,
-                including points measured through the real walls.
+                That is a calibration problem, not noise — run Ranging Calibration in Signal Lab,
+                which measures both beacons against their spacing on this floor plan.
               </Text>
             </View>
           );
@@ -1321,6 +1573,9 @@ export default function FusionMapScreen({
         onAnimateView={animateView}
         onGestureActive={setMapGestureActive}
         navPhase={navPhase}
+        savedRoutesOnMap={savedRoutes
+          .filter((r) => shownRouteIds.has(r.id) && isFusionMapRoute(r))
+          .map((r) => ({ id: r.id, points: r.points, color: routeColor(r.id) }))}
       />
 
       {/* Controls */}
@@ -1391,22 +1646,43 @@ export default function FusionMapScreen({
         <View style={styles.routesBox}>
           {savedRoutes.length === 0 ? (
             <Text style={styles.routesEmpty}>
-              No saved paths yet. Walk a route and tap Save Path.
+              No saved paths yet. Walk a route and tap Save Path; it stays drawn on the map.
             </Text>
           ) : (
-            savedRoutes.map((r) => (
+            savedRoutes.map((r) => {
+              const drawable = isFusionMapRoute(r);
+              const shown = drawable && shownRouteIds.has(r.id);
+              const color = routeColor(r.id);
+              return (
               <View key={r.id} style={styles.routeRow}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.routeName}>{r.name}</Text>
-                  <Text style={styles.routeMeta}>
-                    {r.timestamp} · {r.steps} steps · {Number(r.distance).toFixed(1)} ft · {r.points?.length || 0} pts
-                  </Text>
-                </View>
+                <TouchableOpacity
+                  style={{ flex: 1, flexDirection: "row", alignItems: "center" }}
+                  disabled={!drawable}
+                  onPress={() => toggleRouteOnMap(r.id)}
+                >
+                  <View
+                    style={[
+                      styles.routeSwatch,
+                      shown
+                        ? { backgroundColor: color, borderColor: color }
+                        : { borderColor: drawable ? color : C.textMuted },
+                    ]}
+                  />
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.routeName}>{r.name}</Text>
+                    <Text style={styles.routeMeta}>
+                      {drawable
+                        ? `${r.timestamp} · ${r.steps} steps · ${Number(r.distance).toFixed(1)} ft · ${shown ? "on map, tap to hide" : "tap to show on map"}`
+                        : `${r.timestamp} · ${r.steps} steps · PDR tracker path (metres), not drawn on floor plan`}
+                    </Text>
+                  </View>
+                </TouchableOpacity>
                 <TouchableOpacity onPress={() => handleDeleteRoute(r.id)} style={styles.routeDelete}>
                   <Text style={styles.routeDeleteText}>✕</Text>
                 </TouchableOpacity>
               </View>
-            ))
+              );
+            })
           )}
         </View>
       )}
@@ -1482,6 +1758,7 @@ export default function FusionMapScreen({
           {/* Beacon info strip */}
           <View style={styles.card}>
             <Text style={styles.cardTitle}>Beacon Info</Text>
+            <Text style={styles.locateDiag}>{describeRunningBundle()}</Text>
             <View style={styles.beaconInfoRow}>
               <View style={[styles.beaconChip, { borderColor: C.beacon1 }]}>
                 <Text style={[styles.beaconChipLabel, { color: C.beacon1 }]}>
@@ -1490,6 +1767,9 @@ export default function FusionMapScreen({
                 <Text style={styles.beaconChipValue}>
                   {bleStats.b1?.name || "—"} • {bleStats.b1?.rawRssi != null ? `${bleStats.b1.rawRssi} dBm` : "no signal"}
                 </Text>
+                <Text style={[styles.beaconChipMeta, { color: txSourceColor(bleStats.b1) }]}>
+                  {describeTxSource(bleStats.b1)}
+                </Text>
               </View>
               <View style={[styles.beaconChip, { borderColor: C.beacon2 }]}>
                 <Text style={[styles.beaconChipLabel, { color: C.beacon2 }]}>
@@ -1497,6 +1777,9 @@ export default function FusionMapScreen({
                 </Text>
                 <Text style={styles.beaconChipValue}>
                   {bleStats.b2?.name || "—"} • {bleStats.b2?.rawRssi != null ? `${bleStats.b2.rawRssi} dBm` : "no signal"}
+                </Text>
+                <Text style={[styles.beaconChipMeta, { color: txSourceColor(bleStats.b2) }]}>
+                  {describeTxSource(bleStats.b2)}
                 </Text>
               </View>
             </View>
@@ -1530,6 +1813,7 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1, borderBottomColor: C.border, paddingVertical: 8,
   },
   routeName: { color: C.textPrimary, fontSize: 13, fontWeight: "700" },
+  routeSwatch: { width: 14, height: 14, borderRadius: 7, borderWidth: 2, marginRight: 10 },
   routeMeta: { color: C.textMuted, fontSize: 10, marginTop: 2 },
   routeDelete: { paddingHorizontal: 10, paddingVertical: 4 },
   routeDeleteText: { color: C.accentRed, fontSize: 15, fontWeight: "700" },
@@ -1661,6 +1945,7 @@ const styles = StyleSheet.create({
     marginBottom: 14, gap: 10,
   },
   statusBannerOk: { backgroundColor: "#0d2818", borderColor: "#238636" },
+  locateDiag: { color: C.textSecondary, fontSize: 11, marginTop: 3 },
   statusBannerWarn: { backgroundColor: "#2b2111", borderColor: C.accentOrange },
   statusBannerError: { backgroundColor: "#2b1618", borderColor: C.accentRed },
   statusBannerText: { flex: 1, fontSize: 12, color: C.textPrimary, lineHeight: 17 },
@@ -1681,4 +1966,5 @@ const styles = StyleSheet.create({
   beaconChip: { borderWidth: 1, borderRadius: 8, padding: 10, marginBottom: 6 },
   beaconChipLabel: { fontSize: 12, fontWeight: "600", marginBottom: 4 },
   beaconChipValue: { fontSize: 12, color: C.textMuted },
+  beaconChipMeta: { fontSize: 10, marginTop: 3, fontWeight: "600" },
 });

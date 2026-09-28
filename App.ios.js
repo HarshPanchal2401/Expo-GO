@@ -20,6 +20,7 @@ import { getAppSettings, subscribeAppSettings } from "./services/appSettingsStor
 import { v2Scanner } from "./services/v2BeaconScannerService.js";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { stepLengthModel, STEP_MODEL_CONFIG } from "./services/StepLengthModel.js";
+import { headingFilter } from "./services/HeadingFilter.js";
 
 // Which sensor heading corresponds to the floor plan's "up". A property of
 // the building, so it is persisted rather than re-established each launch.
@@ -93,12 +94,19 @@ export default function AppIOS() {
   // which has no relationship to the map. Persisted, because it is a property of
   // the BUILDING and does not change between sessions.
   const [headingCalibrated, setHeadingCalibrated] = useState(false);
-  const smoothedHeadingRef = useRef(0);
   const positionRef = useRef({ x: 0, y: 0 });
   const totalDistanceRef = useRef(0);
   const lastStepTimeRef = useRef(0);
   const gravityRef = useRef(1.0);
   const hasMotionRotationRef = useRef(false);
+  // Latest raw sensor heading, read by setZero(). A ref because the matching
+  // state is only refreshed a few times a second for display.
+  const rawHeadingRef = useRef(0);
+  // Heading sensors fire at 20 Hz each; re-rendering the whole app that often
+  // starves the JS thread that also runs BLE ranging and step detection. The
+  // refs carry the live value, state is refreshed at display rate only.
+  const lastHeadingUiRef = useRef(0);
+  const lastMagUiRef = useRef(0);
 
   // Robust Peak-Valley Step Detector State Machine
   const stepStateRef = useRef({
@@ -129,6 +137,8 @@ export default function AppIOS() {
         if (Number.isFinite(v)) {
           headingZeroRef.current = v;
           setHeadingZero(v);
+          // The heading so far was relative to the default zero; re-take it.
+          headingFilter.resync();
           setHeadingCalibrated(true);
         }
       } catch (err) {
@@ -200,7 +210,9 @@ export default function AppIOS() {
       setLastBounce(bounceAmp);
     }
 
-    const curHeading = headingRef.current || 0;
+    // Mean heading over this stride rather than the instant the step fired,
+    // which would catch the phone mid-sway. See services/HeadingFilter.js.
+    const curHeading = headingFilter.takeStepHeading();
     const rad = (curHeading * Math.PI) / 180;
     const old = positionRef.current;
 
@@ -230,6 +242,14 @@ export default function AppIOS() {
   // Hardware Sensors (Dynamic Step Detection + Heading)
   useEffect(() => {
     let motionSub, pedSub, accelSub, magSub;
+
+    const publishHeading = () => {
+      const nowMs = Date.now();
+      if (nowMs - lastHeadingUiRef.current < 100) return;
+      lastHeadingUiRef.current = nowMs;
+      setHeading(headingRef.current);
+      setRawHeading(rawHeadingRef.current);
+    };
     let isMounted = true;
 
     // ── 1. Magnetometer ──
@@ -239,17 +259,22 @@ export default function AppIOS() {
         if (!data) return;
         const { x, y, z } = data;
         const totalField = Math.sqrt(x * x + y * y + z * z);
-        setMagneticField({
-          x: Number(x.toFixed(1)),
-          y: Number(y.toFixed(1)),
-          z: Number(z.toFixed(1)),
-          total: Number(totalField.toFixed(1)),
-        });
+        headingFilter.updateMagneticField(totalField);
+        const nowMs = Date.now();
+        if (nowMs - lastMagUiRef.current > 250) {
+          lastMagUiRef.current = nowMs;
+          setMagneticField({
+            x: Number(x.toFixed(1)),
+            y: Number(y.toFixed(1)),
+            z: Number(z.toFixed(1)),
+            total: Number(totalField.toFixed(1)),
+          });
+        }
 
         if (!hasMotionRotationRef.current) {
           let magDeg = Math.atan2(-x, y) * (180 / Math.PI);
           magDeg = norm(magDeg);
-          setRawHeading(magDeg);
+          rawHeadingRef.current = magDeg;
 
           // NOTE THE SIGN, it differs from the DeviceMotion branch below on
           // purpose. These two sensors report rotation in OPPOSITE directions:
@@ -261,9 +286,9 @@ export default function AppIOS() {
           // Applying the same subtraction to both mirrored this branch: turning
           // right swung the map left, and because PDR places each step with
           // x += len*sin(heading), every sideways step landed on the wrong side.
-          const rel = signed(magDeg - headingZeroRef.current);
-          headingRef.current = rel;
-          setHeading(rel);
+          headingFilter.updateAbsolute(signed(magDeg - headingZeroRef.current));
+          headingRef.current = headingFilter.heading;
+          publishHeading();
         }
       });
     } catch (me) {
@@ -274,23 +299,23 @@ export default function AppIOS() {
     try {
       DeviceMotion.setUpdateInterval(50);
       motionSub = DeviceMotion.addListener((data) => {
-        if (!data?.rotation?.alpha) return;
-        hasMotionRotationRef.current = true;
-        const raw = norm(alphaDeg(data.rotation.alpha));
-        setRawHeading(raw);
-
-        // rotation.alpha increases counter-clockwise, so subtracting it from
-        // the zero reference is what converts it into the app's clockwise
-        // heading. See the sign note in the magnetometer branch above.
-        const rel = signed(headingZeroRef.current - raw);
-        let diff = rel - smoothedHeadingRef.current;
-        if (diff > 180) diff -= 360;
-        if (diff < -180) diff += 360;
-
-        smoothedHeadingRef.current = norm(smoothedHeadingRef.current + 0.25 * diff);
-        const formatted = signed(smoothedHeadingRef.current);
-        headingRef.current = formatted;
-        setHeading(formatted);
+        if (!data) return;
+        // Absolute (compass-anchored) orientation: only used to remove slow
+        // gyro drift, never to steer the heading directly.
+        if (Number.isFinite(data.rotation?.alpha)) {
+          hasMotionRotationRef.current = true;
+          const raw = norm(alphaDeg(data.rotation.alpha));
+          rawHeadingRef.current = raw;
+          // rotation.alpha increases counter-clockwise, so subtracting it from
+          // the zero reference is what converts it into the app's clockwise
+          // heading. See the sign note in the magnetometer branch above.
+          headingFilter.updateAbsolute(signed(headingZeroRef.current - raw));
+        }
+        // Gyroscope turn rate drives the heading - immune to the magnetic
+        // disturbance that made the compass-only heading wander indoors.
+        headingFilter.updateMotion(data, "ios");
+        headingRef.current = headingFilter.heading;
+        publishHeading();
       });
     } catch (dme) {
       console.warn("DeviceMotion subscription error:", dme);
@@ -461,13 +486,14 @@ export default function AppIOS() {
   }, []);
 
   const setZero = () => {
-    headingZeroRef.current = rawHeading;
-    setHeadingZero(rawHeading);
+    const rawNow = rawHeadingRef.current;
+    headingZeroRef.current = rawNow;
+    setHeadingZero(rawNow);
     setHeadingCalibrated(true);
-    AsyncStorage.setItem(HEADING_ZERO_KEY, String(rawHeading)).catch((err) =>
+    AsyncStorage.setItem(HEADING_ZERO_KEY, String(rawNow)).catch((err) =>
       console.warn("Heading zero save failed:", err)
     );
-    smoothedHeadingRef.current = 0;
+    headingFilter.reset(0);
     headingRef.current = 0;
     setHeading(0);
     setStatus("Heading zero calibrated (Forward = 0°)");

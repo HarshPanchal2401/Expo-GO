@@ -16,6 +16,7 @@ import {
   parseBeaconPayload,
 } from "./BleScannerService.js";
 import { adaptiveEngine } from "./AdaptiveBeaconEngine.js";
+import { getAppSettings, subscribeAppSettings } from "./appSettingsStorage.js";
 
 const STORAGE_KEY = "@v2_beacon_config_v3";
 
@@ -26,7 +27,7 @@ export const DEFAULT_V2_CONFIG = {
   beacon2Name: "Beacon 2",
   beacon1TxPower: -59,
   beacon2TxPower: -59,
-  pathLossN: 2.2,
+  pathLossN: 2.9, // indoor office; see DEFAULT_PATH_LOSS_N in AdaptiveBeaconEngine.js
   distanceUnit: "m", // 'm' | 'ft' | 'in'
   targetBeaconsOnly: true, // When true and B1/B2 are set, drops all other ambient BLE devices to eliminate phone CPU load
   beaconHeightM: null, // Ceiling/wall mount height in metres; null = same height as phone (no correction)
@@ -47,7 +48,12 @@ export const DEFAULT_V2_CONFIG = {
  * @param {number} pathLossN - Environmental path-loss exponent (default 2.2)
  * @returns {number|null} Distance in meters
  */
-export function calculateV2BeaconDistance(rssi, txPower = -59, pathLossN = 2.2) {
+/** A usable RSSI-at-1m value: outside this range it is a malformed or unset field. */
+export function isPlausibleTx1m(tx) {
+  return Number.isFinite(tx) && tx <= -30 && tx >= -100;
+}
+
+export function calculateV2BeaconDistance(rssi, txPower = -59, pathLossN = 2.9) {
   if (!rssi || !Number.isFinite(rssi)) return null;
 
   // Standard Log-Distance: d_raw = 10 ^ ((TxPower - RSSI) / (10 * n))
@@ -190,6 +196,13 @@ class V2BeaconScannerService {
           this.stats.b2.name = this.config.beacon2Name || "Beacon 2";
         }
         adaptiveEngine.setHeights(this.config.beaconHeightM, this.config.phoneHeightM);
+      }
+      // The Settings screen owns the fallback path-loss model, so push it into
+      // the engine now and again on every change. Previously nothing did, and
+      // the engine silently kept its own constants regardless of the setting.
+      this.applyPathLossSettings(getAppSettings());
+      if (!this._settingsUnsub) {
+        this._settingsUnsub = subscribeAppSettings((s) => this.applyPathLossSettings(s));
       }
     } catch (e) {
       console.warn("[V2Scanner] Failed to load config:", e);
@@ -606,6 +619,12 @@ class V2BeaconScannerService {
       major: parsed.major !== null ? parsed.major : existing.major ?? null,
       minor: parsed.minor !== null ? parsed.minor : existing.minor ?? null,
       txPower: parsed.calibratedTxPower || existing.txPower || -59,
+      // The beacon's own "measured power" (RSSI at 1 m) from its iBeacon
+      // packet, kept separately from txPower above so a real advertised value
+      // can be told apart from the -59 placeholder.
+      advertisedTxPower: isPlausibleTx1m(parsed.calibratedTxPower)
+        ? parsed.calibratedTxPower
+        : existing.advertisedTxPower ?? null,
       estimatedDistM: calculateV2BeaconDistance(rawRssi, parsed.calibratedTxPower || existing.txPower || -59, this.config.pathLossN),
       lastSeen: now,
       packetCount: (existing.packetCount || 0) + 1,
@@ -643,7 +662,19 @@ class V2BeaconScannerService {
   _updateBeaconStream(beaconNum, deviceObj, rawRssi, now) {
     const targetKey = beaconNum === 1 ? "b1" : "b2";
     const statObj = this.stats[targetKey];
-    const txPower = beaconNum === 1 ? this.config.beacon1TxPower : this.config.beacon2TxPower;
+    // 1 m reference used while this beacon is NOT calibrated (once calibrated,
+    // the engine uses the fitted value and ignores this). Priority:
+    //   1. the beacon's own advertised measured power, from its iBeacon packet
+    //   2. null -> the engine's default, i.e. the Settings screen value
+    //
+    // This used to pass beacon1TxPower/beacon2TxPower, which are -59 unless a
+    // calibration has written them. So every uncalibrated beacon ranged off
+    // -59 regardless of how it was configured - a Moko set to a different
+    // transmit power was off by a constant factor (6 dB = 1.6x at n = 2.9),
+    // differently per beacon - and the Settings default could never take
+    // effect either, because a non-null value always overrode it.
+    const advertisedTx = deviceObj.advertisedTxPower;
+    const txPower = isPlausibleTx1m(advertisedTx) ? advertisedTx : null;
 
     statObj.id = deviceObj.id;
     statObj.mac = deviceObj.id;
@@ -692,6 +723,12 @@ class V2BeaconScannerService {
     const safeDist = Number.isFinite(adaptiveData.distanceM) ? adaptiveData.distanceM : null;
 
     statObj.filteredRssi = safeFiltered;
+    // The level the path-loss inversion was actually fed. Ranging calibration
+    // fits against this, not filteredRssi - see rangingRssi in the engine.
+    statObj.rangingRssi = Number.isFinite(adaptiveData.rangingRssi)
+      ? adaptiveData.rangingRssi
+      : safeFiltered;
+    statObj.packetGapMs = Number.isFinite(adaptiveData.packetGapMs) ? adaptiveData.packetGapMs : null;
     statObj.distanceM = safeDist;
     statObj.distanceFt = safeDist !== null ? Number((safeDist * 3.28084).toFixed(2)) : null;
     statObj.distanceIn = safeDist !== null ? Number((safeDist * 39.3701).toFixed(1)) : null;
@@ -711,6 +748,10 @@ class V2BeaconScannerService {
     statObj.kalmanGain = Number.isFinite(adaptiveData.kalmanGain) ? adaptiveData.kalmanGain : 0.5;
     statObj.outlierCount = adaptiveData.outlierCount || 0;
     statObj.isCalibrated = Boolean(adaptiveData.isCalibrated);
+    statObj.advertisedTxPower = isPlausibleTx1m(advertisedTx) ? advertisedTx : null;
+    // Where the 1 m reference in use came from, so the UI can say plainly
+    // whether distances are calibrated or running on an assumption.
+    statObj.txSource = statObj.isCalibrated ? "calibrated" : txPower !== null ? "advertised" : "default";
 
     try {
       const calibrator = adaptiveEngine.getCalibrator(deviceObj.id);
@@ -754,6 +795,9 @@ class V2BeaconScannerService {
       mac: deviceObj.id,
       rawRssi,
       filteredRssi: adaptiveData.filteredRssi,
+      // The level the path-loss inversion consumed. Ranging calibration must
+      // fit against this so the model it produces matches the model in use.
+      rangingRssi: statObj.rangingRssi,
       distanceM: adaptiveData.distanceM,
       major: deviceObj.major,
       minor: deviceObj.minor,
@@ -779,6 +823,92 @@ class V2BeaconScannerService {
     calibrator.addReferencePoint(distanceM, currentRssi);
     this.emitStats();
     return { success: true, count: calibrator.referencePoints.length };
+  }
+
+  /**
+   * Pushes the app-wide fallback path-loss model into the ranging engine.
+   *
+   * Without this the Settings screen's path-loss controls were inert: they
+   * were persisted and used only for the rough estimate beside unselected
+   * devices in the discovery list, while every distance that mattered came
+   * from the engine's own hardcoded constants.
+   *
+   * @param {{pathLossN?: number, txPower?: number}} settings
+   */
+  applyPathLossSettings(settings = {}) {
+    const n = Number(settings.pathLossN);
+    const tx = Number(settings.txPower);
+    const applied = adaptiveEngine.setDefaultPathLoss(
+      Number.isFinite(n) ? n : null,
+      Number.isFinite(tx) ? tx : null
+    );
+    if (Number.isFinite(n)) this.config.pathLossN = applied.pathLossN;
+    return applied;
+  }
+
+  /**
+   * Writes a completed two-stand geometric calibration into both beacons'
+   * per-beacon path-loss models, replacing whatever was there.
+   *
+   * The result is stored as two reference points per beacon rather than as
+   * bare coefficients, so it shows up in the calibration point list exactly
+   * like manually logged points, can be inspected and extended, and survives
+   * through the same persistence PathLossCalibrator already has.
+   *
+   * @param {object} solveResult - output of RangingCalibrationSession.solve()
+   */
+  applyGeometricCalibration(solveResult) {
+    if (!solveResult || !solveResult.ok) {
+      return { success: false, error: solveResult?.error || "Calibration did not solve." };
+    }
+    if (!this.config.beacon1Id || !this.config.beacon2Id) {
+      return { success: false, error: "Select both beacons first." };
+    }
+    const nearM = Number.isFinite(solveResult.nearRefM) ? solveResult.nearRefM : 1.0;
+    const farM = solveResult.baselineM;
+    const applied = {};
+
+    for (const beaconNum of [1, 2]) {
+      const beaconId = beaconNum === 1 ? this.config.beacon1Id : this.config.beacon2Id;
+      const fit = solveResult.beacons[beaconNum];
+      if (!fit || !fit.ok) continue;
+      const calibrator = adaptiveEngine.getCalibrator(beaconId);
+
+      calibrator.clear();
+      calibrator.addReferencePoint(nearM, fit.nearRssi);
+      calibrator.addReferencePoint(farM, fit.farRssi);
+      // Both points sit on the exact line solveTwoPoint found, so the OLS fit
+      // reproduces it; assigning afterwards keeps the two in step even when
+      // the exponent had to be clamped, where OLS alone would not.
+      calibrator.fitModel();
+      calibrator.fittedN = fit.n;
+      calibrator.fittedTxPower1m = fit.txPower1m;
+      calibrator.isCalibrated = true;
+      calibrator.saveToStorage();
+
+      this.config[beaconNum === 1 ? "beacon1TxPower" : "beacon2TxPower"] = fit.txPower1m;
+      this.stats[beaconNum === 1 ? "b1" : "b2"].txPower = fit.txPower1m;
+      applied[beaconNum] = { n: fit.n, txPower1m: fit.txPower1m };
+    }
+
+    this.saveConfig({
+      beacon1TxPower: this.config.beacon1TxPower,
+      beacon2TxPower: this.config.beacon2TxPower,
+    });
+    this.emitStats();
+    return { success: true, applied };
+  }
+
+  /**
+   * Clears both selected beacons' shadow envelopes. Called when the phone has
+   * just been carried somewhere else, so a peak held at the old spot cannot be
+   * mistaken for a fade at the new one - see resetShadowEnvelope() in
+   * AdaptiveBeaconEngine.
+   */
+  resetShadowEnvelopes() {
+    for (const id of [this.config.beacon1Id, this.config.beacon2Id]) {
+      if (id) adaptiveEngine.resetShadowEnvelope(id);
+    }
   }
 
   fitPathLossModel(beaconNum) {

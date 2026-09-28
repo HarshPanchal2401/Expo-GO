@@ -20,3 +20,6 @@ yarn-error.log*
 # OS Files
 .DS_Store
 Thumbs.db
+
+# Floor plan image (kept local, not committed)
+assets/floorplans/

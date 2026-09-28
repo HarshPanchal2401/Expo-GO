@@ -26,7 +26,14 @@ import {
   Platform,
 } from "react-native";
 import { v2Scanner } from "../../services/v2BeaconScannerService.js";
+import {
+  RangingCalibrationSession,
+  RANGING_CALIB_CONFIG,
+  checkRangeGeometry,
+} from "../../services/BeaconRangingCalibration.js";
 import RssiSignalGraph from "./RssiSignalGraph.js";
+
+const FT_PER_M = 3.28084;
 
 const { width: SCREEN_WIDTH } = Dimensions.get("window");
 
@@ -67,6 +74,22 @@ export default function BeaconSignalLabScreen() {
 
   // Position baseline (nominal 5.0m distance between B1 at (0,0) and B2 at (5,0))
   const [baselineDistM, setBaselineDistM] = useState(5.0);
+
+  // ---------------------------------------------------------------------------
+  // TWO-STAND GEOMETRIC RANGING CALIBRATION STATE
+  // The session holds raw samples and is therefore kept in a ref, not state:
+  // it is written to on every BLE packet, several times a second, and nothing
+  // in the render output depends on the individual samples - only on the
+  // progress counters, which are read on a timer.
+  // ---------------------------------------------------------------------------
+  const geoSessionRef = useRef(null);
+  const [geoBaselineInput, setGeoBaselineInput] = useState("");
+  const [geoBaselineFromPlan, setGeoBaselineFromPlan] = useState(null);
+  const [geoActiveStand, setGeoActiveStand] = useState(null); // 1 | 2 | null
+  const [geoProgress, setGeoProgress] = useState(null);
+  const [geoStandsDone, setGeoStandsDone] = useState({ 1: false, 2: false });
+  const [geoResult, setGeoResult] = useState(null);
+  const [geoApplied, setGeoApplied] = useState(false);
 
   // Periodic UI refresh loop (100ms / 10 FPS)
   const tickerRef = useRef(null);
@@ -125,6 +148,185 @@ export default function BeaconSignalLabScreen() {
       unsubPacket();
     };
   }, [isSampling1m, calib1mTarget, targetSampleCount]);
+
+  // ---------------------------------------------------------------------------
+  // TWO-STAND GEOMETRIC RANGING CALIBRATION
+  //
+  // Pre-fills the baseline from the floor plan the user already laid out on the
+  // Fusion Map. That saved separation is the one length in the whole system
+  // that is known exactly, and it is what makes calibrating both beacons
+  // possible without measuring anything by hand.
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const anchors = await v2Scanner.getBeaconAnchors();
+        if (!alive || !anchors) return;
+        const ft = Math.hypot(anchors.b2.x - anchors.b1.x, anchors.b2.y - anchors.b1.y);
+        if (!Number.isFinite(ft) || ft <= 0) return;
+        const metres = ft / FT_PER_M;
+        setGeoBaselineFromPlan(metres);
+        setGeoBaselineInput((prev) => (prev ? prev : metres.toFixed(2)));
+      } catch (e) {
+        console.warn("[BeaconLab] anchor load failed:", e);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const finishGeoStand = useCallback(() => {
+    const session = geoSessionRef.current;
+    setGeoActiveStand(null);
+    setGeoProgress(null);
+    if (!session) return;
+    const committed = session.commitStand();
+    if (!committed.ok) {
+      Alert.alert("Stand Not Recorded", committed.error);
+      return;
+    }
+    setGeoStandsDone({ 1: Boolean(session.stands[1]), 2: Boolean(session.stands[2]) });
+    if (session.isComplete()) {
+      const solved = session.solve();
+      if (!solved.ok) {
+        Alert.alert("Could Not Solve", solved.error);
+        return;
+      }
+      setGeoResult(solved);
+      setGeoApplied(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!geoActiveStand) return;
+    const session = geoSessionRef.current;
+    if (!session) return;
+
+    const unsubPacket = v2Scanner.subscribePackets((pkt) => {
+      if (pkt.beaconNum !== 1 && pkt.beaconNum !== 2) return;
+      // Fit against the level ranging consumes, not the raw or merely-filtered
+      // one, so the calibrated model and the live model see the same input.
+      const level = Number.isFinite(pkt.rangingRssi)
+        ? pkt.rangingRssi
+        : Number.isFinite(pkt.filteredRssi)
+        ? pkt.filteredRssi
+        : pkt.rawRssi;
+      session.addSample(pkt.beaconNum, level);
+    });
+
+    // Progress is polled rather than pushed: packets arrive several times a
+    // second from each beacon, and re-rendering the card on every one of them
+    // would cost far more than it shows.
+    const timer = setInterval(() => {
+      const p = session.standProgress();
+      setGeoProgress(p);
+      if (p.done) {
+        finishGeoStand();
+      } else if (p.timedOut) {
+        session.cancelStand();
+        setGeoActiveStand(null);
+        setGeoProgress(null);
+        Alert.alert(
+          "Not Enough Packets",
+          "One of the beacons barely reached the phone during that stand (B1 " +
+            p.counts[1] + ", B2 " + p.counts[2] + ").\n\n" +
+            "Hold the phone at chest height, keep your body out of the straight " +
+            "line to each beacon, and make sure both are powered and in range."
+        );
+      }
+    }, 250);
+
+    return () => {
+      unsubPacket();
+      clearInterval(timer);
+    };
+  }, [geoActiveStand, finishGeoStand]);
+
+  const handleGeoStartStand = async (standAt) => {
+    if (!stats.beacon1Id || !stats.beacon2Id) {
+      Alert.alert(
+        "Select Both Beacons",
+        "Ranging calibration measures the two beacons against each other, so both " +
+          "B1 and B2 must be selected in the devices list first."
+      );
+      return;
+    }
+    if (!isScanning) {
+      const res = await v2Scanner.startScan();
+      if (!res?.success) {
+        Alert.alert("Scan Required", res?.error || "Enable Bluetooth and Location first.");
+        return;
+      }
+    }
+    const baselineM = parseFloat(geoBaselineInput);
+    if (!Number.isFinite(baselineM) || baselineM < RANGING_CALIB_CONFIG.MIN_BASELINE_M) {
+      Alert.alert(
+        "Beacon Separation Needed",
+        "Enter how far apart the two beacons are - at least " +
+          RANGING_CALIB_CONFIG.MIN_BASELINE_M + " m. Any closer and the two reference " +
+          "readings are too similar to tell the signal decay rate apart from " +
+          "measurement noise."
+      );
+      return;
+    }
+
+    let session = geoSessionRef.current;
+    if (!session) {
+      session = new RangingCalibrationSession(baselineM);
+      geoSessionRef.current = session;
+    }
+    session.setBaseline(baselineM);
+    // The phone has just been carried to a different spot, so both beacons'
+    // peak-hold shadow envelopes are stale: the one we walked away from still
+    // holds its 1 m peak and would add up to 9 dB of phantom fade correction
+    // to every sample of this stand.
+    v2Scanner.resetShadowEnvelopes();
+    const begun = session.beginStand(standAt);
+    if (!begun.ok) {
+      Alert.alert("Cannot Start", begun.error);
+      return;
+    }
+    setGeoResult(null);
+    setGeoApplied(false);
+    setGeoProgress(session.standProgress());
+    setGeoActiveStand(standAt);
+  };
+
+  const handleGeoCancelStand = () => {
+    if (geoSessionRef.current) geoSessionRef.current.cancelStand();
+    setGeoActiveStand(null);
+    setGeoProgress(null);
+  };
+
+  const handleGeoReset = () => {
+    geoSessionRef.current = null;
+    setGeoActiveStand(null);
+    setGeoProgress(null);
+    setGeoStandsDone({ 1: false, 2: false });
+    setGeoResult(null);
+    setGeoApplied(false);
+  };
+
+  const handleGeoApply = () => {
+    if (!geoResult) return;
+    const res = v2Scanner.applyGeometricCalibration(geoResult);
+    if (!res.success) {
+      Alert.alert("Apply Failed", res.error);
+      return;
+    }
+    setGeoApplied(true);
+    const f1 = geoResult.beacons[1];
+    const f2 = geoResult.beacons[2];
+    Alert.alert(
+      "Ranging Calibrated",
+      "Beacon 1   Tx@1m " + f1.txPower1m + " dBm   n " + f1.n + "\n" +
+        "Beacon 2   Tx@1m " + f2.txPower1m + " dBm   n " + f2.n + "\n\n" +
+        "Both beacons now use their own measured model instead of one shared guess. " +
+        "Distances should agree with each other, and with the floor plan, straight away."
+    );
+  };
 
   // Compute 1m statistics from collected samples
   const process1mCalibration = (samples) => {
@@ -407,6 +609,17 @@ export default function BeaconSignalLabScreen() {
 
   const activeTargetBeacon = calib1mTarget === 1 ? b1 : b2;
 
+  // Live geometric self-check. The distance between the beacons is the only
+  // length in the system known exactly, so the triangle inequality against it
+  // is proof of a calibration fault rather than evidence of one - it cannot
+  // false-alarm on noise the way a statistical test would.
+  const geoHealth = useMemo(() => {
+    const baselineM = parseFloat(geoBaselineInput);
+    if (!Number.isFinite(baselineM) || baselineM <= 0) return null;
+    if (!Number.isFinite(b1.distanceM) || !Number.isFinite(b2.distanceM)) return null;
+    return checkRangeGeometry(b1.distanceM, b2.distanceM, baselineM);
+  }, [b1.distanceM, b2.distanceM, geoBaselineInput]);
+
   return (
     <ScrollView style={styles.root} contentContainerStyle={styles.container}>
       {/* ── 1. Screen Header ── */}
@@ -471,6 +684,195 @@ export default function BeaconSignalLabScreen() {
             <Text style={{ fontSize: 10 }}>{formatDist(b2.distanceM, distanceUnit).label}</Text>
           </Text>
         </View>
+      </View>
+
+      {/* ── 3. FEATURED: TWO-STAND GEOMETRIC RANGING CALIBRATION ── */}
+      <View style={styles.geoCard}>
+        <View style={styles.geoHeader}>
+          <View style={styles.geoIconBadge}>
+            <Text style={{ fontSize: 20 }}>📐</Text>
+          </View>
+          <View style={{ flex: 1 }}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+              <Text style={styles.geoTitle}>Ranging Calibration</Text>
+              <View style={styles.geoHeroTag}>
+                <Text style={styles.geoHeroTagText}>FIXES WRONG DISTANCES</Text>
+              </View>
+            </View>
+            <Text style={styles.geoSub}>
+              Two 20-second stands. No tape measure needed.
+            </Text>
+          </View>
+        </View>
+
+        {/* Why */}
+        <View style={styles.geoWhyBox}>
+          <Text style={styles.geoWhyText}>
+            If one beacon reads 8 m and the other 24 m from the same spot, that is not
+            noise — the two radios transmit at different strengths and sit behind
+            different obstacles, so each needs its own distance model. This measures
+            both, using the gap between the beacons on your floor plan as the ruler.
+          </Text>
+        </View>
+
+        {/* Live geometry health */}
+        {geoHealth && !geoHealth.ok && (
+          <View style={styles.geoAlertBox}>
+            <Text style={styles.geoAlertTitle}>⚠ Ranging is geometrically impossible</Text>
+            <Text style={styles.geoAlertText}>{geoHealth.issues[0].message}</Text>
+          </View>
+        )}
+        {geoHealth && geoHealth.ok && (
+          <View style={styles.geoOkBox}>
+            <Text style={styles.geoOkText}>
+              ✓ Ranges are consistent with the {geoHealth.baseline} m beacon gap
+              (sum {geoHealth.sum} m, difference {geoHealth.diff} m)
+            </Text>
+          </View>
+        )}
+
+        {/* Baseline */}
+        <View style={styles.geoBaselineRow}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.geoFieldLabel}>DISTANCE BETWEEN THE TWO BEACONS</Text>
+            <Text style={styles.geoFieldHint}>
+              {geoBaselineFromPlan !== null
+                ? "From your Fusion Map layout — override if the beacons have moved."
+                : "Place both beacons on the Fusion Map to fill this in automatically."}
+            </Text>
+          </View>
+          <View style={styles.geoBaselineInputWrap}>
+            <TextInput
+              style={styles.geoBaselineInput}
+              value={geoBaselineInput}
+              onChangeText={setGeoBaselineInput}
+              keyboardType="decimal-pad"
+              placeholder="10.0"
+              placeholderTextColor="#484f58"
+              editable={!geoActiveStand}
+            />
+            <Text style={styles.geoBaselineUnit}>m</Text>
+          </View>
+        </View>
+
+        {/* Stands */}
+        {[1, 2].map((standAt) => {
+          const done = geoStandsDone[standAt];
+          const active = geoActiveStand === standAt;
+          const accent = standAt === 1 ? "#38bdf8" : "#c084fc";
+          return (
+            <View
+              key={standAt}
+              style={[
+                styles.geoStandRow,
+                active && { borderColor: accent, backgroundColor: "rgba(56,189,248,0.06)" },
+                done && !active && styles.geoStandRowDone,
+              ]}
+            >
+              <View style={{ flex: 1 }}>
+                <Text style={[styles.geoStandTitle, { color: accent }]}>
+                  {done ? "✓ " : ""}Stand {standAt} — at Beacon {standAt}
+                </Text>
+                <Text style={styles.geoStandHint}>
+                  Stand about 1 m in front of Beacon {standAt}, phone at chest height,
+                  facing it. Stay still.
+                </Text>
+                {active && geoProgress && (
+                  <>
+                    <View style={styles.geoProgressTrack}>
+                      <View
+                        style={[
+                          styles.geoProgressFill,
+                          { width: (geoProgress.progress * 100).toFixed(0) + "%", backgroundColor: accent },
+                        ]}
+                      />
+                    </View>
+                    <Text style={styles.geoProgressText}>
+                      {geoProgress.settling
+                        ? "Letting the signal settle after the walk over…"
+                        : "B1 " + geoProgress.counts[1] + " · B2 " + geoProgress.counts[2] +
+                          " packets of " + RANGING_CALIB_CONFIG.TARGET_SAMPLES_PER_BEACON}
+                    </Text>
+                  </>
+                )}
+              </View>
+              {active ? (
+                <Pressable style={styles.geoStandCancelBtn} onPress={handleGeoCancelStand}>
+                  <Text style={styles.geoStandCancelText}>Cancel</Text>
+                </Pressable>
+              ) : (
+                <Pressable
+                  style={[
+                    styles.geoStandBtn,
+                    { borderColor: accent },
+                    geoActiveStand && styles.geoStandBtnDisabled,
+                  ]}
+                  disabled={Boolean(geoActiveStand)}
+                  onPress={() => handleGeoStartStand(standAt)}
+                >
+                  <Text style={[styles.geoStandBtnText, { color: accent }]}>
+                    {done ? "Redo" : "Start"}
+                  </Text>
+                </Pressable>
+              )}
+            </View>
+          );
+        })}
+
+        {/* Result */}
+        {geoResult && (
+          <View style={styles.geoResultBox}>
+            <Text style={styles.geoResultTitle}>MEASURED MODELS</Text>
+            {[1, 2].map((num) => {
+              const fit = geoResult.beacons[num];
+              const accent = num === 1 ? "#38bdf8" : "#c084fc";
+              return (
+                <View key={num} style={styles.geoResultRow}>
+                  <Text style={[styles.geoResultBeacon, { color: accent }]}>B{num}</Text>
+                  <View style={styles.geoResultMetric}>
+                    <Text style={styles.geoResultMetricLabel}>Tx @ 1 m</Text>
+                    <Text style={styles.geoResultMetricVal}>{fit.txPower1m} dBm</Text>
+                  </View>
+                  <View style={styles.geoResultMetric}>
+                    <Text style={styles.geoResultMetricLabel}>decay n</Text>
+                    <Text style={styles.geoResultMetricVal}>{fit.n}</Text>
+                  </View>
+                  <View style={styles.geoResultMetric}>
+                    <Text style={styles.geoResultMetricLabel}>was reading</Text>
+                    <Text style={styles.geoResultMetricVal}>
+                      {fit.uncalibratedFarM ? fit.uncalibratedFarM.toFixed(1) : "—"} m
+                    </Text>
+                  </View>
+                </View>
+              );
+            })}
+            <Text style={styles.geoResultFoot}>
+              Both beacons are genuinely {geoResult.baselineM.toFixed(1)} m away during the
+              other stand, so the "was reading" column is what the old shared model got
+              wrong.
+            </Text>
+
+            {geoResult.warnings.map((w, i) => (
+              <Text key={i} style={styles.geoWarnText}>
+                ⚠ {w}
+              </Text>
+            ))}
+
+            <View style={styles.geoResultActions}>
+              <Pressable
+                style={[styles.geoApplyBtn, geoApplied && styles.geoApplyBtnDone]}
+                onPress={handleGeoApply}
+              >
+                <Text style={styles.geoApplyBtnText}>
+                  {geoApplied ? "✓ Applied to Both Beacons" : "Apply Calibration"}
+                </Text>
+              </Pressable>
+              <Pressable style={styles.geoResetBtn} onPress={handleGeoReset}>
+                <Text style={styles.geoResetBtnText}>Reset</Text>
+              </Pressable>
+            </View>
+          </View>
+        )}
       </View>
 
       {/* ── 3. FEATURED: 1-METER RSSI CALIBRATION STUDIO & CALCULATOR ── */}
@@ -1808,6 +2210,167 @@ const styles = StyleSheet.create({
   // ---------------------------------------------------------------------------
   // 1-METER CALIBRATION STUDIO STYLES
   // ---------------------------------------------------------------------------
+  // ── Two-stand geometric ranging calibration ──
+  geoCard: {
+    backgroundColor: "#161b22",
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 14,
+    borderWidth: 1.5,
+    borderColor: "#f0883e",
+    shadowColor: "#f0883e",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 6,
+    elevation: 4,
+  },
+  geoHeader: { flexDirection: "row", alignItems: "center", gap: 10, marginBottom: 10 },
+  geoIconBadge: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: "rgba(240, 136, 62, 0.15)",
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: "#f0883e",
+  },
+  geoTitle: { fontSize: 15, fontWeight: "900", color: "#f0f6fc" },
+  geoHeroTag: {
+    backgroundColor: "rgba(240, 136, 62, 0.2)",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  geoHeroTagText: { fontSize: 8, fontWeight: "900", color: "#f0883e", letterSpacing: 0.5 },
+  geoSub: { fontSize: 11, color: "#8b949e", marginTop: 2 },
+  geoWhyBox: {
+    backgroundColor: "#0d1117",
+    borderRadius: 8,
+    padding: 10,
+    marginBottom: 10,
+    borderLeftWidth: 3,
+    borderLeftColor: "#f0883e",
+  },
+  geoWhyText: { fontSize: 11, color: "#8b949e", lineHeight: 17 },
+  geoAlertBox: {
+    backgroundColor: "rgba(248, 81, 73, 0.1)",
+    borderRadius: 8,
+    padding: 10,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: "#f85149",
+  },
+  geoAlertTitle: { fontSize: 11, fontWeight: "900", color: "#f85149", marginBottom: 3 },
+  geoAlertText: { fontSize: 11, color: "#ffa198", lineHeight: 16 },
+  geoOkBox: {
+    backgroundColor: "rgba(63, 185, 80, 0.08)",
+    borderRadius: 8,
+    padding: 8,
+    marginBottom: 10,
+  },
+  geoOkText: { fontSize: 11, color: "#3fb950" },
+  geoBaselineRow: { flexDirection: "row", alignItems: "center", gap: 10, marginBottom: 12 },
+  geoFieldLabel: { fontSize: 9, fontWeight: "900", color: "#8b949e", letterSpacing: 0.6 },
+  geoFieldHint: { fontSize: 10, color: "#6e7681", marginTop: 2, lineHeight: 14 },
+  geoBaselineInputWrap: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#0d1117",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#30363d",
+    paddingHorizontal: 8,
+  },
+  geoBaselineInput: {
+    width: 56,
+    paddingVertical: 8,
+    fontSize: 16,
+    fontWeight: "800",
+    color: "#f0f6fc",
+    textAlign: "right",
+  },
+  geoBaselineUnit: { fontSize: 12, color: "#8b949e", marginLeft: 4 },
+  geoStandRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    backgroundColor: "#0d1117",
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#30363d",
+    padding: 10,
+    marginBottom: 8,
+  },
+  geoStandRowDone: { borderColor: "#3fb950" },
+  geoStandTitle: { fontSize: 12, fontWeight: "900" },
+  geoStandHint: { fontSize: 10, color: "#6e7681", marginTop: 2, lineHeight: 14 },
+  geoProgressTrack: {
+    height: 5,
+    borderRadius: 3,
+    backgroundColor: "#21262d",
+    marginTop: 8,
+    overflow: "hidden",
+  },
+  geoProgressFill: { height: 5, borderRadius: 3 },
+  geoProgressText: { fontSize: 10, color: "#8b949e", marginTop: 4 },
+  geoStandBtn: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: 1.5,
+  },
+  geoStandBtnDisabled: { opacity: 0.35 },
+  geoStandBtnText: { fontSize: 12, fontWeight: "900" },
+  geoStandCancelBtn: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: 1.5,
+    borderColor: "#f85149",
+  },
+  geoStandCancelText: { fontSize: 12, fontWeight: "900", color: "#f85149" },
+  geoResultBox: {
+    backgroundColor: "#0d1117",
+    borderRadius: 10,
+    padding: 10,
+    marginTop: 4,
+    borderWidth: 1,
+    borderColor: "#3fb950",
+  },
+  geoResultTitle: {
+    fontSize: 9,
+    fontWeight: "900",
+    color: "#3fb950",
+    letterSpacing: 0.6,
+    marginBottom: 8,
+  },
+  geoResultRow: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 8 },
+  geoResultBeacon: { fontSize: 13, fontWeight: "900", width: 24 },
+  geoResultMetric: { flex: 1 },
+  geoResultMetricLabel: { fontSize: 8, color: "#6e7681", letterSpacing: 0.4 },
+  geoResultMetricVal: { fontSize: 12, fontWeight: "800", color: "#f0f6fc" },
+  geoResultFoot: { fontSize: 10, color: "#6e7681", lineHeight: 15, marginBottom: 6 },
+  geoWarnText: { fontSize: 10, color: "#d29922", lineHeight: 15, marginBottom: 6 },
+  geoResultActions: { flexDirection: "row", gap: 8, marginTop: 4 },
+  geoApplyBtn: {
+    flex: 1,
+    backgroundColor: "#238636",
+    borderRadius: 8,
+    paddingVertical: 11,
+    alignItems: "center",
+  },
+  geoApplyBtnDone: { backgroundColor: "#1f6f2c" },
+  geoApplyBtnText: { fontSize: 13, fontWeight: "900", color: "#ffffff" },
+  geoResetBtn: {
+    paddingHorizontal: 14,
+    justifyContent: "center",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#30363d",
+  },
+  geoResetBtnText: { fontSize: 12, fontWeight: "800", color: "#8b949e" },
+
   calib1mCard: {
     backgroundColor: "#161b22",
     borderRadius: 14,

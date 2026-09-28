@@ -352,7 +352,29 @@ export class FusionEngine {
   feedLocatingSample(d1, d2, conf1 = 1, conf2 = 1) {
     if (!this._locating) return { done: true, progress: 1, samples: 0, provisional: null, fix: null };
 
-    this._accumulator.add(d1, d2, conf1, conf2);
+    // Right next to a beacon the range engine reports 0 (receiver saturated).
+    // That is a genuine "you are at the beacon", not a missing reading, and it
+    // used to be rejected as invalid - so standing near a beacon while
+    // locating meant no sample was ever accepted.
+    const MIN_RANGE_FT = 0.5;
+    const r1 = Number.isFinite(d1) ? Math.max(MIN_RANGE_FT, d1) : d1;
+    const r2 = Number.isFinite(d2) ? Math.max(MIN_RANGE_FT, d2) : d2;
+    this._accumulator.add(r1, r2, conf1, conf2);
+    return this._evaluateLocating();
+  }
+
+  /**
+   * Re-checks the time limits without a new sample. Readiness used to be
+   * evaluated only when a sample arrived, so if samples stopped - a beacon
+   * gone quiet - even the timeout could never fire and locating never ended.
+   * Call this from a periodic timer.
+   */
+  checkLocatingTimeout() {
+    if (!this._locating) return null;
+    return this._evaluateLocating();
+  }
+
+  _evaluateLocating() {
     const progress = this._accumulator.progress();
 
     if (!this._accumulator.isReady()) {
@@ -363,6 +385,7 @@ export class FusionEngine {
           anchor1: this._anchor1, anchor2: this._anchor2,
           d1: c.d1, d2: c.d2, conf1: c.conf, conf2: c.conf,
           room: this._roomBounds(),
+          requireConfidence: false,
         });
         if (peek.position) provisional = peek.position;
       }
@@ -370,12 +393,20 @@ export class FusionEngine {
     }
 
     const c = this._accumulator.consolidate();
-    this._locating = false;
     const fix = this.initializeFromBeacons({
       d1: c.d1, d2: c.d2, conf1: c.conf, conf2: c.conf,
       measuredRangeSigmaFt: Math.max(c.sigma1Ft ?? 0, c.sigma2Ft ?? 0),
       sampleCount: c.sampleCount,
+      averaged: true,
     });
+    if (!fix.position) {
+      // The solve failed. Previously locating was switched off here anyway,
+      // so the screen sat on "locating" forever with nothing left feeding it.
+      // Start a fresh window instead and say why, so the user sees progress.
+      this._accumulator.reset();
+      return { done: false, progress: 0, samples: 0, provisional: null, fix: null, failure: fix };
+    }
+    this._locating = false;
     return { done: true, progress: 1, samples: c.sampleCount, provisional: null, fix };
   }
 
@@ -396,6 +427,27 @@ export class FusionEngine {
     pdrEngine.reset(this._x, this._y);
   }
 
+  /**
+   * Commits the fix immediately from whatever has been collected so far.
+   * Used when the user starts walking mid-locate: from that moment new ranges
+   * describe a moving position, so waiting longer would only make the fix
+   * worse. Returns null (and keeps locating) if there is not yet enough to
+   * solve from.
+   */
+  finishLocatingNow() {
+    if (!this._locating || !this._accumulator.hasProvisional()) return null;
+    const c = this._accumulator.consolidate();
+    const fix = this.initializeFromBeacons({
+      d1: c.d1, d2: c.d2, conf1: c.conf, conf2: c.conf,
+      measuredRangeSigmaFt: Math.max(c.sigma1Ft ?? 0, c.sigma2Ft ?? 0),
+      sampleCount: c.sampleCount,
+      averaged: true,
+    });
+    if (!fix.position) return null;
+    this._locating = false;
+    return fix;
+  }
+
   /** Abandons an in-progress locating phase. */
   cancelLocating() {
     this._locating = false;
@@ -408,11 +460,15 @@ export class FusionEngine {
       : null;
   }
 
-  initializeFromBeacons({ d1, d2, conf1, conf2, keepPrior = false, measuredRangeSigmaFt = null, sampleCount = 1 }) {
+  initializeFromBeacons({ d1, d2, conf1, conf2, keepPrior = false, measuredRangeSigmaFt = null, sampleCount = 1, averaged = false }) {
     const result = solveInitialPosition({
       anchor1: this._anchor1,
       anchor2: this._anchor2,
       d1, d2, conf1, conf2,
+      // The per-packet confidence gate exists to stop ONE noisy packet becoming
+      // the start position. An averaged window has already dealt with that
+      // noise, and its measured spread sets the uncertainty below.
+      requireConfidence: !averaged,
       room: this._roomBounds(),
       priorPosition: keepPrior ? { x: this._x, y: this._y } : null,
     });

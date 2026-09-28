@@ -238,6 +238,7 @@ export function positionUncertaintyFt(p, a1, a2, config = SOLVER_CONFIG) {
  */
 export function solveInitialPosition({
   anchor1, anchor2, d1, d2, conf1 = 1, conf2 = 1, room = null, priorPosition = null,
+  requireConfidence = true,
   config = SOLVER_CONFIG,
 }) {
   const fail = (status, reason) => ({
@@ -250,7 +251,7 @@ export function solveInitialPosition({
   }
   // A cold start is committed to once and inherited by everything afterwards,
   // so a noisy reading is worth waiting out rather than acting on.
-  if (conf1 < config.MIN_COLD_START_CONFIDENCE || conf2 < config.MIN_COLD_START_CONFIDENCE) {
+  if (requireConfidence && (conf1 < config.MIN_COLD_START_CONFIDENCE || conf2 < config.MIN_COLD_START_CONFIDENCE)) {
     return fail("low-confidence", "waiting-for-a-clean-reading-from-both-beacons");
   }
 
@@ -394,8 +395,10 @@ function outsideDistance(p, room) {
 //   10 samples 3.3 ft      / 12.5 ft
 //   30 samples ~2.1 ft     / ~8 ft
 //   80 samples 1.1 ft      /  6.0 ft
-// Around three seconds of packets captures most of the available gain without
-// asking the user to stand still for an unreasonable time.
+// About three seconds of packets captures most of the available gain without
+// asking the user to stand still for an unreasonable time; the accumulator
+// commits then if the ranges have settled, and waits a little longer only
+// while they are still drifting.
 //
 // A TRIMMED MEAN is used rather than a plain mean or a median: the plain mean is
 // dragged by the occasional severe multipath outlier, while the median discards
@@ -404,18 +407,56 @@ function outsideDistance(p, room) {
 // ============================================================================
 
 export const ACCUMULATOR_CONFIG = {
-  // Samples needed before a fix is committed. At a typical 9-10 packets/sec
-  // this is roughly three seconds of standing still.
-  TARGET_SAMPLES: 30,
   // Enough to produce an early provisional fix to show the user immediately.
-  MIN_SAMPLES_FOR_PROVISIONAL: 8,
+  MIN_SAMPLES_FOR_PROVISIONAL: 4,
+  // Minimum evidence before any commit on the normal path: this many packets
+  // AND this much time. Accuracy is set by how many independent looks at the
+  // slow shadowing the window contains, which is a matter of TIME, not packet
+  // count - measured in the office (see above), ~3 s gives ~2.1 ft and there
+  // is no way to get that from less. Committing earlier on a small window that
+  // merely looks steady was simulated at more than double the range error.
+  MIN_SAMPLES_TO_COMMIT: 12,
+  MIN_COLLECT_MS: 3000,
+  // Commit once the standard error of BOTH mean ranges is below this AND the
+  // ranges are not drifting. The standard error is computed from the
+  // EFFECTIVE sample count (see effectiveSampleCount): the distances arriving
+  // here are Kalman-smoothed, so neighbouring samples are strongly correlated
+  // and a plain spread/sqrt(N) would claim far more precision than the data
+  // holds - committing early on that would cost accuracy.
+  CONVERGED_SEM_FT: 1.0,
+  // Drift test: the two halves of the window must agree to within this (or
+  // twice the standard error, whichever is larger). A range still settling -
+  // the user only just stopped walking, or the BLE filter is catching up -
+  // shows up as the halves disagreeing, and averaging it would bake the lag
+  // into the starting position.
+  DRIFT_TOLERANCE_FT: 2.5,
   // Fraction trimmed from EACH end before averaging.
   TRIM_FRACTION: 0.2,
-  // Give up waiting for TARGET_SAMPLES after this long and use what we have,
-  // so a weak beacon cannot leave the user stuck on "locating" forever.
-  MAX_COLLECT_MS: 9000,
+  // Normal time limit: commit with what is there if the ranges are steady.
+  MAX_COLLECT_MS: 6000,
+  // Extended limit while the ranges are still drifting; the commit then uses
+  // only the most recent half of the window, which is closest to the truth.
+  MAX_COLLECT_DRIFTING_MS: 10000,
+  // Minimum evidence for the timeout path - still better than one packet.
+  MIN_SAMPLES_ON_TIMEOUT: 6,
+  // Absolute deadline. Whatever has been collected by now is committed, as
+  // long as it is at least MIN_SAMPLES_AT_DEADLINE. Locating must END: a user
+  // left staring at "finding your position" gets nothing, whereas a slightly
+  // rougher start is refined by BLE correction as soon as they walk.
+  HARD_DEADLINE_MS: 15000,
+  MIN_SAMPLES_AT_DEADLINE: 2,
+  // Rolling window cap; older samples are dropped first.
+  MAX_SAMPLES: 60,
   // Samples below this confidence are ignored entirely.
-  MIN_SAMPLE_CONFIDENCE: 0.2,
+  //
+  // Deliberately 0. The BLE engine's confidence is 1 - (raw RSSI noise
+  // variance)/20 dB^2, and ordinary indoor BLE noise of 4-5 dB alone puts it at
+  // 0-0.2 - so the old 0.2 floor rejected almost every reading and locating
+  // waited minutes for a rare quiet moment. Noisy readings are exactly what
+  // averaging is for, and their noise is already measured by the spread and
+  // reflected in the reported uncertainty. Staleness, which IS a reason to
+  // reject a sample, is handled by the caller from packet timestamps.
+  MIN_SAMPLE_CONFIDENCE: 0.0,
 };
 
 /** Mean of the middle (1 - 2·trim) fraction of the values. */
@@ -434,6 +475,36 @@ function stdDev(values) {
   return Math.sqrt(values.reduce((a, v) => a + (v - m) ** 2, 0) / (values.length - 1));
 }
 
+/**
+ * Number of INDEPENDENT samples a correlated series is worth.
+ *
+ * For an AR(1)-like series with lag-1 autocorrelation rho, the variance of the
+ * mean is that of n_eff = n(1 - rho)/(1 + rho) independent samples. Kalman-
+ * smoothed ranges typically have rho around 0.7-0.9, i.e. 20 samples carry
+ * the information of only 2-4, and pretending otherwise understates error.
+ */
+function effectiveSampleCount(values) {
+  const n = values.length;
+  if (n < 3) return n;
+  const m = values.reduce((a, v) => a + v, 0) / n;
+  let num = 0, den = 0;
+  for (let i = 0; i < n; i++) {
+    const e = values[i] - m;
+    den += e * e;
+    if (i + 1 < n) num += e * (values[i + 1] - m);
+  }
+  if (den < 1e-9) return n; // perfectly constant: no evidence of correlation
+  const rho = Math.max(0, Math.min(0.95, num / den));
+  return Math.max(1, (n * (1 - rho)) / (1 + rho));
+}
+
+/** Standard error of the mean, corrected for autocorrelation. */
+function honestSem(values) {
+  const s = stdDev(values);
+  if (s === null) return null;
+  return s / Math.sqrt(effectiveSampleCount(values));
+}
+
 export class RangeFixAccumulator {
   constructor(config = {}) {
     this.cfg = { ...ACCUMULATOR_CONFIG, ...config };
@@ -447,27 +518,63 @@ export class RangeFixAccumulator {
     this._startedAt = Date.now();
   }
 
-  /** Feeds one BLE reading. Low-confidence readings are dropped, not averaged in. */
+  /** Feeds one BLE reading. The caller is responsible for skipping stale or duplicate ones. */
   add(d1, d2, conf1 = 1, conf2 = 1) {
     if (!Number.isFinite(d1) || !Number.isFinite(d2) || d1 <= 0 || d2 <= 0) return false;
     if (conf1 < this.cfg.MIN_SAMPLE_CONFIDENCE || conf2 < this.cfg.MIN_SAMPLE_CONFIDENCE) return false;
     this._d1.push(d1);
     this._d2.push(d2);
     this._conf.push(Math.min(conf1, conf2));
+    if (this._d1.length > this.cfg.MAX_SAMPLES) {
+      this._d1.shift();
+      this._d2.shift();
+      this._conf.shift();
+    }
     return true;
   }
 
   get sampleCount() { return this._d1.length; }
+  get elapsedMs() { return Date.now() - this._startedAt; }
+
+  /** True while either range is still moving between the two halves of the window. */
+  isDrifting() {
+    const n = this._d1.length;
+    if (n < this.cfg.MIN_SAMPLES_TO_COMMIT) return false;
+    const half = Math.floor(n / 2);
+    const drifts = (values) => {
+      const early = trimmedMean(values.slice(0, half), this.cfg.TRIM_FRACTION);
+      const late = trimmedMean(values.slice(half), this.cfg.TRIM_FRACTION);
+      const sem = honestSem(values) ?? 0;
+      return Math.abs(late - early) > Math.max(this.cfg.DRIFT_TOLERANCE_FT, 2 * sem);
+    };
+    return drifts(this._d1) || drifts(this._d2);
+  }
 
   /** Enough evidence to commit to a fix? */
   isReady() {
-    if (this._d1.length >= this.cfg.TARGET_SAMPLES) return true;
-    // Timeout path: commit with whatever we have rather than stalling, provided
-    // it is at least enough to be better than a single packet.
-    return (
-      this._d1.length >= this.cfg.MIN_SAMPLES_FOR_PROVISIONAL &&
-      Date.now() - this._startedAt > this.cfg.MAX_COLLECT_MS
-    );
+    const n = this._d1.length;
+    const elapsed = Date.now() - this._startedAt;
+    const drifting = this.isDrifting();
+    if (
+      n >= this.cfg.MIN_SAMPLES_TO_COMMIT &&
+      elapsed >= this.cfg.MIN_COLLECT_MS &&
+      !drifting &&
+      this._isConverged()
+    ) return true;
+    // Timeout paths: commit with whatever we have rather than stalling, provided
+    // it is at least enough to be better than a single packet. A drifting
+    // window is given longer, because committing mid-drift bakes the lag in.
+    if (n >= this.cfg.MIN_SAMPLES_AT_DEADLINE && elapsed > this.cfg.HARD_DEADLINE_MS) return true;
+    if (n < this.cfg.MIN_SAMPLES_ON_TIMEOUT) return false;
+    return elapsed > (drifting ? this.cfg.MAX_COLLECT_DRIFTING_MS : this.cfg.MAX_COLLECT_MS);
+  }
+
+  /** Both mean ranges known to within CONVERGED_SEM_FT (autocorrelation-corrected). */
+  _isConverged() {
+    const e1 = honestSem(this._d1);
+    const e2 = honestSem(this._d2);
+    if (e1 === null || e2 === null) return false;
+    return e1 <= this.cfg.CONVERGED_SEM_FT && e2 <= this.cfg.CONVERGED_SEM_FT;
   }
 
   /** Enough for a provisional position to show while still collecting. */
@@ -476,33 +583,44 @@ export class RangeFixAccumulator {
   }
 
   progress() {
-    return Math.min(1, this._d1.length / this.cfg.TARGET_SAMPLES);
+    if (this.isReady()) return 1;
+    // Closer of: statistical convergence, or the time limit.
+    const e = Math.max(honestSem(this._d1) ?? Infinity, honestSem(this._d2) ?? Infinity);
+    const byPrecision = Number.isFinite(e) && this._d1.length >= this.cfg.MIN_SAMPLES_TO_COMMIT
+      ? Math.min(1, this.cfg.CONVERGED_SEM_FT / e)
+      : (this._d1.length / this.cfg.MIN_SAMPLES_TO_COMMIT) * 0.5;
+    const limit = this.isDrifting() ? this.cfg.MAX_COLLECT_DRIFTING_MS : this.cfg.MAX_COLLECT_MS;
+    const byTime = (Date.now() - this._startedAt) / limit;
+    return Math.min(0.95, Math.max(byPrecision, byTime));
   }
 
   /**
    * Consolidated ranges plus the standard error of each.
    *
-   * The reported sigma is the standard error of the MEAN (spread / sqrt(N)),
-   * floored so it never claims more precision than BLE can physically deliver —
-   * averaging reduces jitter but cannot remove the slow shadowing component, so
-   * a spread that happens to look small must not be read as a perfect fix.
+   * The reported sigma is the autocorrelation-corrected standard error of the
+   * mean; FusionEngine floors it so it never claims more precision than BLE can
+   * physically deliver - averaging reduces jitter but cannot remove the slow
+   * shadowing component. If the window is still drifting (timeout path) only
+   * the most recent half is used, since the older part describes where the
+   * range estimate was, not where the user is.
    */
   consolidate() {
     if (!this._d1.length) return null;
-    const n = this._d1.length;
-    const d1 = trimmedMean(this._d1, this.cfg.TRIM_FRACTION);
-    const d2 = trimmedMean(this._d2, this.cfg.TRIM_FRACTION);
-    const s1 = stdDev(this._d1);
-    const s2 = stdDev(this._d2);
-    const sem = (s) => (s === null ? null : s / Math.sqrt(n));
+    let v1 = this._d1, v2 = this._d2, vc = this._conf;
+    if (this.isDrifting()) {
+      const half = Math.floor(v1.length / 2);
+      v1 = v1.slice(half); v2 = v2.slice(half); vc = vc.slice(half);
+    }
+    const n = v1.length;
     return {
-      d1, d2,
-      sampleCount: n,
-      conf: this._conf.reduce((a, v) => a + v, 0) / n,
-      sigma1Ft: sem(s1),
-      sigma2Ft: sem(s2),
-      spread1Ft: s1,
-      spread2Ft: s2,
+      d1: trimmedMean(v1, this.cfg.TRIM_FRACTION),
+      d2: trimmedMean(v2, this.cfg.TRIM_FRACTION),
+      sampleCount: this._d1.length,
+      conf: vc.reduce((a, v) => a + v, 0) / n,
+      sigma1Ft: honestSem(v1),
+      sigma2Ft: honestSem(v2),
+      spread1Ft: stdDev(v1),
+      spread2Ft: stdDev(v2),
     };
   }
 }

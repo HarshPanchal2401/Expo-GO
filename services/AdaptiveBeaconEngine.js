@@ -160,9 +160,28 @@ export const DEFAULT_ADAPTIVE_CONFIG = {
   ENVELOPE_WEIGHT: 0.85,
   MAX_ENVELOPE_CORRECTION_DB: 9.0,
 
-  // Fallback path loss parameters if beacon is not individually calibrated
+  // Fallback path loss parameters if beacon is not individually calibrated.
+  //
+  // WHY n = 2.9 AND NOT 2.2: n is the exponent in d = 10^((Tx - RSSI)/(10n)),
+  // so it sets the ENTIRE distance scale, and it is the single biggest source
+  // of absolute range error before per-beacon calibration. n = 2.0 is free
+  // space; 2.2 is barely more than that and describes an open corridor with
+  // clear line of sight. A real furnished office - desks, partitions, people,
+  // the user's own body between phone and beacon - measures 2.8 to 3.2.
+  //
+  // The error is not small, because it compounds logarithmically. A beacon at
+  // a true 10 m with Tx = -59 reads about -89 dBm in an office. Inverted with
+  // n = 2.2 that becomes 10^(30/22) = 23 m; with n = 2.9 it becomes
+  // 10^(30/29) = 10.2 m. The old default reported distances roughly 2.3x too
+  // long at 10 m, and the overshoot GREW with range - the worst possible shape
+  // of error for an initial-position solve, which depends on two long ranges
+  // agreeing with each other and with the floor plan.
+  //
+  // This is only the fallback. Per-beacon calibration (PathLossCalibrator, fed
+  // by BeaconRangingCalibration) overrides it and should always be run for a
+  // real deployment, because n and Tx both differ between two beacons.
   DEFAULT_TX_POWER_1M: -59.0,
-  DEFAULT_PATH_LOSS_N: 2.2,
+  DEFAULT_PATH_LOSS_N: 2.9,
 
   // Kinematic walking ceiling (1.6 m/s represents natural indoor walking speed).
   // This is a PLAUSIBILITY CLAMP, not a smoother — see ingestReading() step 7.
@@ -191,6 +210,13 @@ export const DEFAULT_ADAPTIVE_CONFIG = {
 
   // Stale beacon timeout in milliseconds (decays confidence if packets stop arriving)
   STALE_TIMEOUT_MS: 3000,
+
+  // Packet gap that costs no confidence. A beacon advertising at 400 ms is
+  // perfectly healthy, so the recency decay must not begin at the first
+  // millisecond of silence or every link would sit permanently below full
+  // confidence. Confidence stays at 1.0 up to this gap, then ramps linearly
+  // to 0 at STALE_TIMEOUT_MS.
+  PACKET_GAP_GRACE_MS: 900,
 
   // Optional 3D slant -> 2D floor-plane height correction, for beacons mounted at
   // a different height than the phone (e.g. ceiling-mounted, common in floor-plan
@@ -923,6 +949,13 @@ export class BeaconManager {
     }
 
     const entry = this._getOrCreate(beaconId, meta.name);
+    // Captured BEFORE it is overwritten: step 8 needs the gap since the
+    // PREVIOUS packet to judge whether this link is keeping up. Reading
+    // entry.lastTimestamp after the assignment below always yielded 0, which
+    // silently pinned recencyFactor at 1.0 and made STALE_TIMEOUT_MS dead
+    // code - a beacon dropping most of its packets still scored full
+    // confidence, and the fusion filter trusted it accordingly.
+    const prevTimestamp = entry.lastTimestamp;
     entry.totalPackets++;
     entry.lastRawRssi = numRssi;
     entry.lastTimestamp = timestamp;
@@ -1171,8 +1204,13 @@ export class BeaconManager {
     entry.lastDistanceUpdate = timestamp;
 
     // 8. Compute Live Confidence Score C ∈ [0.0, 1.0]
-    const ageMs = timestamp - entry.lastTimestamp;
-    const recencyFactor = Math.max(0.0, 1.0 - ageMs / this.config.STALE_TIMEOUT_MS);
+    const gapMs = Number.isFinite(prevTimestamp) ? Math.max(0, timestamp - prevTimestamp) : 0;
+    const graceMs = this.config.PACKET_GAP_GRACE_MS ?? 900;
+    const staleMs = Math.max(graceMs + 1, this.config.STALE_TIMEOUT_MS ?? 3000);
+    const recencyFactor = Math.max(
+      0.0,
+      Math.min(1.0, 1.0 - Math.max(0, gapMs - graceMs) / (staleMs - graceMs))
+    );
     const sufficiencyFactor = Math.min(1.0, entry.profile.samples.length / 5.0);
     const rawConf = stabilityScore * recencyFactor * sufficiencyFactor;
     const confidenceScore = Number.isFinite(rawConf) ? Number(Math.max(0, Math.min(1, rawConf)).toFixed(3)) : 0.5;
@@ -1189,6 +1227,13 @@ export class BeaconManager {
       noiseVariance: Number.isFinite(noiseVariance) ? noiseVariance : 4.0,
       shadowGapDb: Number(shadowGapDb.toFixed(1)),
       shadowCorrectionDb: Number(shadowCorrectionDb.toFixed(1)),
+      // The exact level the path-loss inversion was fed: filtered RSSI plus
+      // the shadow correction. Calibration MUST be fitted against this rather
+      // than filteredRssi - fitting the model to one level and then ranging
+      // off another injects a constant offset equal to the typical correction,
+      // which is several dB and therefore metres of range error.
+      rangingRssi: Number(rangingRssi.toFixed(2)),
+      packetGapMs: gapMs,
       stdDev: entry.profile.getStdDev(),
       stabilityScore: Number.isFinite(stabilityScore) ? stabilityScore : 0.5,
       confidenceScore,
@@ -1448,6 +1493,65 @@ export class BeaconManager {
    * normally the real floor plan's diagonal (plus a small margin). Pass null
    * to disable. See MAX_PLAUSIBLE_DISTANCE_M in DEFAULT_ADAPTIVE_CONFIG.
    */
+  /**
+   * Sets the fallback path-loss model used by any beacon that has NOT been
+   * individually calibrated.
+   *
+   * These two numbers existed in DEFAULT_ADAPTIVE_CONFIG and in the app's
+   * settings store simultaneously, but nothing connected them: the Settings
+   * screen wrote pathLossN into AsyncStorage, the scanner used it only for the
+   * rough estimate shown next to unselected devices in the discovery list, and
+   * the engine that produces every real distance kept its own hardcoded 2.2.
+   * Changing the setting therefore appeared to do nothing. This is the missing
+   * link, called whenever settings load or change.
+   *
+   * @param {number} n - Path-loss exponent (1.2 - 4.5)
+   * @param {number} [txPower1m] - Fallback RSSI at 1 m in dBm (-95 - -35)
+   */
+  setDefaultPathLoss(n, txPower1m = null) {
+    if (Number.isFinite(n)) {
+      this.config.DEFAULT_PATH_LOSS_N = Math.max(1.2, Math.min(4.5, n));
+    }
+    if (Number.isFinite(txPower1m)) {
+      this.config.DEFAULT_TX_POWER_1M = Math.max(-95, Math.min(-35, txPower1m));
+    }
+    return {
+      pathLossN: this.config.DEFAULT_PATH_LOSS_N,
+      txPower1m: this.config.DEFAULT_TX_POWER_1M,
+    };
+  }
+
+  /**
+   * Discards a beacon's shadow envelope so it re-seeds from the next reading.
+   *
+   * The envelope is a peak-hold over many seconds, which is exactly what makes
+   * it work as a fading correction and exactly what makes it WRONG the instant
+   * the phone is somewhere else. After walking from one beacon to the other,
+   * the near beacon's envelope still holds the strong level it saw at 1 m, so
+   * every reading at the new spot looks like a deep fade and gets up to
+   * MAX_ENVELOPE_CORRECTION_DB added to it - which during calibration is
+   * indistinguishable from the beacon genuinely being stronger, and corrupts
+   * the fitted exponent by several dB of lever arm.
+   *
+   * Callers that know the phone has moved somewhere materially different -
+   * ranging calibration between stands - should call this first.
+   */
+  resetShadowEnvelope(beaconId = null) {
+    const clear = (entry) => {
+      entry.shadowEnvelopeDb = null;
+      entry.envelopePeakTime = null;
+      entry.lastEnvelopeUpdate = null;
+    };
+    if (beaconId === null) {
+      for (const entry of this.beacons.values()) clear(entry);
+      return true;
+    }
+    const entry = this.beacons.get(beaconId);
+    if (!entry) return false;
+    clear(entry);
+    return true;
+  }
+
   setMaxPlausibleDistance(maxDistanceM) {
     this.config.MAX_PLAUSIBLE_DISTANCE_M = Number.isFinite(maxDistanceM) ? maxDistanceM : null;
   }
