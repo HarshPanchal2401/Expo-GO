@@ -412,11 +412,13 @@ export const ACCUMULATOR_CONFIG = {
   // Minimum evidence before any commit on the normal path: this many packets
   // AND this much time. Accuracy is set by how many independent looks at the
   // slow shadowing the window contains, which is a matter of TIME, not packet
-  // count - measured in the office (see above), ~3 s gives ~2.1 ft and there
-  // is no way to get that from less. Committing earlier on a small window that
-  // merely looks steady was simulated at more than double the range error.
-  MIN_SAMPLES_TO_COMMIT: 12,
-  MIN_COLLECT_MS: 3000,
+  // count. Simulated against correlated BLE noise, 1.5 s costs ~0.2 ft of
+  // median range error against 3 s (2.5 vs 2.3 ft) while halving the wait,
+  // and the navigation filter keeps refining with every BLE update afterwards.
+  // Below ~1 s the loss grows quickly (a small window that merely looks
+  // steady was simulated at more than double the error), so do not go lower.
+  MIN_SAMPLES_TO_COMMIT: 6,
+  MIN_COLLECT_MS: 1500,
   // Commit once the standard error of BOTH mean ranges is below this AND the
   // ranges are not drifting. The standard error is computed from the
   // EFFECTIVE sample count (see effectiveSampleCount): the distances arriving
@@ -433,17 +435,17 @@ export const ACCUMULATOR_CONFIG = {
   // Fraction trimmed from EACH end before averaging.
   TRIM_FRACTION: 0.2,
   // Normal time limit: commit with what is there if the ranges are steady.
-  MAX_COLLECT_MS: 6000,
+  MAX_COLLECT_MS: 4000,
   // Extended limit while the ranges are still drifting; the commit then uses
   // only the most recent half of the window, which is closest to the truth.
-  MAX_COLLECT_DRIFTING_MS: 10000,
+  MAX_COLLECT_DRIFTING_MS: 8000,
   // Minimum evidence for the timeout path - still better than one packet.
-  MIN_SAMPLES_ON_TIMEOUT: 6,
+  MIN_SAMPLES_ON_TIMEOUT: 3,
   // Absolute deadline. Whatever has been collected by now is committed, as
   // long as it is at least MIN_SAMPLES_AT_DEADLINE. Locating must END: a user
   // left staring at "finding your position" gets nothing, whereas a slightly
   // rougher start is refined by BLE correction as soon as they walk.
-  HARD_DEADLINE_MS: 15000,
+  HARD_DEADLINE_MS: 8000,
   MIN_SAMPLES_AT_DEADLINE: 2,
   // Rolling window cap; older samples are dropped first.
   MAX_SAMPLES: 60,
@@ -612,7 +614,21 @@ export class RangeFixAccumulator {
       v1 = v1.slice(half); v2 = v2.slice(half); vc = vc.slice(half);
     }
     const n = v1.length;
+    // How far the ranges moved across the window. A commit made while they
+    // were still settling is less certain than its standard error says, so
+    // the caller widens the starting uncertainty by this - the navigation
+    // filter then trusts BLE more for the first few updates and pulls a rough
+    // start in quickly, instead of defending it.
+    const halfDrift = (values) => {
+      if (values.length < 4) return 0;
+      const h = Math.floor(values.length / 2);
+      return Math.abs(
+        trimmedMean(values.slice(h), this.cfg.TRIM_FRACTION) -
+        trimmedMean(values.slice(0, h), this.cfg.TRIM_FRACTION)
+      );
+    };
     return {
+      driftFt: Math.max(halfDrift(this._d1), halfDrift(this._d2)),
       d1: trimmedMean(v1, this.cfg.TRIM_FRACTION),
       d2: trimmedMean(v2, this.cfg.TRIM_FRACTION),
       sampleCount: this._d1.length,

@@ -65,7 +65,7 @@ const FLOORPLAN_IMAGE = require("../../assets/floorplans/office-72x72.png");
 // because an OTA update is only APPLIED on the next cold start after it
 // downloads, so "I published the fix and it still fails" is very often the
 // old bundle still running - this makes that visible instead of a guess.
-const ENGINE_TAG = "locate-v5";
+const ENGINE_TAG = "locate-v6";
 
 let ExpoUpdates = null;
 try {
@@ -892,6 +892,8 @@ export default function FusionMapScreen({
   const locateStartRef = useRef({ t: 0, p1: 0, p2: 0 });
   // Re-renders the locating diagnostics once a second.
   const [locateClock, setLocateClock] = useState(0);
+  // When the last fix was committed, for the brief "position found" banner.
+  const [locatedAt, setLocatedAt] = useState(0);
   // Packet counter at the last locating sample, so each packet is used once.
   const lastLocatePacketsRef = useRef(-1);
   // Result of the cold-start solve, surfaced so the map can explain an
@@ -1120,24 +1122,24 @@ export default function FusionMapScreen({
   };
 
   /**
-   * Position fixed. Navigation starts straight away when the heading is already
-   * aligned to the map - there is nothing left for the user to confirm, and the
-   * extra button press was pure waiting. Otherwise stop at "located" so the
-   * heading prompt can be answered first.
-   * @returns true when navigation has started.
+   * Position fixed: stop locating and start navigating, always.
+   *
+   * It used to stop at "located" whenever the heading had never been zeroed,
+   * waiting for a button press - which on screen looked exactly like locating
+   * never finishing. Navigation now starts immediately; if the heading is not
+   * aligned yet, the Zero Heading prompt stays visible while navigating, since
+   * zeroing does not depend on the position and can be done at any time.
+   * @returns true (navigation has started).
    */
   const completeLocating = (fix) => {
     setInitialFix(fix);
     coldStartDoneRef.current = true;
     setLocProgress(null);
-    if (headingCalibratedRef.current) {
-      fusionEngine.beginNavigation();
-      setFusionState({ ...fusionEngine.getState() });
-      setNavPhase("navigating");
-      return true;
-    }
-    setNavPhase("located");
-    return false;
+    fusionEngine.beginNavigation();
+    setFusionState({ ...fusionEngine.getState() });
+    setNavPhase("navigating");
+    setLocatedAt(Date.now());
+    return true;
   };
 
   /** Commits the fix and starts drawing the walked path from it. */
@@ -1455,7 +1457,7 @@ export default function FusionMapScreen({
           direction the floor plan's "up" points in, a walk north on the map can
           come out pointing anywhere. This is asked once and then remembered,
           since it is a property of the building, not of the session. */}
-      {navPhase === "located" && !headingCalibrated && (
+      {(navPhase === "located" || navPhase === "navigating") && !headingCalibrated && (
         <View style={[styles.statusBanner, styles.fixBannerWarn]}>
           <Text style={styles.statusBannerText}>
             🧭 Set your forward direction before walking. Stand facing the way the map's
@@ -1465,6 +1467,15 @@ export default function FusionMapScreen({
           <TouchableOpacity style={styles.headingFixBtn} onPress={handleZeroHeading}>
             <Text style={styles.headingFixBtnText}>🎯 I'm facing map-up — Zero Heading</Text>
           </TouchableOpacity>
+        </View>
+      )}
+
+      {navPhase === "navigating" && locatedAt > 0 && (locateClock || Date.now()) - locatedAt < 5000 && (
+        <View style={[styles.statusBanner, styles.fixBannerReady]}>
+          <Text style={styles.statusBannerText}>
+            ✓ Position found in {initialFix?.sampleCount ? `${initialFix.sampleCount} readings` : "a few seconds"}
+            {initialFix?.uncertaintyFt ? ` (± ${initialFix.uncertaintyFt.toFixed(1)} ft)` : ""} — navigating. Start walking.
+          </Text>
         </View>
       )}
 

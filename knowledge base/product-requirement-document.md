@@ -5,7 +5,7 @@
 | **Product** | Indoor Nav (Expo app "PDR Test", `com.harsh553.pdrtest`) |
 | **Status** | Working prototype. It tracks on a real office floor plan and is being tuned for accuracy |
 | **Platforms** | Android (main), iOS |
-| **Last updated** | 2026-09-29 (engine tag `locate-v5`) |
+| **Last updated** | 2026-09-30 (engine tag `locate-v6`) |
 
 ---
 
@@ -47,12 +47,12 @@ GPS doesn't work indoors, so a phone can't show where a person is inside an offi
 | ID | Requirement | Status |
 |---|---|---|
 | L-1 | Find the starting position from both beacons while the user stands still | ✅ Done |
-| L-2 | **Always finish**: normally about 3 s, and never more than 15 s | ✅ Done (to be confirmed in the field) |
-| L-3 | Don't reduce accuracy to go faster: at least 3 s of evidence, drift detection, honest uncertainty | ✅ Done |
+| L-2 | **Always finish**: normally about 1.5–4 s, and never more than 8 s | ✅ Done (to be confirmed in the field) |
+| L-3 | Keep accuracy while going faster: at least 1.5 s of evidence, drift detection, honest uncertainty that is refined while navigating | ✅ Done |
 | L-4 | Show why locating is waiting (packets per beacon, time since last packet, which build is running) | ✅ Done |
 | L-5 | When two positions are possible, show both and ask the user to walk across the beacon line | ✅ Done |
 | L-6 | Warn when ranges are geometrically impossible (a calibration fault) | ✅ Done |
-| L-7 | Start navigation automatically once the position is found (if the heading is zeroed) | ✅ Done |
+| L-7 | Start navigation automatically once the position is found, always. Zero Heading doesn't block it | ✅ Done |
 
 ### 4.3 Navigation
 | ID | Requirement | Status |
@@ -82,8 +82,8 @@ GPS doesn't work indoors, so a phone can't show where a person is inside an offi
 
 | Metric | Target | Current evidence |
 |---|---|---|
-| Time to first fix (standing, both beacons audible) | median ≤ 4 s, always ≤ 15 s | Simulation: median 3.1 s. Hard limit 15 s. **Field test pending** |
-| Initial range error | ≤ 2.5 ft median per range | Simulation: 2.2 ft. Office measurement: 2.1 ft at 3 s |
+| Time to first fix (standing, both beacons audible) | median ≤ 2 s, always ≤ 8 s | Simulation: median 1.5 s (good beacons), 6–7 s (one weak beacon). Hard limit 8 s. **Field test pending** |
+| Initial range error | ≤ 2.5 ft median per range | Simulation: 2.4–2.6 ft at 1.5 s. Office measurement: 2.1 ft at 3 s |
 | Position error while walking | to be defined after a field test | **Not yet measured**: needs a walk along a known route |
 | Heading error during a turn or interference | ≤ 20° worst case | Simulation: 18° worst (the old filter was 30°+ for 10 s) |
 | Heading stuck | never more than 20° off for more than 2 s | Simulation: 0 s (the old filter was 10 s) |
@@ -105,7 +105,7 @@ GPS doesn't work indoors, so a phone can't show where a person is inside an offi
 | Risk | Impact | Mitigation |
 |---|---|---|
 | Uncalibrated or wrongly configured beacon Tx | All distances wrong by a constant factor | Use advertised Tx, show calibration status, two-stand calibration |
-| A beacon heard only rarely | Slow or failed locating | 10 s freshness window, 15 s deadline, per-beacon diagnostics |
+| A beacon heard only rarely | Slow or failed locating | 10 s freshness window, 8 s deadline, per-beacon diagnostics |
 | Magnetic interference | Heading drift, curved paths | Gyro-driven filter with a field-strength check |
 | Walking parallel to the beacon line | The mirror position is never resolved | UI tells the user to cross the line; no forced guess |
 | Two app-shell files drift apart | Android and iOS behave differently | Planned: move shared logic into one module |

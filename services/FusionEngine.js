@@ -395,7 +395,7 @@ export class FusionEngine {
     const c = this._accumulator.consolidate();
     const fix = this.initializeFromBeacons({
       d1: c.d1, d2: c.d2, conf1: c.conf, conf2: c.conf,
-      measuredRangeSigmaFt: Math.max(c.sigma1Ft ?? 0, c.sigma2Ft ?? 0),
+      measuredRangeSigmaFt: Math.max(c.sigma1Ft ?? 0, c.sigma2Ft ?? 0, c.driftFt ?? 0),
       sampleCount: c.sampleCount,
       averaged: true,
     });
@@ -439,7 +439,7 @@ export class FusionEngine {
     const c = this._accumulator.consolidate();
     const fix = this.initializeFromBeacons({
       d1: c.d1, d2: c.d2, conf1: c.conf, conf2: c.conf,
-      measuredRangeSigmaFt: Math.max(c.sigma1Ft ?? 0, c.sigma2Ft ?? 0),
+      measuredRangeSigmaFt: Math.max(c.sigma1Ft ?? 0, c.sigma2Ft ?? 0, c.driftFt ?? 0),
       sampleCount: c.sampleCount,
       averaged: true,
     });

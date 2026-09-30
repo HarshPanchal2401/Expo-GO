@@ -106,7 +106,7 @@ Accelerometer (30 ms) ─▶ step state machine (App.*.js)
              headingFilter.takeStepHeading() ─▶ heading (°)
                              │
                  addStep(): PDR-tab position, path, counters
-                             ├─▶ v2Scanner.notifyStep()          (BLE engine learns "walking")
+                             ├─▶ v2Scanner.notifyStep()   (BLE engine learns "walking")
                              └─▶ pdrStepCallbackRef.current(...) (only while the Fusion Map is open)
                                         │ metresToFeet
                                         ▼
@@ -141,7 +141,7 @@ idle ──Find My Position──▶ locating ──fix committed──▶ navig
                              │   └── Re-locate ─────────────┤
                              └──fix, heading not zeroed──▶ located ──Zero Heading / Start──┘
 ```
-- **locating** collects ranges while you stand still. It ends early if you start walking, and always ends by a 15 s deadline that a 1 Hz timer checks.
+- **locating** collects ranges while you stand still. It ends early if you start walking, and always ends by an 8 s deadline that a 1 Hz timer checks. Once a fix is committed it always moves straight to **navigating**; the old `located` waiting state is no longer entered.
 - **navigating** turns on PDR prediction, BLE correction and the trail.
 
 ---

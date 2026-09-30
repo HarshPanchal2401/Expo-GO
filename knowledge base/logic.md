@@ -1,6 +1,6 @@
 # Logic & Algorithms
 
-The maths and decision rules behind positioning, and the constants each one uses as of engine tag `locate-v5`. Values are quoted from the source. If you change one, update it here too.
+The maths and decision rules behind positioning, and the constants each one uses as of engine tag `locate-v6`. Values are quoted from the source. If you change one, update it here too.
 
 > Replaces `02_core_logic_algorithms_and_math.md`, which describes an earlier engine.
 
@@ -118,15 +118,16 @@ One sample per **new** packet, and only while both beacons were heard within the
 
 | Rule | Value |
 |---|---|
-| Normal commit | at least 12 samples **and** at least 3 s **and** not drifting **and** honest SEM ≤ 1.0 ft for both ranges |
+| Normal commit | at least 6 samples **and** at least 1.5 s **and** not drifting **and** honest SEM ≤ 1.0 ft for both ranges |
 | Honest SEM | `s / √n_eff`, with `n_eff = n(1−ρ)/(1+ρ)`, where ρ is the lag-1 autocorrelation (range 0–0.95) |
 | Drift test | the halves of the window differ by more than max(2.5 ft, 2·SEM) |
-| Timeouts | 6 s when steady, or 10 s while drifting (then only the newest half is used), with at least 6 samples |
-| Hard deadline | **15 s**, with at least 2 samples. Checked every second, even when no samples arrive |
+| Timeouts | 4 s when steady, or 8 s while drifting (then only the newest half is used), with at least 3 samples |
+| Hard deadline | **8 s**, with at least 2 samples. Checked every second, even when no samples arrive |
+| Starting uncertainty | from max(SEM, drift across the window), so a rough start is corrected quickly by BLE once navigating |
 | Walking starts | commit immediately if at least 4 samples |
 | Estimate | 20% trimmed mean of each range, then §5.1 |
 
-Measured in the office: 3 s of packets gives about 2.1 ft of range error, and 8 s gives about 1.1 ft. Accuracy is limited by **time** (slow shadowing), not packet count.
+Measured in the office: 3 s of packets gives about 2.1 ft of range error, and 8 s gives about 1.1 ft. Accuracy is limited by **time** (slow shadowing), not packet count. In simulation, 1.5 s costs about 0.2 ft of median range error compared with 3 s. Going below about 1 s costs much more.
 
 ## 6. Fusion EKF (`FusionEngine.js`)
 
@@ -165,8 +166,8 @@ K  = P Hᵀ / (H P Hᵀ + R) ;   x += K·(t − H·x) ;   P = (I − K H) P
 1. **Find My Position** → `beginLocating()`, and the per-beacon diagnostics start.
 2. Samples go into §5.2. Once there are 4 or more, a provisional dot is shown but not used for tracking.
 3. Fix committed:
-   - If the heading is zeroed → `beginNavigation()` right away.
-   - Otherwise it waits at **located** until Zero Heading is tapped.
+   - `beginNavigation()` **always** runs right away, and a "✓ Position found" banner shows for 5 s.
+   - If the heading has never been zeroed, the Zero Heading prompt stays visible while navigating. It no longer blocks navigation.
 4. **Navigating:** steps call `predict`, BLE calls `correct`, and the trail is drawn.
 5. **Save Path** stores the trail in feet (`source: "fusionMap"`), and the route stays drawn on the map.
 
