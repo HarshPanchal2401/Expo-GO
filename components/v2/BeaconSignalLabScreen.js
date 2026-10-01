@@ -37,6 +37,10 @@ const FT_PER_M = 3.28084;
 
 const { width: SCREEN_WIDTH } = Dimensions.get("window");
 
+// Packets ignored at the start of a 1 m calibration, while the filters settle
+// after the user has walked up to the beacon.
+const CALIB_1M_SETTLE_MS = 3000;
+
 export default function BeaconSignalLabScreen() {
   const [isScanning, setIsScanning] = useState(false);
   const [stats, setStats] = useState(v2Scanner.getStats());
@@ -130,10 +134,24 @@ export default function BeaconSignalLabScreen() {
   useEffect(() => {
     if (!isSampling1m) return;
 
+    // The first seconds after pressing Start are discarded: the user has just
+    // walked up to the beacon, so its filters are still catching up from
+    // further away and every early sample would pull the result low.
+    const startedAt = Date.now();
     const unsubPacket = v2Scanner.subscribePackets((pkt) => {
       if (pkt.beaconNum === calib1mTarget) {
+        if (Date.now() - startedAt < CALIB_1M_SETTLE_MS) return;
+        // The level the distance formula inverts. This used to be raw RSSI, so
+        // the 1 m reference sat a few dB away from what ranging compares it
+        // with, and every distance from that beacon was scaled by that offset.
+        const level = Number.isFinite(pkt.rangingRssi)
+          ? pkt.rangingRssi
+          : Number.isFinite(pkt.filteredRssi)
+          ? pkt.filteredRssi
+          : pkt.rawRssi;
+        if (!Number.isFinite(level)) return;
         setSamples1m((prev) => {
-          const next = [...prev, pkt.rawRssi];
+          const next = [...prev, level];
           if (next.length >= targetSampleCount) {
             // Sampling target reached! Calculate statistics
             setIsSampling1m(false);
@@ -499,7 +517,17 @@ export default function BeaconSignalLabScreen() {
     const res = v2Scanner.logCalibrationPoint(calibTarget, num);
     if (!res.success) {
       Alert.alert("Calibration Error", res.error);
+      return;
     }
+    Alert.alert(
+      res.unsteady ? `Logged ${num} m, but the signal was unsteady` : `Logged ${num} m`,
+      `Beacon ${calibTarget}: ${res.level} dBm (average of ${res.samples} readings, ± ${res.sigmaDb} dB).` +
+        (res.unsteady
+          ? "\n\nSomething moved between you and the beacon. Consider deleting this point and logging it again."
+          : "") +
+        `\n\nPoints so far: ${res.count}. For long range accuracy log several distances, including ` +
+        `at least three beyond 6 m, then tap Fit.`
+    );
   };
 
   const handleFitModel = () => {
@@ -1878,7 +1906,9 @@ export default function BeaconSignalLabScreen() {
               <Text style={styles.calibTitle}>Multi-Distance OLS Regression Studio</Text>
             </View>
             <Text style={styles.calibSub}>
-              Fits environment path-loss exponent n & TxPower across multiple distances (1m, 2m, 3m, 5m)
+              Fits this beacon's own decay (n) and 1 m level from several measured distances. Stand still at each
+              distance for ~6 s (phone at chest height, facing the beacon), then tap it. Each point is the AVERAGE of
+              those seconds, on the same signal level the distance formula uses.
             </Text>
           </View>
         </View>
@@ -1929,7 +1959,9 @@ export default function BeaconSignalLabScreen() {
             </View>
           ) : (
             <Text style={styles.calibUnfittedText}>
-              Using default model (n = 2.20, Tx = -59 dBm). Record points at known distances to fit.
+              Not calibrated: using {(calibTarget === 1 ? b1 : b2)?.txSource === "advertised" ? "the beacon's own" : "the default"} 1 m level
+              ({(calibTarget === 1 ? b1 : b2)?.txPower1m ?? -59} dBm) and n = {(calibTarget === 1 ? b1 : b2)?.currentN ?? 2.9}.
+              Record points at known distances to fit this beacon.
             </Text>
           )}
         </View>
@@ -1956,9 +1988,9 @@ export default function BeaconSignalLabScreen() {
         </View>
 
         {/* Quick Distance Logging Buttons */}
-        <Text style={styles.calibActionLabel}>1. Log Current Filtered RSSI at Known Distance:</Text>
+        <Text style={styles.calibActionLabel}>1. Stand ~6 s at a measured distance, then tap it:</Text>
         <View style={styles.quickDistRow}>
-          {[1.0, 2.0, 3.0, 5.0, 10.0].map((d) => (
+          {[1.0, 2.0, 3.0, 5.0, 8.0, 10.0, 12.0, 15.0].map((d) => (
             <Pressable
               key={`quick-${d}`}
               style={styles.quickDistBtn}

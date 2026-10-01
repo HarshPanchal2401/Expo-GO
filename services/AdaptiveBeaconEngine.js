@@ -623,6 +623,24 @@ export class PathLossCalibrator {
     this.hasFarSegment = false;
     this.fittedNFar = null;
     this.rssiAtBreakpoint = null; // RSSI predicted by the near segment at the breakpoint
+
+    // Set when the active model was learned by BeaconAutoCalibration rather
+    // than measured by hand, and from how many walks.
+    this.autoCalibrated = false;
+    this.autoWindows = 0;
+  }
+
+  /** Installs a model learned automatically from walking. */
+  applyAutoModel(txPower1m, n, windows = 0) {
+    this.fittedTxPower1m = Number(Number(txPower1m).toFixed(1));
+    this.fittedN = Number(Number(n).toFixed(2));
+    this.hasFarSegment = false;
+    this.fittedNFar = null;
+    this.rssiAtBreakpoint = null;
+    this.isCalibrated = true;
+    this.autoCalibrated = true;
+    this.autoWindows = windows;
+    this.saveToStorage();
   }
 
   /**
@@ -650,6 +668,8 @@ export class PathLossCalibrator {
     this.referencePoints = [];
     this.rSquared = null;
     this.isCalibrated = false;
+    this.autoCalibrated = false;
+    this.autoWindows = 0;
     this.hasFarSegment = false;
     this.fittedNFar = null;
     this.rssiAtBreakpoint = null;
@@ -687,6 +707,7 @@ export class PathLossCalibrator {
     const val = Number(Number(txPower1m).toFixed(1));
     this.fittedTxPower1m = val;
     this.isCalibrated = true;
+    this.autoCalibrated = false;
     const idx = this.referencePoints.findIndex((p) => Math.abs(p.distanceM - 1.0) < 0.1);
     if (idx >= 0) {
       this.referencePoints[idx] = { distanceM: 1.0, rssi: val, timestamp: Date.now() };
@@ -785,6 +806,7 @@ export class PathLossCalibrator {
 
     this.rSquared = Number(r2.toFixed(3));
     this.isCalibrated = true;
+    this.autoCalibrated = false;
 
     return {
       n: this.fittedN,
@@ -849,6 +871,8 @@ export class PathLossCalibrator {
         hasFarSegment: this.hasFarSegment,
         fittedNFar: this.fittedNFar,
         rssiAtBreakpoint: this.rssiAtBreakpoint,
+        autoCalibrated: this.autoCalibrated,
+        autoWindows: this.autoWindows,
       };
       await AsyncStorage.setItem(`@v2_beacon_calib_${this.beaconId}`, JSON.stringify(data));
     } catch (e) {
@@ -870,6 +894,8 @@ export class PathLossCalibrator {
         this.hasFarSegment = parsed.hasFarSegment || false;
         this.fittedNFar = parsed.fittedNFar ?? null;
         this.rssiAtBreakpoint = parsed.rssiAtBreakpoint ?? null;
+        this.autoCalibrated = Boolean(parsed.autoCalibrated);
+        this.autoWindows = parsed.autoWindows || 0;
       }
     } catch (e) {
       console.warn("[PathLossCalibrator] Load error:", e);

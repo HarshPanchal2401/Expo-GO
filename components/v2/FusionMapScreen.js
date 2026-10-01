@@ -65,7 +65,7 @@ const FLOORPLAN_IMAGE = require("../../assets/floorplans/office-72x72.png");
 // because an OTA update is only APPLIED on the next cold start after it
 // downloads, so "I published the fix and it still fails" is very often the
 // old bundle still running - this makes that visible instead of a guess.
-const ENGINE_TAG = "locate-v6";
+const ENGINE_TAG = "locate-v7";
 
 let ExpoUpdates = null;
 try {
@@ -309,6 +309,11 @@ function OfficeMapCanvas({
   onGestureActive,
   navPhase = "idle",
   savedRoutesOnMap = [],
+  // Tap-to-choose: when on, a tap (not a drag) on the plan reports the tapped
+  // floor-plan point in feet through onMapTap.
+  pickMode = false,
+  onMapTap,
+  pendingPoint = null,
 }) {
   const {
     x, y, uncertaintyRadius, trail,
@@ -381,7 +386,38 @@ function OfficeMapCanvas({
   scaleRef.current = effectiveScale;
   const placementRef = useRef(placementMode);
   placementRef.current = placementMode;
-  const gestureRef = useRef({ startView: null, startDist: 0, pinching: false });
+  const gestureRef = useRef({ startView: null, startDist: 0, pinching: false, sawPinch: false });
+  const pickRef = useRef(pickMode);
+  pickRef.current = pickMode;
+  const onMapTapRef = useRef(onMapTap);
+  onMapTapRef.current = onMapTap;
+  const wrapperRef = useRef(null);
+  const tapGeomRef = useRef(null); // { viewTransform, transform, roomW, roomH }
+  // Must come AFTER the useRef above. Assigning it earlier crashed the whole
+  // Fusion Map ("Cannot set property 'current' of undefined"): Metro compiles
+  // const to var, so the ref was still undefined at that point.
+  tapGeomRef.current = { viewTransform, transform: baseTransform, roomW, roomH };
+
+  // Screen tap -> floor-plan feet. Inverts exactly what rendering does: the
+  // wrapper's position on the page (and its 1 px border), then the zoom/pan
+  // group transform, then worldToScreen.
+  const reportTap = (pageX, pageY) => {
+    const node = wrapperRef.current;
+    if (!node || typeof node.measure !== "function") return;
+    node.measure((_fx, _fy, _w, _h, px, py) => {
+      const g = tapGeomRef.current;
+      if (!g || !Number.isFinite(px) || !Number.isFinite(py)) return;
+      const lx = pageX - px - 1;
+      const ly = pageY - py - 1;
+      const bx = (lx - g.viewTransform.tx) / g.viewTransform.z;
+      const by = (ly - g.viewTransform.ty) / g.viewTransform.z;
+      const wx = (bx - MAP_PADDING - g.transform.offsetX) / g.transform.scale;
+      const wy = g.roomH - (by - MAP_PADDING - g.transform.offsetY) / g.transform.scale;
+      const margin = 3; // allow a slightly-off tap at the wall
+      if (wx < -margin || wx > g.roomW + margin || wy < -margin || wy > g.roomH + margin) return;
+      onMapTapRef.current?.(clamp(wx, 0, g.roomW), clamp(wy, 0, g.roomH));
+    });
+  };
 
   const touchDistance = (touches) =>
     Math.hypot(touches[0].pageX - touches[1].pageX, touches[0].pageY - touches[1].pageY);
@@ -393,7 +429,12 @@ function OfficeMapCanvas({
         // swallowed before it reached the zoom buttons sitting on top of the
         // map, so those buttons simply did nothing. The map only takes over
         // once the finger actually moves, which leaves taps to the buttons.
-        onStartShouldSetPanResponder: () => false,
+        //
+        // The exception is pick mode, where a TAP is the input: the map claims
+        // the touch on press so it can tell a tap from a drag on release. The
+        // zoom buttons still work, because they are deeper in the tree and the
+        // deepest view is asked first.
+        onStartShouldSetPanResponder: () => pickRef.current,
         onStartShouldSetPanResponderCapture: () => false,
         onMoveShouldSetPanResponder: (evt, g) => {
           if (placementRef.current) return false; // markers own the drag there
@@ -409,6 +450,7 @@ function OfficeMapCanvas({
           gestureRef.current.startView = { ...viewRef.current };
           const t = evt.nativeEvent.touches || [];
           gestureRef.current.pinching = t.length === 2;
+          gestureRef.current.sawPinch = t.length === 2;
           gestureRef.current.startDist = t.length === 2 ? touchDistance(t) : 0;
         },
         onPanResponderMove: (evt, g) => {
@@ -421,6 +463,7 @@ function OfficeMapCanvas({
             // reference separation the first time two fingers are seen.
             if (!gestureRef.current.pinching) {
               gestureRef.current.pinching = true;
+              gestureRef.current.sawPinch = true;
               gestureRef.current.startDist = touchDistance(t);
               gestureRef.current.startView = { ...viewRef.current };
               return;
@@ -449,9 +492,15 @@ function OfficeMapCanvas({
             cy: clamp(startCy + g.dy / sc, 0, roomH),
           });
         },
-        onPanResponderRelease: () => {
+        onPanResponderRelease: (_evt, g) => {
+          const wasPinch = gestureRef.current.sawPinch;
           gestureRef.current.pinching = false;
+          gestureRef.current.sawPinch = false;
           onGestureActive?.(false);
+          // A finger that barely moved is a tap, anything more was a pan.
+          if (pickRef.current && !wasPinch && Math.abs(g.dx) < 8 && Math.abs(g.dy) < 8) {
+            reportTap(g.x0, g.y0);
+          }
         },
         onPanResponderTerminate: () => {
           gestureRef.current.pinching = false;
@@ -548,7 +597,7 @@ function OfficeMapCanvas({
   }, [roomW, transform.scale, transform.offsetX, transform.offsetY, inv]);
 
   return (
-    <View style={styles.mapCanvasWrapper} {...mapPanResponder.panHandlers}>
+    <View ref={wrapperRef} collapsable={false} style={styles.mapCanvasWrapper} {...mapPanResponder.panHandlers}>
       <Svg width={MAP_SIZE} height={canvasHeight + MAP_PADDING * 2}>
         <Defs>
           <RadialGradient id="haloGrad" cx="50%" cy="50%" r="50%">
@@ -706,6 +755,22 @@ function OfficeMapCanvas({
             })()}
           </>
         )}
+        {/* ── Start point the user tapped (not yet confirmed) ── */}
+        {pendingPoint && (() => {
+          const p = toScreen(pendingPoint.x, pendingPoint.y);
+          const r = 11 * inv;
+          return (
+            <G>
+              <Circle cx={p.cx} cy={p.cy} r={r * 1.9} fill={C.accent} fillOpacity={0.15} />
+              <Circle cx={p.cx} cy={p.cy} r={r} fill="none" stroke={C.accent} strokeWidth={2.5 * inv} />
+              <Line x1={p.cx - r * 1.6} y1={p.cy} x2={p.cx + r * 1.6} y2={p.cy} stroke={C.accent} strokeWidth={1.5 * inv} />
+              <Line x1={p.cx} y1={p.cy - r * 1.6} x2={p.cx} y2={p.cy + r * 1.6} stroke={C.accent} strokeWidth={1.5 * inv} />
+              <SvgText x={p.cx} y={p.cy - r * 2.2} textAnchor="middle" fontSize={10 * inv} fill={C.accent} fontWeight="bold">
+                START
+              </SvgText>
+            </G>
+          );
+        })()}
         </G>
       </Svg>
 
@@ -796,6 +861,14 @@ export default function FusionMapScreen({
   const [navPhase, setNavPhase] = useState("idle");
   // Viewport: which world point is centred, and at what magnification.
   // null centre = "fit the whole floor plan", the default.
+  // Room size comes first: the view animation below lists roomW/roomH as
+  // dependencies, and reading them before this declaration gave it
+  // [undefined, undefined], so it never saw a changed room size.
+  const [roomWidthStr, setRoomWidthStr] = useState(String(DEFAULT_ROOM_W_FT));
+  const [roomHeightStr, setRoomHeightStr] = useState(String(DEFAULT_ROOM_H_FT));
+  const roomW = parseFloatSafe(roomWidthStr, DEFAULT_ROOM_W_FT);
+  const roomH = parseFloatSafe(roomHeightStr, DEFAULT_ROOM_H_FT);
+
   const [view, setView] = useState({ zoom: 1, cx: null, cy: null });
   // Page scrolling is suspended while the map is being dragged or pinched.
   const [mapGestureActive, setMapGestureActive] = useState(false);
@@ -857,10 +930,6 @@ export default function FusionMapScreen({
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [configLoaded, setConfigLoaded] = useState(false);
 
-  const [roomWidthStr, setRoomWidthStr] = useState(String(DEFAULT_ROOM_W_FT));
-  const [roomHeightStr, setRoomHeightStr] = useState(String(DEFAULT_ROOM_H_FT));
-  const roomW = parseFloatSafe(roomWidthStr, DEFAULT_ROOM_W_FT);
-  const roomH = parseFloatSafe(roomHeightStr, DEFAULT_ROOM_H_FT);
 
   const [anchor1, setAnchor1] = useState({ x: 6, y: 6 });
   const [anchor2, setAnchor2] = useState({ x: 66, y: 6 });
@@ -894,6 +963,8 @@ export default function FusionMapScreen({
   const [locateClock, setLocateClock] = useState(0);
   // When the last fix was committed, for the brief "position found" banner.
   const [locatedAt, setLocatedAt] = useState(0);
+  // Start point tapped on the map in "picking", awaiting Start Here.
+  const [pendingStart, setPendingStart] = useState(null);
   // Packet counter at the last locating sample, so each packet is used once.
   const lastLocatePacketsRef = useRef(-1);
   // Result of the cold-start solve, surfaced so the map can explain an
@@ -956,6 +1027,10 @@ export default function FusionMapScreen({
       setBleStats({ b1: stats.b1, b2: stats.b2 });
 
       if (!isRunning || placementMode) return;
+      // Choosing on the map: the user is deciding the start, so BLE must not.
+      // Without this the "first reading places the user" path below would
+      // overwrite the choice with a single-packet guess.
+      if (navPhase === "picking") return;
 
       const d1Ft = Number.isFinite(stats.b1?.distanceM) ? metresToFeet(stats.b1.distanceM) : null;
       const d2Ft = Number.isFinite(stats.b2?.distanceM) ? metresToFeet(stats.b2.distanceM) : null;
@@ -1213,7 +1288,45 @@ export default function FusionMapScreen({
     catch (err) { console.warn("[FusionMap] delete failed:", err); }
   };
 
+  /** Manual start: the user taps where they are, then confirms. */
+  const handleStartPicking = () => {
+    fusionEngine.cancelLocating();
+    setLocProgress(null);
+    setPendingStart(null);
+    setNavPhase("picking");
+  };
+
+  const handleMapTap = (xFt, yFt) => {
+    if (navPhase === "locating") {
+      // Tapping while beacons are still deciding means "I know where I am".
+      fusionEngine.cancelLocating();
+      setLocProgress(null);
+      setNavPhase("picking");
+      setPendingStart({ x: xFt, y: yFt });
+      return;
+    }
+    if (navPhase === "picking") {
+      setPendingStart({ x: xFt, y: yFt });
+      return;
+    }
+    if (navPhase === "navigating" && fusionState.positionAmbiguous) {
+      if (fusionEngine.chooseHypothesisNear(xFt, yFt)) {
+        setFusionState({ ...fusionEngine.getState() });
+      }
+    }
+  };
+
+  const handleStartHere = () => {
+    if (!pendingStart) return;
+    fusionEngine.setRoomSize(roomW, roomH);
+    fusionEngine.setBleAnchors(anchor1, anchor2);
+    const fix = fusionEngine.setManualPosition(pendingStart.x, pendingStart.y);
+    setPendingStart(null);
+    completeLocating(fix);
+  };
+
   const handleStop = () => {
+    setPendingStart(null);
     fusionEngine.cancelLocating();
     setNavPhase("idle");
     setLocProgress(null);
@@ -1425,6 +1538,16 @@ export default function FusionMapScreen({
           Standing still for a few seconds is what buys the accurate fix, so the
           reason for the wait is stated plainly and the progress is visible —
           otherwise it just looks like the app is slow to respond. */}
+      {navPhase === "picking" && (
+        <View style={[styles.statusBanner, styles.fixBannerWaiting]}>
+          <Text style={styles.statusBannerText}>
+            {pendingStart
+              ? `📍 Start at (${pendingStart.x.toFixed(1)}, ${pendingStart.y.toFixed(1)}) ft. Tap again to move it, or press Start Here.`
+              : "👆 Tap the spot on the map where you are standing. Zoom in with + for a precise spot."}
+          </Text>
+        </View>
+      )}
+
       {navPhase === "locating" && (
         <View style={[styles.statusBanner, styles.fixBannerWaiting]}>
           <Text style={styles.statusBannerText}>
@@ -1432,6 +1555,9 @@ export default function FusionMapScreen({
             {locProgress?.samples
               ? `${locProgress.samples} readings collected`
               : "waiting for both beacons"}
+          </Text>
+          <Text style={[styles.locateDiag, { color: C.textPrimary }]}>
+            Taking too long? Tap where you are on the map to start there.
           </Text>
           <Text style={styles.locateDiag}>{describeRunningBundle()}</Text>
           {locateDiagnostics.map((line) => (
@@ -1473,8 +1599,9 @@ export default function FusionMapScreen({
       {navPhase === "navigating" && locatedAt > 0 && (locateClock || Date.now()) - locatedAt < 5000 && (
         <View style={[styles.statusBanner, styles.fixBannerReady]}>
           <Text style={styles.statusBannerText}>
-            ✓ Position found in {initialFix?.sampleCount ? `${initialFix.sampleCount} readings` : "a few seconds"}
-            {initialFix?.uncertaintyFt ? ` (± ${initialFix.uncertaintyFt.toFixed(1)} ft)` : ""} — navigating. Start walking.
+            {initialFix?.status === "manual"
+              ? "✓ Start set on the map — navigating. Start walking; beacons will fine-tune it."
+              : `✓ Position found in ${initialFix?.sampleCount ? `${initialFix.sampleCount} readings` : "a few seconds"}${initialFix?.uncertaintyFt ? ` (± ${initialFix.uncertaintyFt.toFixed(1)} ft)` : ""} — navigating. Start walking.`}
           </Text>
         </View>
       )}
@@ -1501,7 +1628,7 @@ export default function FusionMapScreen({
             <View style={[styles.statusBanner, styles.fixBannerAmbiguous]}>
               <Text style={styles.statusBannerText}>
                 ◉ Two possible positions — you are at one of the two marks.
-                {" "}Walk a few steps ACROSS the line between the beacons to settle it
+                {" "}Tap the mark where you are, or walk a few steps ACROSS the line between the beacons to settle it
                 {st.ambiguityStale ? " (walking along that line cannot resolve it)." : "."}
               </Text>
             </View>
@@ -1584,6 +1711,13 @@ export default function FusionMapScreen({
         onAnimateView={animateView}
         onGestureActive={setMapGestureActive}
         navPhase={navPhase}
+        pickMode={
+          navPhase === "picking" ||
+          navPhase === "locating" ||
+          (navPhase === "navigating" && fusionState.positionAmbiguous)
+        }
+        onMapTap={handleMapTap}
+        pendingPoint={navPhase === "picking" ? pendingStart : null}
         savedRoutesOnMap={savedRoutes
           .filter((r) => shownRouteIds.has(r.id) && isFusionMapRoute(r))
           .map((r) => ({ id: r.id, points: r.points, color: routeColor(r.id) }))}
@@ -1613,9 +1747,28 @@ export default function FusionMapScreen({
               </>
             )}
             {navPhase === "locating" && (
-              <TouchableOpacity style={[styles.stopBtn, { flex: 1 }]} onPress={handleStop}>
-                <Text style={styles.primaryBtnText}>✕ Cancel</Text>
-              </TouchableOpacity>
+              <>
+                <TouchableOpacity style={[styles.stopBtn, { flex: 1, marginRight: 10 }]} onPress={handleStop}>
+                  <Text style={styles.primaryBtnText}>✕ Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={[styles.secondaryBtn, { flex: 1.3 }]} onPress={handleStartPicking}>
+                  <Text style={styles.secondaryBtnText}>👆 Choose on Map</Text>
+                </TouchableOpacity>
+              </>
+            )}
+            {navPhase === "picking" && (
+              <>
+                <TouchableOpacity style={[styles.secondaryBtn, { flex: 1, marginRight: 10 }]} onPress={handleStop}>
+                  <Text style={styles.secondaryBtnText}>✕ Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.primaryBtn, { flex: 1.4 }, !pendingStart && { opacity: 0.45 }]}
+                  disabled={!pendingStart}
+                  onPress={handleStartHere}
+                >
+                  <Text style={styles.primaryBtnText}>▶ Start Here</Text>
+                </TouchableOpacity>
+              </>
             )}
             {navPhase === "located" && (
               <>
@@ -1640,6 +1793,12 @@ export default function FusionMapScreen({
           </>
         )}
       </View>
+      {!placementMode && navPhase === "idle" && (
+        <TouchableOpacity style={[styles.secondaryBtn, { marginBottom: 12 }]} onPress={handleStartPicking}>
+          <Text style={styles.secondaryBtnText}>👆 Set My Start on the Map</Text>
+        </TouchableOpacity>
+      )}
+
       {/* "Reset to Center" is gone deliberately: the room centre was never a
           real position, only a placeholder to stop the dot sitting somewhere
           stale. Re-locate does the thing that was actually wanted — measure

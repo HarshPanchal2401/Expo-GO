@@ -1,6 +1,6 @@
 # Logic & Algorithms
 
-The maths and decision rules behind positioning, and the constants each one uses as of engine tag `locate-v6`. Values are quoted from the source. If you change one, update it here too.
+The maths and decision rules behind positioning, and the constants each one uses as of engine tag `locate-v7`. Values are quoted from the source. If you change one, update it here too.
 
 > Replaces `02_core_logic_algorithms_and_math.md`, which describes an earlier engine.
 
@@ -169,7 +169,11 @@ K  = P Hᵀ / (H P Hᵀ + R) ;   x += K·(t − H·x) ;   P = (I − K H) P
    - `beginNavigation()` **always** runs right away, and a "✓ Position found" banner shows for 5 s.
    - If the heading has never been zeroed, the Zero Heading prompt stays visible while navigating. It no longer blocks navigation.
 4. **Navigating:** steps call `predict`, BLE calls `correct`, and the trail is drawn.
-5. **Save Path** stores the trail in feet (`source: "fusionMap"`), and the route stays drawn on the map.
+5. **Manual start** ("👆 Set My Start on the Map", or a tap on the map while locating):
+   - Tap where you are, then **Start Here**. `setManualPosition(x, y)` cancels locating, clamps the point into the room and seeds ±3 ft of uncertainty, so BLE still fine-tunes it.
+   - BLE auto-placement is suspended while you choose.
+   - While two candidates are shown, tapping near one settles it (`chooseHypothesisNear`).
+6. **Save Path** stores the trail in feet (`source: "fusionMap"`), and the route stays drawn on the map.
 
 ## 8. Loop closure (PDR tab)
 "Close loop" assumes you ended where you started. It spreads the end-point error back along the path in proportion to each point's position along it.

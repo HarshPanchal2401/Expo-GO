@@ -36,8 +36,9 @@ export default function RssiSignalGraph({
   const plotW = Math.max(100, safeLayoutW - MARGIN_LEFT - MARGIN_RIGHT);
   const plotH = Math.max(80, DEFAULT_HEIGHT - MARGIN_TOP - MARGIN_BOTTOM);
 
-  const b1Color = darkMode ? "#38bdf8" : "#0969da";
-  const b2Color = darkMode ? "#c084fc" : "#8250df";
+  // Same beacon colours as the Fusion Map, so B1/B2 read identically everywhere.
+  const b1Color = darkMode ? "#58a6ff" : "#0969da";
+  const b2Color = darkMode ? "#bc8cff" : "#8250df";
 
   // Y-axis mapping: RSSI (-30 to -95) -> screen Y
   const rssiToY = (rssi) => {

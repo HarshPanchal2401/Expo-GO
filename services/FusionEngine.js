@@ -448,6 +448,48 @@ export class FusionEngine {
     return fix;
   }
 
+  /**
+   * Starts from a position the USER chose on the map, instead of from beacons.
+   *
+   * The user knows where they are standing far better than two BLE ranges do,
+   * so this is both the fallback when locating cannot decide and a shortcut
+   * when it would take too long. Uncertainty is still seeded (a finger tap on
+   * a phone-sized plan is only good to a few feet), so BLE corrections refine
+   * it from the first update rather than being ignored.
+   */
+  setManualPosition(x, y, uncertaintyFt = 3.0) {
+    this.cancelLocating();
+    let px = Number(x) || 0;
+    let py = Number(y) || 0;
+    if (this._roomWidth !== null) px = Math.max(0, Math.min(this._roomWidth, px));
+    if (this._roomHeight !== null) py = Math.max(0, Math.min(this._roomHeight, py));
+    this.reset(px, py);
+    const v = Math.max(this._cfg.INITIAL_COVARIANCE_FT2, uncertaintyFt ** 2);
+    this._pxx = v;
+    this._pyy = v;
+    this._pxy = 0;
+    return {
+      status: "manual",
+      reason: "chosen-on-map",
+      position: { x: px, y: py },
+      alternate: null,
+      uncertaintyFt,
+      sampleCount: 0,
+    };
+  }
+
+  /**
+   * Settles the two-candidate ambiguity by the user pointing at the mark they
+   * are standing on. Returns false if there is nothing to choose between.
+   */
+  chooseHypothesisNear(x, y) {
+    if (!this._alt) return false;
+    const dPrimary = Math.hypot(this._x - x, this._y - y);
+    const dAlt = Math.hypot(this._alt.x - x, this._alt.y - y);
+    this._collapseTo(dAlt < dPrimary ? "alternate" : "primary", "user-chose-on-map");
+    return true;
+  }
+
   /** Abandons an in-progress locating phase. */
   cancelLocating() {
     this._locating = false;

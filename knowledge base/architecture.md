@@ -137,6 +137,8 @@ headingFilter.heading ─▶ headingRef (live; the UI refreshes at most every 10
 ### 4.4 Fusion Map session (states)
 ```text
 idle ──Find My Position──▶ locating ──fix committed──▶ navigating ──Stop──▶ idle
+  │                          │ tap map / Choose on Map        ▲
+  └──Set My Start on Map──▶ picking ──tap, then Start Here─────┘
                              │   ▲                          ▲
                              │   └── Re-locate ─────────────┤
                              └──fix, heading not zeroed──▶ located ──Zero Heading / Start──┘

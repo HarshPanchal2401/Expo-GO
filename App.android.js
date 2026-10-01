@@ -244,7 +244,7 @@ export default function AppAndroid() {
     // Tell the BLE ranging engine the user is genuinely walking. It uses this
     // to distinguish real movement from a signal fade, which it cannot do from
     // RSSI alone. Reported on every step regardless of which screen is open.
-    v2Scanner.notifyStep();
+    v2Scanner.notifyStep(Date.now(), { lengthM: len, headingDeg: curHeading });
 
     // Feed step into Fusion Engine / map if it is listening
     if (pdrStepCallbackRef.current) {

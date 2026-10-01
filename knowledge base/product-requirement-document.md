@@ -5,7 +5,7 @@
 | **Product** | Indoor Nav (Expo app "PDR Test", `com.harsh553.pdrtest`) |
 | **Status** | Working prototype. It tracks on a real office floor plan and is being tuned for accuracy |
 | **Platforms** | Android (main), iOS |
-| **Last updated** | 2026-09-30 (engine tag `locate-v6`) |
+| **Last updated** | 2026-09-30 (engine tag `locate-v7`) |
 
 ---
 
@@ -53,6 +53,8 @@ GPS doesn't work indoors, so a phone can't show where a person is inside an offi
 | L-5 | When two positions are possible, show both and ask the user to walk across the beacon line | ✅ Done |
 | L-6 | Warn when ranges are geometrically impossible (a calibration fault) | ✅ Done |
 | L-7 | Start navigation automatically once the position is found, always. Zero Heading doesn't block it | ✅ Done |
+| L-8 | **Manual start:** the user taps where they are on the map and presses Start Here. Also offered during locating ("Choose on Map", or just tap) | ✅ Done |
+| L-9 | Settle a two-candidate ambiguity by tapping the correct mark | ✅ Done |
 
 ### 4.3 Navigation
 | ID | Requirement | Status |

@@ -16,6 +16,7 @@ import {
   parseBeaconPayload,
 } from "./BleScannerService.js";
 import { adaptiveEngine } from "./AdaptiveBeaconEngine.js";
+import { autoCalibrator } from "./BeaconAutoCalibration.js";
 import { getAppSettings, subscribeAppSettings } from "./appSettingsStorage.js";
 
 const STORAGE_KEY = "@v2_beacon_config_v3";
@@ -30,6 +31,10 @@ export const DEFAULT_V2_CONFIG = {
   pathLossN: 2.9, // indoor office; see DEFAULT_PATH_LOSS_N in AdaptiveBeaconEngine.js
   distanceUnit: "m", // 'm' | 'ft' | 'in'
   targetBeaconsOnly: true, // When true and B1/B2 are set, drops all other ambient BLE devices to eliminate phone CPU load
+  // Learn each beacon's 1 m level and decay automatically from ordinary
+  // walking (see BeaconAutoCalibration.js). On by default: in production
+  // nobody calibrates by hand.
+  autoCalibration: true,
   beaconHeightM: null, // Ceiling/wall mount height in metres; null = same height as phone (no correction)
   phoneHeightM: 1.1,
 };
@@ -48,6 +53,14 @@ export const DEFAULT_V2_CONFIG = {
  * @param {number} pathLossN - Environmental path-loss exponent (default 2.2)
  * @returns {number|null} Distance in meters
  */
+// Calibration averaging: how long a stand's readings are kept, the window a
+// logged point averages over, the fewest readings that window must hold, and
+// the spread above which a stand is reported as unsteady.
+const RANGING_HISTORY_MS = 20000;
+const CALIB_WINDOW_MS = 6000;
+const CALIB_MIN_SAMPLES = 8;
+const CALIB_MAX_SIGMA_DB = 6.0;
+
 /** A usable RSSI-at-1m value: outside this range it is a malformed or unset field. */
 export function isPlausibleTx1m(tx) {
   return Number.isFinite(tx) && tx <= -30 && tx >= -100;
@@ -204,6 +217,7 @@ class V2BeaconScannerService {
       if (!this._settingsUnsub) {
         this._settingsUnsub = subscribeAppSettings((s) => this.applyPathLossSettings(s));
       }
+      await this._initAutoCalibration();
     } catch (e) {
       console.warn("[V2Scanner] Failed to load config:", e);
     }
@@ -247,6 +261,7 @@ class V2BeaconScannerService {
     }
 
     this.graphHistory[key] = [];
+    if (this.rangingHistory) this.rangingHistory[key] = [];
     this.timestampWindows[key] = [];
     this.lastDistanceUpdate[key] = { dist: null, time: null };
     this.stats[key] = {
@@ -314,6 +329,8 @@ class V2BeaconScannerService {
       beacon2Name: this.config.beacon2Name,
       beacon2TxPower: this.config.beacon2TxPower,
     });
+    autoCalibrator.setBeaconIds(this.config.beacon1Id, this.config.beacon2Id);
+    autoCalibrator.load([this.config.beacon1Id, this.config.beacon2Id]);
 
     if (device && Number.isFinite(device.rawRssi)) {
       this._updateBeaconStream(beaconNum, device, device.rawRssi, Date.now());
@@ -359,6 +376,8 @@ class V2BeaconScannerService {
       beacon2Name: this.config.beacon2Name,
       beacon2TxPower: this.config.beacon2TxPower,
     });
+    autoCalibrator.setBeaconIds(this.config.beacon1Id, this.config.beacon2Id);
+    autoCalibrator.load([this.config.beacon1Id, this.config.beacon2Id]);
     this.emitStats();
     return { success: true };
   }
@@ -751,7 +770,12 @@ class V2BeaconScannerService {
     statObj.advertisedTxPower = isPlausibleTx1m(advertisedTx) ? advertisedTx : null;
     // Where the 1 m reference in use came from, so the UI can say plainly
     // whether distances are calibrated or running on an assumption.
-    statObj.txSource = statObj.isCalibrated ? "calibrated" : txPower !== null ? "advertised" : "default";
+    const cal = adaptiveEngine.getCalibrator(deviceObj.id);
+    statObj.autoWindows = cal?.autoWindows || 0;
+    statObj.txSource = statObj.isCalibrated
+      ? (cal?.autoCalibrated ? "auto" : "calibrated")
+      : txPower !== null ? "advertised" : "default";
+    if (this.config.autoCalibration) autoCalibrator.onPacket(beaconNum, now, statObj.rangingRssi);
 
     try {
       const calibrator = adaptiveEngine.getCalibrator(deviceObj.id);
@@ -787,6 +811,16 @@ class V2BeaconScannerService {
     hist.push({ t: now, raw: rawRssi, filtered: adaptiveData.filteredRssi, dist: adaptiveData.distanceM });
     if (hist.length > this.maxGraphPoints) hist.shift();
 
+    // Recent RANGING levels, for calibration. Calibration must be fitted on the
+    // same level the distance formula inverts (rangingRssi = filtered + shadow
+    // correction), averaged over a stand - see getRecentRangingLevel().
+    if (!this.rangingHistory) this.rangingHistory = { b1: [], b2: [] };
+    if (Number.isFinite(statObj.rangingRssi)) {
+      const rh = this.rangingHistory[targetKey];
+      rh.push({ t: now, level: statObj.rangingRssi });
+      while (rh.length && now - rh[0].t > RANGING_HISTORY_MS) rh.shift();
+    }
+
     // Packet log entry
     const packetEntry = {
       id: `${now}-${beaconNum}-${statObj.totalPackets}`,
@@ -813,16 +847,68 @@ class V2BeaconScannerService {
   // CALIBRATION & LOCALIZATION CONVENIENCE METHODS
   // =========================================================================
 
+  /**
+   * Logs a calibration point at a known distance from the AVERAGE ranging
+   * level over the last few seconds of standing there.
+   *
+   * It used to log a single instant of filteredRssi, which was wrong twice:
+   *   - wrong LEVEL: ranging inverts rangingRssi (filtered + shadow correction),
+   *     and that correction grows with range, because a longer path fades more.
+   *     A model fitted on filtered RSSI was close up near and increasingly off
+   *     far away - "short range accurate, long range not".
+   *   - one INSTANT: a single reading carries the full few dB of noise, which
+   *     tilts the fitted slope differently every time, so two beacons
+   *     calibrated the same way still disagreed.
+   */
   logCalibrationPoint(beaconNum, distanceM) {
     const beaconId = beaconNum === 1 ? this.config.beacon1Id : this.config.beacon2Id;
     if (!beaconId) return { success: false, error: "Beacon not selected" };
     const calibrator = adaptiveEngine.getCalibrator(beaconId);
-    const stat = this.stats[beaconNum === 1 ? "b1" : "b2"];
-    const currentRssi = stat.filteredRssi !== null ? stat.filteredRssi : stat.rawRssi;
-    if (currentRssi === null) return { success: false, error: "No signal received yet" };
-    calibrator.addReferencePoint(distanceM, currentRssi);
+    const avg = this.getRecentRangingLevel(beaconNum);
+    if (!avg.ok) return { success: false, error: avg.error };
+    calibrator.addReferencePoint(distanceM, avg.level);
     this.emitStats();
-    return { success: true, count: calibrator.referencePoints.length };
+    return {
+      success: true,
+      count: calibrator.referencePoints.length,
+      level: avg.level,
+      sigmaDb: avg.sigmaDb,
+      samples: avg.samples,
+      unsteady: avg.sigmaDb > CALIB_MAX_SIGMA_DB,
+    };
+  }
+
+  /**
+   * Trimmed mean of this beacon's ranging level over the last windowMs.
+   * Requires enough packets that the average means something.
+   */
+  getRecentRangingLevel(beaconNum, windowMs = CALIB_WINDOW_MS) {
+    const key = beaconNum === 1 ? "b1" : "b2";
+    const now = Date.now();
+    const rh = (this.rangingHistory && this.rangingHistory[key]) || [];
+    const vals = rh.filter((p) => now - p.t <= windowMs).map((p) => p.level);
+    if (vals.length < CALIB_MIN_SAMPLES) {
+      return {
+        ok: false,
+        samples: vals.length,
+        error:
+          `Only ${vals.length} readings from Beacon ${beaconNum} in the last ${Math.round(windowMs / 1000)} s ` +
+          `(need ${CALIB_MIN_SAMPLES}). Stand still at the distance a few more seconds, ` +
+          `with the phone at chest height facing the beacon, then try again.`,
+      };
+    }
+    const sorted = [...vals].sort((a, b) => a - b);
+    const cut = Math.floor(sorted.length * 0.2);
+    const kept = sorted.slice(cut, sorted.length - cut);
+    const level = kept.reduce((a, v) => a + v, 0) / kept.length;
+    const mean = vals.reduce((a, v) => a + v, 0) / vals.length;
+    const sigmaDb = Math.sqrt(vals.reduce((a, v) => a + (v - mean) ** 2, 0) / vals.length);
+    return {
+      ok: true,
+      level: Number(level.toFixed(2)),
+      sigmaDb: Number(sigmaDb.toFixed(2)),
+      samples: vals.length,
+    };
   }
 
   /**
@@ -885,6 +971,7 @@ class V2BeaconScannerService {
       calibrator.fittedTxPower1m = fit.txPower1m;
       calibrator.isCalibrated = true;
       calibrator.saveToStorage();
+      autoCalibrator.forget(beaconId);
 
       this.config[beaconNum === 1 ? "beacon1TxPower" : "beacon2TxPower"] = fit.txPower1m;
       this.stats[beaconNum === 1 ? "b1" : "b2"].txPower = fit.txPower1m;
@@ -911,6 +998,17 @@ class V2BeaconScannerService {
     }
   }
 
+  /** Deletes one logged calibration point (e.g. one taken while someone walked past). */
+  removeCalibrationPoint(beaconNum, index) {
+    const beaconId = beaconNum === 1 ? this.config.beacon1Id : this.config.beacon2Id;
+    if (!beaconId) return { success: false, error: "Beacon not selected" };
+    const calibrator = adaptiveEngine.getCalibrator(beaconId);
+    calibrator.removeReferencePoint(index);
+    calibrator.saveToStorage();
+    this.emitStats();
+    return { success: true, count: calibrator.referencePoints.length };
+  }
+
   fitPathLossModel(beaconNum) {
     const beaconId = beaconNum === 1 ? this.config.beacon1Id : this.config.beacon2Id;
     if (!beaconId) return { success: false, error: "Beacon not selected" };
@@ -918,6 +1016,7 @@ class V2BeaconScannerService {
     const res = calibrator.fitModel();
     if (!res) return { success: false, error: "Need at least 2 distinct distance measurements" };
     calibrator.saveToStorage();
+    autoCalibrator.forget(beaconId);
     this.emitStats();
     return { success: true, ...res };
   }
@@ -943,16 +1042,18 @@ class V2BeaconScannerService {
    * @returns {{success: boolean, error?: string, b1TxPower?: number, b2TxPower?: number, deltaDb?: number}}
    */
   matchBeaconPair() {
-    const s1 = this.stats.b1;
-    const s2 = this.stats.b2;
     if (!this.config.beacon1Id || !this.config.beacon2Id) {
       return { success: false, error: "Select both B1 and B2 first." };
     }
-    const r1 = Number.isFinite(s1.filteredRssi) ? s1.filteredRssi : s1.rawRssi;
-    const r2 = Number.isFinite(s2.filteredRssi) ? s2.filteredRssi : s2.rawRssi;
-    if (!Number.isFinite(r1) || !Number.isFinite(r2)) {
-      return { success: false, error: "Both beacons need a live signal before matching." };
-    }
+    // Same level ranging uses, averaged over a stand, for the same reasons as
+    // logCalibrationPoint(): one instant of filteredRssi matched the two
+    // beacons to noise and on the wrong level.
+    const a1 = this.getRecentRangingLevel(1);
+    const a2 = this.getRecentRangingLevel(2);
+    if (!a1.ok) return { success: false, error: a1.error };
+    if (!a2.ok) return { success: false, error: a2.error };
+    const r1 = a1.level;
+    const r2 = a2.level;
 
     const tx1 = Number.isFinite(this.config.beacon1TxPower) ? this.config.beacon1TxPower : -59;
     const tx2 = Number.isFinite(this.config.beacon2TxPower) ? this.config.beacon2TxPower : -59;
@@ -992,6 +1093,7 @@ class V2BeaconScannerService {
         if (calibrator && typeof calibrator.set1MeterTxPower === "function") {
           calibrator.set1MeterTxPower(val);
         }
+        autoCalibrator.forget(beaconId);
       } catch (e) {
         console.warn("[V2Scanner] set1MeterTxPower error:", e);
       }
@@ -1059,9 +1161,79 @@ class V2BeaconScannerService {
    * steps and forwards it to the ranging engine. Knowing this is what lets the
    * engine reject multi-second signal fades without also lagging real movement.
    */
-  notifyStep(timestamp = Date.now()) {
+  notifyStep(timestamp = Date.now(), step = null) {
     this._lastStepAt = timestamp;
     this._motionReportingActive = true;
+    // Each step's length and heading give auto-calibration the shape of the
+    // path walked, which is what it measures the beacons against.
+    if (step && this.config.autoCalibration) {
+      autoCalibrator.onStep(timestamp, step.lengthM, step.headingDeg);
+    }
+  }
+
+  // ── Automatic calibration ─────────────────────────────────────────────────
+  async _initAutoCalibration() {
+    if (this._autoInit) return;
+    this._autoInit = true;
+    autoCalibrator.setEnabled(this.config.autoCalibration !== false);
+    autoCalibrator.setApplyFunction((beaconId, model) => {
+      try {
+        adaptiveEngine.getCalibrator(beaconId).applyAutoModel(model.tx, model.n, model.windows);
+        this.emitStats();
+      } catch (e) {
+        console.warn("[V2Scanner] auto-calibration apply failed:", e);
+      }
+    });
+    autoCalibrator.setPriorProvider((num) => {
+      const id = num === 1 ? this.config.beacon1Id : this.config.beacon2Id;
+      if (!id) return null;
+      const cal = adaptiveEngine.getCalibrator(id);
+      // A hand calibration is a good starting point: trust it more.
+      if (cal?.isCalibrated && !cal.autoCalibrated) {
+        return { tx: cal.fittedTxPower1m, n: cal.fittedN, txSigma: 3, nSigma: 0.3 };
+      }
+      const adv = this.stats[num === 1 ? "b1" : "b2"]?.advertisedTxPower;
+      return { tx: isPlausibleTx1m(adv) ? adv : -59, n: 2.9 };
+    });
+    autoCalibrator.setBeaconIds(this.config.beacon1Id, this.config.beacon2Id);
+    await autoCalibrator.load([this.config.beacon1Id, this.config.beacon2Id]);
+    await this._refreshAutoGeometry();
+  }
+
+  async _refreshAutoGeometry() {
+    // Only real, saved beacon positions are used. The Fusion Map's placeholder
+    // positions would make auto-calibration learn a model for the wrong layout.
+    const [anchors, size] = await Promise.all([this.getBeaconAnchors(), this.getPlaceSize()]);
+    autoCalibrator.setGeometry(anchors, size || { widthFt: 72, heightFt: 72 });
+  }
+
+  setAutoCalibration(enabled) {
+    this.config.autoCalibration = Boolean(enabled);
+    autoCalibrator.setEnabled(this.config.autoCalibration);
+    this.saveConfig({ autoCalibration: this.config.autoCalibration });
+  }
+
+  getAutoCalibrationStatus() {
+    return autoCalibrator.getStatus();
+  }
+
+  subscribeAutoCalibration(fn) {
+    fn(autoCalibrator.getStatus());
+    return autoCalibrator.subscribe(fn);
+  }
+
+  /** Forgets everything learned automatically for the two selected beacons. */
+  async resetAutoCalibration() {
+    await autoCalibrator.reset();
+    for (const id of [this.config.beacon1Id, this.config.beacon2Id]) {
+      if (!id) continue;
+      const cal = adaptiveEngine.getCalibrator(id);
+      if (cal?.autoCalibrated) {
+        cal.clear();
+        cal.saveToStorage();
+      }
+    }
+    this.emitStats();
   }
 
   setBeaconHeights(beaconHeightM, phoneHeightM = 1.1) {
@@ -1100,6 +1272,7 @@ class V2BeaconScannerService {
         "@v2_fusion_place_size_ft",
         JSON.stringify({ widthFt: Number(widthFt), heightFt: Number(heightFt) })
       );
+      await this._refreshAutoGeometry();
     } catch (e) {
       console.warn("[V2Scanner] setPlaceSize error:", e);
     }
@@ -1140,6 +1313,9 @@ class V2BeaconScannerService {
           b2: { x: Number(b2.x), y: Number(b2.y) },
         })
       );
+      // Beacons moved on the plan: what was learned for the old layout no
+      // longer describes their distances.
+      await this._refreshAutoGeometry();
     } catch (e) {
       console.warn("[V2Scanner] setBeaconAnchors error:", e);
     }
