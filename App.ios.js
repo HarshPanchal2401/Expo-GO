@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   SafeAreaView,
   View,
@@ -13,6 +13,7 @@ import { Pedometer, DeviceMotion, Accelerometer, Magnetometer } from "expo-senso
 import { getSavedPaths, savePath, deleteSavedPath, clearAllSavedPaths } from "./PathStorage.js";
 import AppSettingsScreen from "./components/AppSettingsScreen.js";
 import BeaconSignalLabScreen from "./components/v2/BeaconSignalLabScreen.js";
+import RawDistanceScreen from "./components/v2/RawDistanceScreen.js";
 import FusionMapScreen from "./components/v2/FusionMapScreen.js";
 import PdrTrackerScreen from "./components/v2/PdrTrackerScreen.js";
 import ErrorBoundary from "./components/ErrorBoundary.js";
@@ -71,6 +72,13 @@ export default function AppIOS() {
 
   // Active Tab: 'pdr' | 'fusionMap' | 'signalLab' | 'settings'
   const [activeTab, setActiveTab] = useState("pdr");
+  // Read inside sensor callbacks. Live readouts (bounce, heading, magnetic
+  // field) are only pushed into React state while the PDR tab shows them:
+  // each update re-renders the whole app, and at ~40 updates a second while
+  // the Fusion Map or Signal Lab was open the JS thread saturated - the UI
+  // froze and BLE packets queued up behind it.
+  const activeTabRef = useRef("pdr");
+  activeTabRef.current = activeTab;
 
   // OTA update state
   const [otaChecking, setOtaChecking] = useState(false);
@@ -247,8 +255,12 @@ export default function AppIOS() {
       const nowMs = Date.now();
       if (nowMs - lastHeadingUiRef.current < 100) return;
       lastHeadingUiRef.current = nowMs;
-      setHeading(headingRef.current);
-      setRawHeading(rawHeadingRef.current);
+      // Turn detection for BLE ranging (see v2Scanner.notifyHeading).
+      v2Scanner.notifyHeading(headingRef.current, nowMs);
+      if (activeTabRef.current === "pdr") {
+        setHeading(headingRef.current);
+        setRawHeading(rawHeadingRef.current);
+      }
     };
     let isMounted = true;
 
@@ -261,7 +273,7 @@ export default function AppIOS() {
         const totalField = Math.sqrt(x * x + y * y + z * z);
         headingFilter.updateMagneticField(totalField);
         const nowMs = Date.now();
-        if (nowMs - lastMagUiRef.current > 250) {
+        if (activeTabRef.current === "pdr" && nowMs - lastMagUiRef.current > 250) {
           lastMagUiRef.current = nowMs;
           setMagneticField({
             x: Number(x.toFixed(1)),
@@ -349,7 +361,7 @@ export default function AppIOS() {
         gravityRef.current = 0.98 * gravityRef.current + 0.02 * ss.filteredMag;
         const dynamicAccel = ss.filteredMag - gravityRef.current;
 
-        if (!ss.lastLiveBounceUpdate || now - ss.lastLiveBounceUpdate > 100) {
+        if (activeTabRef.current === "pdr" && (!ss.lastLiveBounceUpdate || now - ss.lastLiveBounceUpdate > 100)) {
           ss.lastLiveBounceUpdate = now;
           setLiveBounce(Math.abs(dynamicAccel));
         }
@@ -485,7 +497,9 @@ export default function AppIOS() {
     };
   }, []);
 
-  const setZero = () => {
+  // Stable identity, so the memoised Fusion Map does not re-render each time
+  // the app shell does.
+  const setZero = useCallback(() => {
     const rawNow = rawHeadingRef.current;
     headingZeroRef.current = rawNow;
     setHeadingZero(rawNow);
@@ -497,7 +511,7 @@ export default function AppIOS() {
     headingRef.current = 0;
     setHeading(0);
     setStatus("Heading zero calibrated (Forward = 0°)");
-  };
+  }, []);
 
   const start = () => {
     // Deliberately does NOT touch heading calibration — only the explicit
@@ -669,6 +683,15 @@ export default function AppIOS() {
         </Pressable>
 
         <Pressable
+          style={[styles.tabBtn, activeTab === "raw" && styles.tabBtnActive]}
+          onPress={() => setActiveTab("raw")}
+        >
+          <Text style={[styles.tabBtnText, activeTab === "raw" && styles.tabBtnTextActive]}>
+            📏 Raw
+          </Text>
+        </Pressable>
+
+        <Pressable
           style={[styles.tabBtn, activeTab === "settings" && styles.tabBtnActive]}
           onPress={() => setActiveTab("settings")}
         >
@@ -717,6 +740,8 @@ export default function AppIOS() {
           />
         ) : activeTab === "signalLab" ? (
           <BeaconSignalLabScreen />
+        ) : activeTab === "raw" ? (
+          <RawDistanceScreen />
         ) : (
           <AppSettingsScreen />
         )}

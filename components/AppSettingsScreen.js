@@ -1,9 +1,10 @@
 // ============================================================================
 // AppSettingsScreen — In-App Runtime Configuration Panel (Premium UI)
 //
-// Allows live tuning of all core parameters (BLE path-loss, dead zone,
-// near-field 0cm curve, One-Euro filter, Weinberg stride K, step thresholds,
-// cadence, and room dimensions) directly inside the app without EAS commits.
+// Live tuning of the PDR step detector and stride model - the only settings
+// the app still reads. BLE distance settings (Measured Power, n, Kalman) live
+// on the Raw tab (shared with Signal Lab and the Fusion Map); room size lives
+// on the Fusion Map.
 // ============================================================================
 
 import React, { useState, useEffect } from "react";
@@ -14,7 +15,6 @@ import {
   ScrollView,
   Pressable,
   TextInput,
-  Switch,
   Alert,
   ActivityIndicator,
 } from "react-native";
@@ -120,7 +120,7 @@ export default function AppSettingsScreen() {
         </View>
         <Text style={s.headerTitle}>App Parameter Tuning</Text>
         <Text style={s.headerSub}>
-          Tune sensor thresholds, BLE filters, 0cm near-field curves, and room size directly in-app. No code edits or EAS builds required!
+          Tune the step detector and stride length. BLE distance settings (Measured Power, n, Kalman) are on the 📏 Raw tab; room size is on the Fusion Map.
         </Text>
       </View>
 
@@ -147,151 +147,6 @@ export default function AppSettingsScreen() {
           <Text style={s.successText}>✅ Parameters saved and active immediately!</Text>
         </View>
       )}
-
-      {/* ──────────────────────────────────────────────────────────────────── */}
-      {/* SECTION 1: NEAR-FIELD / 0 CM CORRECTION (Solves 18-21cm floor)        */}
-      {/* ──────────────────────────────────────────────────────────────────── */}
-      <View style={s.card}>
-        <View style={s.cardHeader}>
-          <View style={{ flex: 1, paddingRight: 10 }}>
-            <View style={{ flexDirection: "row", alignItems: "center", gap: 6, marginBottom: 2 }}>
-              <Text style={s.cardTitle}>🎯 Near-Field 0 cm Correction</Text>
-            </View>
-            <Text style={s.cardDesc}>
-              Fixes the 18–21 cm floor error caused by hardware receiver saturation when touching the beacon antenna.
-            </Text>
-          </View>
-          <Switch
-            value={settings.nearFieldCorrectionOn}
-            onValueChange={(val) => updateParam("nearFieldCorrectionOn", val)}
-            trackColor={{ false: "#d0d7de", true: "#54aeff" }}
-            thumbColor={settings.nearFieldCorrectionOn ? "#1f6feb" : "#f6f8fa"}
-          />
-        </View>
-
-        <SettingNumberRow
-          label="Hardware Saturation RSSI"
-          hint="Max signal strength observed at 0 cm touch contact"
-          unit="dBm"
-          value={settings.nearFieldSaturationRssi}
-          step={1}
-          min={-70}
-          max={-20}
-          decimals={0}
-          onChange={(val) => updateParam("nearFieldSaturationRssi", val)}
-        />
-      </View>
-
-      {/* ──────────────────────────────────────────────────────────────────── */}
-      {/* SECTION 2: BLE PROPAGATION & SIGNAL FILTERING                        */}
-      {/* ──────────────────────────────────────────────────────────────────── */}
-      <View style={s.card}>
-        <View style={s.cardHeader}>
-          <View style={{ flex: 1 }}>
-            <Text style={s.cardTitle}>📶 BLE Propagation & Filtering</Text>
-            <Text style={s.cardDesc}>
-              Log-distance path-loss model, One-Euro jitter filter, and stationary dead-bands.
-            </Text>
-          </View>
-        </View>
-
-        <SettingNumberRow
-          label="TxPower @ 1 Meter"
-          hint="Calibrated RSSI at exactly 1.0 meter (default: -59 dBm)"
-          unit="dBm"
-          value={settings.txPower}
-          step={1}
-          min={-85}
-          max={-35}
-          decimals={0}
-          onChange={(val) => updateParam("txPower", val)}
-        />
-
-        <SettingNumberRow
-          label="Path Loss Exponent (n)"
-          hint="Environment factor: 2.0 = open line-of-sight, 2.8+ = obstacles"
-          unit=""
-          value={settings.pathLossN}
-          step={0.1}
-          min={1.0}
-          max={4.5}
-          decimals={1}
-          onChange={(val) => updateParam("pathLossN", val)}
-        />
-
-        <SettingNumberRow
-          label="Stationary Dead-Band"
-          hint="Hysteresis noise clamp: 0.03 = 3cm, prevents jitter at rest"
-          unit="m"
-          value={settings.deadZone}
-          step={0.01}
-          min={0.0}
-          max={0.25}
-          decimals={2}
-          onChange={(val) => updateParam("deadZone", val)}
-        />
-
-        <SettingNumberRow
-          label="One-Euro Min Cutoff"
-          hint="Baseline filter frequency; lower = smoother when phone is still"
-          unit="Hz"
-          value={settings.oneEuroMinCutoff}
-          step={0.05}
-          min={0.05}
-          max={1.5}
-          decimals={2}
-          onChange={(val) => updateParam("oneEuroMinCutoff", val)}
-        />
-
-        <SettingNumberRow
-          label="One-Euro Beta"
-          hint="Speed gain; higher = faster tracking during rapid movement"
-          unit=""
-          value={settings.oneEuroBeta}
-          step={0.01}
-          min={0.01}
-          max={0.3}
-          decimals={2}
-          onChange={(val) => updateParam("oneEuroBeta", val)}
-        />
-
-        <SettingNumberRow
-          label="Median Filter Window"
-          hint="Rolling sample window to strip multi-path channel hops"
-          unit="pkts"
-          value={settings.medianWindow || 5}
-          step={1}
-          min={1}
-          max={15}
-          decimals={0}
-          onChange={(val) => updateParam("medianWindow", val)}
-        />
-
-        {/* Distance Display Unit Selector */}
-        <View style={s.inputRowStacked}>
-          <View style={{ marginBottom: 8 }}>
-            <Text style={s.inputLabel}>Preferred Distance Display Unit</Text>
-            <Text style={s.inputHint}>Select active distance unit for all screens and charts</Text>
-          </View>
-          <View style={s.unitGroup}>
-            {[
-              { id: "m", label: "Meters (m)" },
-              { id: "ft", label: "Feet (ft)" },
-              { id: "in", label: "Inches (in)" },
-            ].map((u) => (
-              <Pressable
-                key={u.id}
-                onPress={() => updateParam("distanceUnit", u.id)}
-                style={[s.unitBtn, settings.distanceUnit === u.id && s.unitBtnActive]}
-              >
-                <Text style={[s.unitBtnText, settings.distanceUnit === u.id && s.unitBtnTextActive]}>
-                  {u.label}
-                </Text>
-              </Pressable>
-            ))}
-          </View>
-        </View>
-      </View>
 
       {/* ──────────────────────────────────────────────────────────────────── */}
       {/* SECTION 3: PDR STEP DETECTOR & WEINBERG STRIDE                       */}
@@ -343,18 +198,6 @@ export default function AppSettingsScreen() {
         />
 
         <SettingNumberRow
-          label="Valley Threshold"
-          hint="Swing-phase acceleration dip (negative value)"
-          unit="g"
-          value={settings.valleyThreshold}
-          step={0.01}
-          min={-0.35}
-          max={-0.02}
-          decimals={2}
-          onChange={(val) => updateParam("valleyThreshold", val)}
-        />
-
-        <SettingNumberRow
           label="Min Bounce Swing"
           hint="Minimum (Peak - Valley) difference to confirm valid step"
           unit="g"
@@ -378,55 +221,6 @@ export default function AppSettingsScreen() {
           onChange={(val) => updateParam("minCadenceMs", val)}
         />
 
-        <SettingNumberRow
-          label="Max Cadence Window"
-          hint="Slowest step timeout before resetting state machine"
-          unit="ms"
-          value={settings.maxCadenceMs || 1600}
-          step={50}
-          min={800}
-          max={2500}
-          decimals={0}
-          onChange={(val) => updateParam("maxCadenceMs", val)}
-        />
-      </View>
-
-      {/* ──────────────────────────────────────────────────────────────────── */}
-      {/* SECTION 4: ROOM & MAP ENVIRONMENT                                    */}
-      {/* ──────────────────────────────────────────────────────────────────── */}
-      <View style={s.card}>
-        <View style={s.cardHeader}>
-          <View style={{ flex: 1 }}>
-            <Text style={s.cardTitle}>📐 Room Dimensions</Text>
-            <Text style={s.cardDesc}>
-              Physical room boundaries for 2-beacon positioning and 2D map scaling.
-            </Text>
-          </View>
-        </View>
-
-        <SettingNumberRow
-          label="Room Width (X axis)"
-          hint="Horizontal room dimension (default: 18 ft)"
-          unit="ft"
-          value={settings.roomWidthFt}
-          step={1}
-          min={5}
-          max={150}
-          decimals={0}
-          onChange={(val) => updateParam("roomWidthFt", val)}
-        />
-
-        <SettingNumberRow
-          label="Room Height (Y axis)"
-          hint="Vertical room dimension (default: 15 ft)"
-          unit="ft"
-          value={settings.roomHeightFt}
-          step={1}
-          min={5}
-          max={150}
-          decimals={0}
-          onChange={(val) => updateParam("roomHeightFt", val)}
-        />
       </View>
 
       {/* Reset to Factory Defaults */}

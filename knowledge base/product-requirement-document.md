@@ -5,7 +5,7 @@
 | **Product** | Indoor Nav (Expo app "PDR Test", `com.harsh553.pdrtest`) |
 | **Status** | Working prototype. It tracks on a real office floor plan and is being tuned for accuracy |
 | **Platforms** | Android (main), iOS |
-| **Last updated** | 2026-09-30 (engine tag `locate-v7`) |
+| **Last updated** | 2026-10-01 (engine tag `range-v1`) |
 
 ---
 

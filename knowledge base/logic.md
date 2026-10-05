@@ -1,6 +1,6 @@
 # Logic & Algorithms
 
-The maths and decision rules behind positioning, and the constants each one uses as of engine tag `locate-v7`. Values are quoted from the source. If you change one, update it here too.
+The maths and decision rules behind positioning, and the constants each one uses as of engine tag `range-v1`. Values are quoted from the source. If you change one, update it here too.
 
 > Replaces `02_core_logic_algorithms_and_math.md`, which describes an earlier engine.
 
@@ -79,19 +79,29 @@ For each packet from Beacon *i*:
    - `R = clamp(noiseVar, 3, 25)`.
    - `q = 12·(1 + min(1, var/10))`, cut to ×0.12 when stationary.
    - The rate is capped at ±14 dB/s and pulled toward 0 (×0.65 per step) when stationary.
-   - "Stationary" comes from the PDR step detector (moving = a step in the last 1.2 s). Without that, it falls back to an innovation-whiteness test.
-4. **Shadow envelope:** a peak-hold of the filtered level. It rises instantly and falls at a bounded rate. The hold is 8 s standing, 0.6 s walking, 4 s unknown. `rangingRssi = filtered + min(9 dB, 0.85·(envelope − filtered))`.
-5. **Path loss:** `d = 10^((Tx1m − rangingRssi)/(10·n))`. When dual-slope calibrated, a steeper `n_far` applies beyond the 6 m breakpoint.
+   - **Moving** = a step in the last 1.2 s **or a turn** (heading change ≥ 35° within 1.5 s) in the last 1.5 s. It is reported from app start, because the step detector always runs. A sustained one-sided innovation (filter visibly lagging) overrides "still" after 2.5 s.
+4. **Shadow envelope:** still computed (peak-hold of the filtered level) for diagnostics, but **no longer applied** (`SHADOW_ENVELOPE_RANGING: false`). Its correction depended on the motion state, so the same spot ranged differently standing and walking.
+5. **Body shadow** (`BODY_SHADOW_LOSS_DB = 4`): the Fusion Map sends each beacon's fraction `f = clamp((−cos δ + 0.2)/1.2, 0, 1)`, where δ = heading − bearing to the beacon (0 facing, 1 behind), at 4 Hz. `level += 4 dB · f`. It is ignored after 3 s without an update. 4 dB was the value that beat no correction for a real body loss of 3, 7 and 11 dB.
+6. **Standing average:** while still, `rangingRssi` = the exponential average since the user stopped, with τ growing from 0.5 s up to 10 s. It restarts immediately on a step or turn.
+7. **Path loss:** `d = 10^((Tx1m − rangingRssi)/(10·n))`. When dual-slope calibrated, a steeper `n_far` applies beyond the 6 m breakpoint.
    - **Where Tx1m comes from:** the calibrated value → the beacon's own advertised measured power (valid only between −100 and −30 dBm) → the Settings default (−59).
    - **Where n comes from:** the calibrated value → the default **2.9**, which suits a furnished office.
-6. **Near-field:** within +9 to +16 dB of Tx1m, the distance ramps down to 0 (the receiver is saturated).
-7. **Clamps:**
-   - Never more than the room diagonal.
-   - Rate of change limited to 0.3 m/s standing, or 1.6 × 2.5 m/s walking or unknown.
-8. **Confidence** = `stability × recency × sufficiency`, where stability = 1 − noiseVar/20 dB². Ordinary indoor noise already puts this around 0–0.2, so **nothing hard-gates on it**. It only weights BLE in the EKF.
+8. **Near-field:** within +9 to +16 dB of Tx1m, the distance ramps down to 0 (the receiver is saturated).
+9. **Clamps:** never more than the room diagonal. There is **no** m/s rate limit (`DISTANCE_SLEW_CLAMP: false`): range noise is multiplicative, so a linear limit biased every approach by +15–30%. The Kalman rate cap already rules out impossible jumps.
+10. **Confidence** = `stability × recency × sufficiency`, where stability = 1 − noiseVar/20 dB². Ordinary indoor noise already puts this around 0–0.2, so **nothing hard-gates on it**. It only weights BLE in the EKF.
 
-### 4.1 Two-stand calibration (`BeaconRangingCalibration.js`)
-Stand 1 m from Beacon 1, then 1 m from Beacon 2. Each stand gives both beacons a reading, one at 1 m and one at the known baseline *B*:
+### 4.1 Calibration fit (`PathLossCalibrator.fitModel`)
+All reference points (spot, two-stand, 1 m, manual) are stored with the calibration level `levelDb` (no body correction, no standing average) and, when known, their body-shadow fraction `shape`. The fit is a **regularised** least squares on `y = levelDb + 4·shape = Tx − 10·n·log10(d)`:
+- **Priors:** Tx ~ N(advertised or −59, 8 dB) and n ~ N(2.9, 0.4).
+- **Point noise:** 2 dB.
+- **What one point gives:** with a single point, Tx is already well fixed. Points spread over the room fit n as well.
+- **Limits:** n is limited to 1.6–4.5.
+
+### 4.2 Spot calibration (Fusion Map → "📐 Calibrate Distance Here")
+Tap where you stand, then stand still. The first 1.5 s are skipped, then 6 s are averaged (trimmed mean, at least 8 packets per beacon). The true distances come from the map (converted to slant distance when beacon height is set). Each beacon gets one point and is refitted. Taking a step during the measurement cancels it. 3–5 spots spread over the room gave the best simulated results.
+
+### 4.3 Two-stand calibration (`BeaconRangingCalibration.js`)
+Stand 1 m from Beacon 1, then 1 m from Beacon 2, **side-on** (the beacon at your shoulder). Facing one beacon puts the other behind you, which made the fitted n too steep (3.16 vs a true 2.6 in simulation). Each stand gives both beacons a reading, one at 1 m and one at the known baseline *B*:
 ```
 n    = (RSSI_near − RSSI_far) / (10·log10(B / 1 m))     clamped to 1.8–4.5
 Tx1m = RSSI_near                                        (exact fit when n isn't clamped)

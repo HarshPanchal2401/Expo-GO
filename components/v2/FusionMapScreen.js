@@ -58,6 +58,10 @@ import { v2Scanner } from "../../services/v2BeaconScannerService.js";
 import { checkRangeGeometry } from "../../services/BeaconRangingCalibration.js";
 import { metresToFeet, feetToMetres } from "../../services/PdrEngine.js";
 import { savePath, getSavedPaths, deleteSavedPath } from "../../PathStorage.js";
+import { RangeAutoCalibrator } from "../../services/RangeAutoCalibrator.js";
+import { RadioMap } from "../../services/RadioMap.js";
+import { simpleRanging, SMOOTH_PRESETS, DIST_SMOOTH_PRESETS } from "../../services/SimpleRanging.js";
+import { obstacleMap, OBSTACLE_TYPES, DEFAULT_PILLAR_RADIUS_FT } from "../../services/ObstacleMap.js";
 
 const FLOORPLAN_IMAGE = require("../../assets/floorplans/office-72x72.png");
 
@@ -65,7 +69,7 @@ const FLOORPLAN_IMAGE = require("../../assets/floorplans/office-72x72.png");
 // because an OTA update is only APPLIED on the next cold start after it
 // downloads, so "I published the fix and it still fails" is very often the
 // old bundle still running - this makes that visible instead of a guess.
-const ENGINE_TAG = "locate-v7";
+const ENGINE_TAG = "simple-range-v2";
 
 let ExpoUpdates = null;
 try {
@@ -148,12 +152,100 @@ const LOCATE_STALE_MS = 10000;
 // Which 1 m reference a beacon's distance is computed from. Shown on the map
 // because every distance scales with it, and "is this beacon calibrated?" is
 // otherwise invisible from here.
+// Spot calibration: settle after tapping, then average this long.
+const SPOT_SETTLE_MS = 1500;
+// Fastest screen redraw driven by BLE packets (see scheduleUiRefresh).
+const UI_REFRESH_MS = 200;
+const SPOT_WINDOW_MS = 6000;
+
+/**
+ * Fraction of the user's body loss that applies to a beacon: 0 when facing it,
+ * 1 when it is directly behind. Heading and bearing share the app convention
+ * (0 = map +Y, clockwise). Must match the shape the ranging engine was tuned on.
+ */
+function bodyShadowFraction(user, beacon, headingDeg) {
+  const bearing = (Math.atan2(beacon.x - user.x, beacon.y - user.y) * 180) / Math.PI;
+  const delta = ((headingDeg - bearing) * Math.PI) / 180;
+  return Math.max(0, Math.min(1, (-Math.cos(delta) + 0.2) / 1.2));
+}
+
 const describeTxSource = (b) => {
   if (!b?.id) return "";
   const tx = Number.isFinite(b.txPower1m) ? `${b.txPower1m} dBm` : "?";
-  if (b.txSource === "calibrated") return `✓ Calibrated · 1 m = ${tx} · n ${b.currentN}`;
+  const pts = b.calibrationPointsCount ? ` · ${b.calibrationPointsCount} pts` : "";
+  const body = b.bodyLossDb > 0.2 ? ` · body +${b.bodyLossDb.toFixed(1)} dB` : "";
+  const auto = b.autoPointsCount ? ` · ${b.autoPointsCount} auto` : "";
+  const walls = Math.abs(b.locationCorrectionDb) >= 0.5
+    ? ` · walls ${b.locationCorrectionDb > 0 ? "+" : ""}${b.locationCorrectionDb.toFixed(1)} dB` : "";
+  const sig = Number.isFinite(b.rangeSigmaM) ? ` · ±${b.rangeSigmaM.toFixed(1)} m` : "";
+  // RSSI@1m falls with distance (see DEFAULT_EXCESS_LOSS_DB_PER_M): show the
+  // drop per metre and the value in effect at the current range.
+  const slope = b.excessLossDbPerM > 0.05 ? ` −${b.excessLossDbPerM.toFixed(1)} dB/m` : "";
+  const now = slope && Number.isFinite(b.txAtDistance) && Number.isFinite(b.distanceM)
+    ? ` (now ${b.txAtDistance} @ ${b.distanceM.toFixed(1)} m)` : "";
+  if (b.txSource === "calibrated") return `✓ Calibrated · 1 m = ${tx}${slope}${now} · n ${b.currentN}${pts}${auto}${body}${walls}${sig}`;
   if (b.txSource === "advertised") return `Not calibrated · using beacon's own 1 m = ${tx}`;
   return `Not calibrated · default 1 m = ${tx} — run Ranging Calibration`;
+};
+/** Expected obstacle loss (dB) between p and beacon `anchor`, with that beacon's fitted losses. */
+function obstacleLossDb(beaconNum, p, anchor, sigmaFt = 0) {
+  if (!anchor || !p || !obstacleMap.items.length) return 0;
+  const losses = v2Scanner.getWallLosses(beaconNum) || undefined;
+  return obstacleMap.expectedLoss(p, anchor, sigmaFt || 0, losses).lossDb;
+}
+
+/** "1 wall, 1 pillar" for the path from p to a beacon. */
+function describeObstaclePath(p, anchor) {
+  if (!anchor || !p || !obstacleMap.items.length) return "";
+  const counts = obstacleMap.crossingCounts(p, anchor);
+  const parts = OBSTACLE_TYPES.map((t, i) => (counts[i] ? `${counts[i]} ${t.label.toLowerCase()}` : null)).filter(Boolean);
+  return parts.length ? parts.join(", ") : "clear line of sight";
+}
+
+/**
+ * Beacon distance for the Fusion Map: the SIMPLE calculation, the same as the
+ * Raw tab and Signal Lab - Kalman-smoothed RSSI, then
+ *   d = 10 ^ ((Measured Power - RSSI) / (10 n)).
+ * Everything after it (locating, the position solve, PDR + BLE fusion) is
+ * unchanged. Also returns a 1-sigma range uncertainty for the fusion filter:
+ * a level error of sigmaDb dB moves the distance by d * sigmaDb * ln10 / (10 n),
+ * so far beacons are trusted less. sigmaDb is the slow shadowing the Kalman
+ * filter cannot remove (raw packets: more).
+ */
+function simpleRange(num) {
+  const b = simpleRanging.getBeacon(num);
+  if (!Number.isFinite(b.distanceM)) return { m: null, sigmaM: null, b };
+  const sigmaDb = simpleRanging.settings.kalman ? 3 : 4.5;
+  return { m: b.distanceM, sigmaM: (b.distanceM * sigmaDb * Math.LN10) / (10 * b.n), b };
+}
+
+function describeSimple(num) {
+  const b = simpleRanging.getBeacon(num);
+  const st = simpleRanging.settings;
+  const filt = (st.kalman ? `RSSI Kalman ${(SMOOTH_PRESETS[st.smooth] || SMOOTH_PRESETS.medium).label}` : "raw RSSI") +
+    (st.distKalman ? ` · dist Kalman ${(DIST_SMOOTH_PRESETS[st.distSmooth] || DIST_SMOOTH_PRESETS.medium).label}` : "");
+  const rssi = Number.isFinite(b.used) ? `${b.used.toFixed(1)} dBm` : "no signal";
+  return `Simple · MP ${b.mp} dBm · n ${b.n} · ${filt} · RSSI ${rssi}`;
+}
+
+const AUTO_CAL_PAUSE_TEXT = {
+  "no-anchor": "tap 👆 Set My Start (or calibrate a spot), then walk",
+  drift: "walked far enough that the track is uncertain - set the start or calibrate a spot again",
+  "left-room": "track left the room - zero the heading, then set the start again",
+  "heading-not-zeroed": "zero the heading first, then set the start",
+  stopped: "navigation stopped",
+  relocating: "locating again",
+  disabled: "off",
+};
+const describeAutoCal = (st, headingOk) => {
+  if (!st.enabled) return "🔄 Auto-calibration: OFF (tap to turn on)";
+  const pts = `${st.points?.[1] || 0}+${st.points?.[2] || 0} points`;
+  if (st.active) {
+    return `🔄 Auto-calibrating while you walk · ${pts} · track ±${st.posSigmaM} m` +
+      (headingOk ? "" : " · zero the heading!");
+  }
+  return `🔄 Auto-calibration waiting: ${AUTO_CAL_PAUSE_TEXT[st.pausedReason] || st.pausedReason || "idle"}` +
+    (st.points?.[1] || st.points?.[2] ? ` · last walk ${pts}` : "");
 };
 const txSourceColor = (b) =>
   b?.txSource === "calibrated" ? C.accentGreen : b?.txSource === "advertised" ? C.accentOrange : C.accentRed;
@@ -314,6 +406,7 @@ function OfficeMapCanvas({
   pickMode = false,
   onMapTap,
   pendingPoint = null,
+  obstacles = [],
 }) {
   const {
     x, y, uncertaintyRadius, trail,
@@ -652,6 +745,33 @@ function OfficeMapCanvas({
           />
         )}
 
+        {/* ── Obstacles (walls, glass, pillars, cabinets) ──────────────────── */}
+        {obstacles.map((o) => {
+          const t = OBSTACLE_TYPES.find((k) => k.key === o.type);
+          const color = t?.color || C.textSecondary;
+          if (o.x1 !== undefined) {
+            const a = toScreen(o.x1, o.y1);
+            const b = toScreen(o.x2, o.y2);
+            return (
+              <Line
+                key={`ob-${o.id}`}
+                x1={a.cx} y1={a.cy} x2={b.cx} y2={b.cy}
+                stroke={color} strokeWidth={(o.type === "glass" ? 3 : 4.5) * inv}
+                strokeOpacity={0.9} strokeLinecap="round"
+                strokeDasharray={o.type === "glass" ? `${5 * inv},${3 * inv}` : undefined}
+              />
+            );
+          }
+          const c = toScreen(o.x, o.y);
+          return (
+            <Circle
+              key={`ob-${o.id}`}
+              cx={c.cx} cy={c.cy} r={(o.r || DEFAULT_PILLAR_RADIUS_FT) * transform.scale}
+              fill={color} fillOpacity={0.55} stroke={color} strokeWidth={1.5 * inv}
+            />
+          );
+        })}
+
         {/* ── Saved routes ─────────────────────────────────────────────────
             Drawn beneath the live trail, dashed, with a start dot and an end
             ring, so a recorded route is clearly a record and not the walk in
@@ -843,7 +963,7 @@ function OfficeMapCanvas({
 
 // ─── Main Screen ──────────────────────────────────────────────────────────────
 
-export default function FusionMapScreen({
+function FusionMapScreen({
   pdrStepCallbackRef,
   headingRef,
   onZeroHeading,
@@ -965,6 +1085,37 @@ export default function FusionMapScreen({
   const [locatedAt, setLocatedAt] = useState(0);
   // Start point tapped on the map in "picking", awaiting Start Here.
   const [pendingStart, setPendingStart] = useState(null);
+  // Spot calibration: { stage: "pick" | "measuring" | "done", point, startedAt, result }
+  const [spotCal, setSpotCal] = useState(null);
+  const [spotClock, setSpotClock] = useState(0);
+  // Auto-calibration: learns each beacon's distance model from the walked
+  // (PDR-only) track after a known position - see RangeAutoCalibrator.
+  // Radio map per beacon: walls, pillars and cabins, learned from calibration
+  // points measured at known places (see RadioMap.js).
+  const radioMapsRef = useRef(null);
+  if (!radioMapsRef.current) radioMapsRef.current = { 1: new RadioMap(), 2: new RadioMap(), ver: {} };
+  const [radioMapInfo, setRadioMapInfo] = useState({ 1: 0, 2: 0 });
+  // Obstacles drawn on the plan (see ObstacleMap.js). obstacleVer re-renders.
+  const [obstacleVer, setObstacleVer] = useState(0);
+  // Drawing mode: { type, first: {x,y}|null, erase: bool } or null.
+  const [obstacleEdit, setObstacleEdit] = useState(null);
+  const anchorsRef = useRef({ a1: null, a2: null });
+  const autoCalRef = useRef(null);
+  if (!autoCalRef.current) {
+    autoCalRef.current = new RangeAutoCalibrator({
+      getLevelWindow: (num, fromT, toT) => v2Scanner.getLevelWindow(num, fromT, toT),
+      addPoint: (num, dM, level, shape, sigmaDb, at) =>
+        v2Scanner.addAutoCalibrationPoint(
+          num, dM, level, shape, sigmaDb, at,
+          radioMapsRef.current[num].query(at?.x, at?.y).meanDb
+        ),
+      getModel: (num) => v2Scanner.getRangingModel(num),
+      save: () => v2Scanner.saveCalibrations(),
+    });
+  }
+  const [autoCalStatus, setAutoCalStatus] = useState(() => autoCalRef.current.getStatus());
+  // Packet count at the last BLE correction, so each packet corrects once.
+  const lastCorrectPacketsRef = useRef(-1);
   // Packet counter at the last locating sample, so each packet is used once.
   const lastLocatePacketsRef = useRef(-1);
   // Result of the cold-start solve, surfaced so the map can explain an
@@ -1021,10 +1172,39 @@ export default function FusionMapScreen({
     })();
   }, []);
 
+  // ── Screen refresh, decoupled from the packet rate ─────────────────────────
+  // Every BLE packet still updates the engine, but the screen is redrawn at
+  // most UI_REFRESH_MS apart (with a trailing redraw so the last value always
+  // shows). Redrawing this large screen on every packet saturated the JS
+  // thread, which is what froze the UI and made the distances look stuck.
+  const latestStatsRef = useRef(null);
+  const uiRefreshRef = useRef({ last: 0, timer: null });
+  const flushUi = useCallback(() => {
+    uiRefreshRef.current.last = Date.now();
+    uiRefreshRef.current.timer = null;
+    const st = latestStatsRef.current;
+    if (st) setBleStats({ b1: st.b1, b2: st.b2 });
+    setFusionState({ ...fusionEngine.getState() });
+  }, []);
+  const scheduleUiRefresh = useCallback(() => {
+    const r = uiRefreshRef.current;
+    if (r.timer) return;
+    const wait = UI_REFRESH_MS - (Date.now() - r.last);
+    if (wait <= 0) flushUi();
+    else r.timer = setTimeout(flushUi, wait);
+  }, [flushUi]);
+  useEffect(() => () => clearTimeout(uiRefreshRef.current.timer), []);
+
+  // ── Simple distance calculation: make sure it is running (it listens to the
+  // scanner's packets) even if the Raw / Signal Lab tabs were never opened.
+  // Settings changed on those tabs (n, Measured Power, Kalman) redraw here.
+  useEffect(() => simpleRanging.subscribe(() => scheduleUiRefresh()), [scheduleUiRefresh]);
+
   // ── BLE stats subscription: convert metres -> feet at this single boundary ──
   useEffect(() => {
     statsUnsubRef.current = v2Scanner.subscribeStats((stats) => {
-      setBleStats({ b1: stats.b1, b2: stats.b2 });
+      latestStatsRef.current = stats;
+      scheduleUiRefresh();
 
       if (!isRunning || placementMode) return;
       // Choosing on the map: the user is deciding the start, so BLE must not.
@@ -1032,8 +1212,12 @@ export default function FusionMapScreen({
       // overwrite the choice with a single-packet guess.
       if (navPhase === "picking") return;
 
-      const d1Ft = Number.isFinite(stats.b1?.distanceM) ? metresToFeet(stats.b1.distanceM) : null;
-      const d2Ft = Number.isFinite(stats.b2?.distanceM) ? metresToFeet(stats.b2.distanceM) : null;
+      // Distances from the simple calculation (see simpleRange); confidence,
+      // packet counts and freshness still come from the scanner.
+      const r1 = simpleRange(1);
+      const r2 = simpleRange(2);
+      const d1Ft = Number.isFinite(r1.m) ? metresToFeet(r1.m) : null;
+      const d2Ft = Number.isFinite(r2.m) ? metresToFeet(r2.m) : null;
       const c1 = stats.b1?.confidenceScore ?? 0;
       const c2 = stats.b2?.confidenceScore ?? 0;
       if (!Number.isFinite(d1Ft) || !Number.isFinite(d2Ft)) return;
@@ -1057,7 +1241,7 @@ export default function FusionMapScreen({
         const r = fusionEngine.feedLocatingSample(d1Ft, d2Ft, c1, c2);
         setLocProgress(r);
         if (r.done && r.fix?.position) completeLocating(r.fix);
-        setFusionState({ ...fusionEngine.getState() });
+        scheduleUiRefresh();
         return;
       }
 
@@ -1078,7 +1262,7 @@ export default function FusionMapScreen({
         if (init.position) {
           coldStartDoneRef.current = true;
           setInitialFix(init);
-          setFusionState({ ...fusionEngine.getState() });
+          scheduleUiRefresh();
           return; // this packet was consumed by the cold-start placement
         }
         // Not confident enough yet — keep waiting rather than committing to a
@@ -1087,11 +1271,161 @@ export default function FusionMapScreen({
         return;
       }
 
-      fusionEngine.correct(d1Ft, d2Ft, c1, c2);
-      setFusionState({ ...fusionEngine.getState() });
+      // One correction per NEW packet. Stats are re-emitted on every scanned
+      // device's packet (and on UI events), so the same pair of ranges used to
+      // be applied many times over. Each repeat shrank the uncertainty as if it
+      // were fresh evidence, so BLE was trusted far more than it deserved and
+      // the dot jumped with every wobble of the ranges.
+      const packets = (stats.b1?.totalPackets ?? 0) + (stats.b2?.totalPackets ?? 0);
+      if (packets === lastCorrectPacketsRef.current) return;
+      lastCorrectPacketsRef.current = packets;
+      // Range uncertainty (grows with distance; shrinks where the radio map
+      // has data) so far, doubtful ranges pull the position less.
+      const s1 = Number.isFinite(r1.sigmaM) ? metresToFeet(r1.sigmaM) : null;
+      const s2 = Number.isFinite(r2.sigmaM) ? metresToFeet(r2.sigmaM) : null;
+      fusionEngine.correct(d1Ft, d2Ft, c1, c2, s1, s2);
+      scheduleUiRefresh();
     });
     return () => statsUnsubRef.current?.();
   }, [isRunning, navPhase, placementMode, anchor1, anchor2]);
+
+  // ── Body shadow → ranging engine ───────────────────────────────────────────
+  // Needs a known position and a heading aligned to the map. 4 Hz is plenty:
+  // the fraction only changes as fast as the user turns or walks round.
+  useEffect(() => {
+    if (!headingCalibrated) return undefined;
+    const id = setInterval(() => {
+      let user = null;
+      if (spotCal?.point && spotCal.stage !== "done") user = spotCal.point;
+      else if (navPhase === "navigating" || navPhase === "located") {
+        const st = fusionEngine.getState();
+        user = { x: st.x, y: st.y };
+      }
+      const h = headingRef?.current;
+      if (!user || !Number.isFinite(h)) return;
+      v2Scanner.setBodyShadow({
+        b1: bodyShadowFraction(user, anchor1, h),
+        b2: bodyShadowFraction(user, anchor2, h),
+      });
+    }, 250);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [headingCalibrated, navPhase, spotCal?.stage, spotCal?.point, anchor1, anchor2]);
+
+  anchorsRef.current = { a1: anchor1, a2: anchor2 };
+
+  // ── Obstacles: load once; push geometry to the calibration and locating ───
+  useEffect(() => {
+    obstacleMap.load().then(() => setObstacleVer((v) => v + 1));
+  }, []);
+  const beaconIdKey = `${bleStats.b1?.id || ""}|${bleStats.b2?.id || ""}`;
+  useEffect(() => {
+    v2Scanner.setObstacleGeometry(obstacleMap, anchor1, anchor2);
+    // Locating: the factor each range is shortened by at a candidate place,
+    // for what the obstacles AND the radio map say is lost between there and
+    // the beacon (see FusionEngine._solveWithObstacles).
+    fusionEngine.setRangeCorrector((x, y) => {
+      const out = {};
+      for (const [num, key, a] of [[1, "f1", anchor1], [2, "f2", anchor2]]) {
+        const L = obstacleLossDb(num, { x, y }, a, 3) - radioMapsRef.current[num].query(x, y).meanDb;
+        // Same n as the distances themselves (simple calculation).
+        const n = simpleRanging.pathLossN(num) || 2.9;
+        out[key] = Math.pow(10, -L / (10 * n));
+      }
+      return out;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [obstacleVer, anchor1, anchor2, beaconIdKey]);
+
+  // ── Radio map → ranging engine (4 Hz) ──────────────────────────────────────
+  // Rebuilds a beacon's map whenever its model was refitted, and feeds the
+  // correction at the user's current position. Without a known position (idle,
+  // locating) nothing is applied and ranging uses the plain distance model.
+  useEffect(() => {
+    const id = setInterval(() => {
+      const maps = radioMapsRef.current;
+      let changed = false;
+      for (const num of [1, 2]) {
+        const ver = v2Scanner.getCalibrationVersion(num);
+        if (maps.ver[num] !== ver) {
+          maps.ver[num] = ver;
+          maps[num].build(v2Scanner.getRadioMapPoints(num));
+          changed = true;
+        }
+      }
+      if (changed) setRadioMapInfo({ 1: maps[1].pts.length, 2: maps[2].pts.length });
+      const phase = navPhaseRef.current;
+      if (phase !== "navigating" && phase !== "located") return;
+      const st = fusionEngine.getState();
+      const corr = {};
+      const { a1, a2 } = anchorsRef.current;
+      for (const [num, key, a] of [[1, "b1", a1], [2, "b2", a2]]) {
+        const q = maps[num].query(st.x, st.y);
+        // Obstacles between here and the beacon (added back), then whatever
+        // the radio map has measured on top of them (residual = measured -
+        // model, so minus it). Averaged over the position uncertainty so the
+        // correction changes smoothly as the estimate crosses a wall.
+        const wallDb = obstacleLossDb(num, st, a, st.uncertaintyRadius);
+        corr[key] = { db: wallDb - q.meanDb, sdDb: Math.sqrt(q.sdDb ** 2 + 2.25), wallDb };
+      }
+      v2Scanner.setLocationCorrection(corr);
+    }, 250);
+    return () => clearInterval(id);
+  }, []);
+
+  // ── Auto-calibration: geometry, and a 4 Hz tick that records points ───────
+  useEffect(() => {
+    autoCalRef.current.setGeometry(anchor1, anchor2, roomW, roomH);
+  }, [anchor1, anchor2, roomW, roomH]);
+  useEffect(() => {
+    const ac = autoCalRef.current;
+    const id = setInterval(() => {
+      const wasActive = ac.active;
+      const added = ac.tick(Date.now());
+      if (added.length || wasActive !== ac.active) setAutoCalStatus(ac.getStatus());
+    }, 250);
+    return () => clearInterval(id);
+  }, []);
+
+  // ── Spot calibration: wait while the user stands still, then record ────────
+  useEffect(() => {
+    if (spotCal?.stage !== "measuring") return undefined;
+    const id = setInterval(() => {
+      const now = Date.now();
+      setSpotClock(now);
+      const startedAt = spotCal.startedAt;
+      // Moving spoils it: the point was measured somewhere else.
+      if (Number.isFinite(v2Scanner._lastStepAt) && v2Scanner._lastStepAt > startedAt + 500) {
+        setSpotCal((c) => c && { ...c, stage: "done", result: { ok: false, moved: true } });
+        return;
+      }
+      if (now - startedAt < SPOT_SETTLE_MS + SPOT_WINDOW_MS) return;
+      // 1 m calibration: this beacon's own RSSI@1m, measured.
+      if (spotCal.oneMeter) {
+        const num = spotCal.oneMeter;
+        const key = num === 1 ? "b1" : "b2";
+        const avg = v2Scanner.getRecentRangingLevel(num, SPOT_WINDOW_MS);
+        let r;
+        if (!avg.ok) r = { ok: false, error: avg.error };
+        else {
+          const res = v2Scanner.set1MeterTxPower(num, avg.level, { measured: true });
+          r = { ok: true, oneMeter: true, txPower1m: res.txPower1m, unsteady: avg.sigmaDb > 6 };
+        }
+        setSpotCal((c) => c && { ...c, stage: "done", result: { ok: r.ok, beacons: { [key]: r } } });
+        return;
+      }
+      const toM = (a) => feetToMetres(Math.hypot(spotCal.point.x - a.x, spotCal.point.y - a.y));
+      const result = v2Scanner.addSpotCalibration({ b1: toM(anchor1), b2: toM(anchor2) }, SPOT_WINDOW_MS, spotCal.point);
+      // The user is standing exactly here: walking on from it auto-calibrates.
+      if (result?.ok) {
+        autoCalRef.current.setAnchor(spotCal.point.x, spotCal.point.y, "spot", now);
+        setAutoCalStatus(autoCalRef.current.getStatus());
+      }
+      setSpotCal((c) => c && { ...c, stage: "done", result });
+    }, 250);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [spotCal?.stage]);
 
   // ── PDR step hook: convert metres -> feet at this single boundary ──
   useEffect(() => {
@@ -1101,6 +1435,14 @@ export default function FusionMapScreen({
         // meant to be standing still, and feeding steps in would move the very
         // position being measured.
         if (placementMode) return;
+        // Auto-calibration's own PDR-only track. Needs the heading aligned to
+        // the map, or every step goes the wrong way.
+        const ac = autoCalRef.current;
+        if (ac.active) {
+          if (headingCalibratedRef.current) ac.onStep(stepLengthMeters, heading, Date.now());
+          else ac.stop("heading-not-zeroed");
+          if (!ac.active) setAutoCalStatus(ac.getStatus());
+        }
         // Walking during locating ends it: from here on the ranges describe a
         // moving position, so waiting longer would only blur the fix. Commit
         // what has been collected and let this step be the first one tracked.
@@ -1207,6 +1549,13 @@ export default function FusionMapScreen({
    * @returns true (navigation has started).
    */
   const completeLocating = (fix) => {
+    // A start chosen on the map starts an auto-calibration track. A BLE fix
+    // does not: it comes from the very ranges being calibrated, so learning
+    // from it would only confirm their errors.
+    if (fix?.position && fix.status === "manual") {
+      autoCalRef.current.setAnchor(fix.position.x, fix.position.y, "manual");
+      setAutoCalStatus(autoCalRef.current.getStatus());
+    }
     setInitialFix(fix);
     coldStartDoneRef.current = true;
     setLocProgress(null);
@@ -1296,7 +1645,37 @@ export default function FusionMapScreen({
     setNavPhase("picking");
   };
 
+  const handleStartSpotCal = () => setSpotCal({ stage: "pick", point: null });
+
+  const obstaclesChanged = () => {
+    obstacleMap.save();
+    setObstacleVer((v) => v + 1);
+  };
+
   const handleMapTap = (xFt, yFt) => {
+    if (obstacleEdit) {
+      const t = OBSTACLE_TYPES.find((k) => k.key === obstacleEdit.type);
+      if (obstacleEdit.erase) {
+        if (obstacleMap.removeNear(xFt, yFt)) obstaclesChanged();
+      } else if (t?.point) {
+        obstacleMap.add({ type: t.key, x: xFt, y: yFt, r: DEFAULT_PILLAR_RADIUS_FT });
+        obstaclesChanged();
+      } else if (!obstacleEdit.first) {
+        setObstacleEdit({ ...obstacleEdit, first: { x: xFt, y: yFt } });
+      } else {
+        const f = obstacleEdit.first;
+        if (Math.hypot(f.x - xFt, f.y - yFt) >= 1) {
+          obstacleMap.add({ type: t.key, x1: f.x, y1: f.y, x2: xFt, y2: yFt });
+          obstaclesChanged();
+        }
+        setObstacleEdit({ ...obstacleEdit, first: null });
+      }
+      return;
+    }
+    if (spotCal?.stage === "pick") {
+      setSpotCal({ stage: "measuring", point: { x: xFt, y: yFt }, startedAt: Date.now() });
+      return;
+    }
     if (navPhase === "locating") {
       // Tapping while beacons are still deciding means "I know where I am".
       fusionEngine.cancelLocating();
@@ -1326,6 +1705,8 @@ export default function FusionMapScreen({
   };
 
   const handleStop = () => {
+    autoCalRef.current.stop("stopped");
+    setAutoCalStatus(autoCalRef.current.getStatus());
     setPendingStart(null);
     fusionEngine.cancelLocating();
     setNavPhase("idle");
@@ -1334,6 +1715,8 @@ export default function FusionMapScreen({
 
   /** Throws away the current fix and locates again from scratch. */
   const handleReLocate = () => {
+    autoCalRef.current.stop("relocating");
+    setAutoCalStatus(autoCalRef.current.getStatus());
     coldStartDoneRef.current = false;
     setInitialFix(null);
     setLocProgress(null);
@@ -1377,8 +1760,10 @@ export default function FusionMapScreen({
   }
 
   const { uncertaintyRadius, bleConfidence, pdrConfidence, stepCount, totalDistanceFt } = fusionState;
-  const d1Ft = Number.isFinite(bleStats.b1?.distanceM) ? metresToFeet(bleStats.b1.distanceM) : null;
-  const d2Ft = Number.isFinite(bleStats.b2?.distanceM) ? metresToFeet(bleStats.b2.distanceM) : null;
+  const sr1 = simpleRange(1).m;
+  const sr2 = simpleRange(2).m;
+  const d1Ft = Number.isFinite(sr1) ? metresToFeet(sr1) : null;
+  const d2Ft = Number.isFinite(sr2) ? metresToFeet(sr2) : null;
 
   // What locating is waiting on, per beacon: packets heard since it started
   // and how long since the last one. Without this a stalled locate looks the
@@ -1397,7 +1782,8 @@ export default function FusionMapScreen({
       const heard = Math.max(0, (b.totalPackets ?? 0) - base);
       const age = Number.isFinite(b.lastSeen) ? (now - b.lastSeen) / 1000 : null;
       const rate = start.t ? heard / Math.max(1, (now - start.t) / 1000) : 0;
-      const dist = Number.isFinite(b.distanceM) ? `${metresToFeet(b.distanceM).toFixed(1)} ft` : "—";
+      const sm = simpleRange(k).m;
+      const dist = Number.isFinite(sm) ? `${metresToFeet(sm).toFixed(1)} ft` : "—";
       const quiet = age === null || age * 1000 > LOCATE_STALE_MS;
       lines.push({
         key: k,
@@ -1538,6 +1924,145 @@ export default function FusionMapScreen({
           Standing still for a few seconds is what buys the accurate fix, so the
           reason for the wait is stated plainly and the progress is visible —
           otherwise it just looks like the app is slow to respond. */}
+      {obstacleEdit && (
+        <View style={[styles.statusBanner, styles.fixBannerWaiting]}>
+          <Text style={styles.statusBannerText}>
+            {obstacleEdit.erase
+              ? "🧽 Tap an obstacle to remove it."
+              : OBSTACLE_TYPES.find((t) => t.key === obstacleEdit.type)?.point
+                ? "Tap the centre of each pillar / cabinet."
+                : obstacleEdit.first
+                  ? "Now tap where this wall ENDS."
+                  : "Tap where a wall STARTS, then where it ends. Draw every wall, glass cabin side and partition between desks and the beacons."}
+          </Text>
+          <View style={{ flexDirection: "row", flexWrap: "wrap", marginTop: 6 }}>
+            {OBSTACLE_TYPES.map((t) => {
+              const on = !obstacleEdit.erase && obstacleEdit.type === t.key;
+              return (
+                <TouchableOpacity
+                  key={t.key}
+                  onPress={() => setObstacleEdit({ type: t.key, first: null, erase: false })}
+                  style={[styles.secondaryBtn, { paddingVertical: 6, paddingHorizontal: 8, marginRight: 6, marginBottom: 6, borderColor: on ? t.color : undefined, borderWidth: on ? 2 : undefined }]}
+                >
+                  <Text style={[styles.secondaryBtnText, { fontSize: 12, color: on ? t.color : C.textSecondary }]}>{t.icon} {t.label}</Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+          <View style={{ flexDirection: "row" }}>
+            <TouchableOpacity
+              style={[styles.secondaryBtn, { flex: 1, marginRight: 6, paddingVertical: 8 }]}
+              onPress={() => { if (obstacleMap.removeLast()) obstaclesChanged(); }}
+            >
+              <Text style={styles.secondaryBtnText}>↶ Undo</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.secondaryBtn, { flex: 1, marginRight: 6, paddingVertical: 8 }]}
+              onPress={() => setObstacleEdit({ ...obstacleEdit, first: null, erase: !obstacleEdit.erase })}
+            >
+              <Text style={styles.secondaryBtnText}>{obstacleEdit.erase ? "✏ Draw" : "🧽 Erase"}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[styles.primaryBtn, { flex: 1, paddingVertical: 8 }]} onPress={() => setObstacleEdit(null)}>
+              <Text style={styles.primaryBtnText}>Done ({obstacleMap.items.length})</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
+
+      {spotCal && (
+        <View
+          style={[
+            styles.statusBanner,
+            spotCal.stage === "done" && !spotCal.result?.ok ? styles.fixBannerWarn
+              : spotCal.stage === "done" ? styles.fixBannerReady
+              : styles.fixBannerWaiting,
+          ]}
+        >
+          {spotCal.stage === "pick" && (
+            <>
+              <Text style={styles.statusBannerText}>
+                📐 Distance calibration: tap the exact spot where you are standing (zoom in with +
+                for precision). Then hold the phone at chest height and stand still for 8 s.
+                {!headingCalibrated ? " Tip: zero the heading first, so your body's effect can be accounted for." : ""}
+              </Text>
+              <Text style={[styles.locateDiag, { color: C.textPrimary }]}>
+                Do this first, once per beacon: stand exactly 1 m in front of it (measure with a tape),
+                facing it, phone at chest height, and tap:
+              </Text>
+              <View style={{ flexDirection: "row", marginTop: 6 }}>
+                {[1, 2].map((num) => (
+                  <TouchableOpacity
+                    key={num}
+                    style={[styles.secondaryBtn, { flex: 1, marginRight: num === 1 ? 8 : 0, paddingVertical: 8 }]}
+                    onPress={() => setSpotCal({ stage: "measuring", oneMeter: num, point: null, startedAt: Date.now() })}
+                  >
+                    <Text style={styles.secondaryBtnText}>📏 I'm 1 m from B{num}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </>
+          )}
+          {spotCal.stage === "measuring" && (() => {
+            const el = Math.max(0, (spotClock || Date.now()) - spotCal.startedAt);
+            const left = Math.max(0, Math.ceil((SPOT_SETTLE_MS + SPOT_WINDOW_MS - el) / 1000));
+            return (
+              <>
+                <Text style={styles.statusBannerText}>
+                  📐 Measuring — stand still… {left} s
+                </Text>
+                <View style={styles.locateTrack}>
+                  <View
+                    style={[
+                      styles.locateBar,
+                      { width: `${Math.min(100, Math.round((el / (SPOT_SETTLE_MS + SPOT_WINDOW_MS)) * 100))}%` },
+                    ]}
+                  />
+                </View>
+              </>
+            );
+          })()}
+          {spotCal.stage === "done" && (
+            <>
+              {spotCal.result?.moved ? (
+                <Text style={styles.statusBannerText}>
+                  ⚠ You moved during the measurement, so it was not used. Stand still and try again.
+                </Text>
+              ) : (
+                [["b1", 1], ["b2", 2]].map(([k, n]) => {
+                  const r = spotCal.result?.beacons?.[k];
+                  if (spotCal.oneMeter && spotCal.oneMeter !== n) return null;
+                  return (
+                    <Text key={k} style={styles.statusBannerText}>
+                      {r?.ok && r.oneMeter
+                        ? `✓ B${n}: RSSI@1m measured = ${r.txPower1m} dBm (its own value)${r.unsteady ? " — signal was unsteady, consider repeating" : ""}`
+                        : r?.ok
+                        ? `✓ B${n}: ${r.distanceM.toFixed(1)} m away → 1 m = ${r.txPower1m} dBm, n ${r.n} (${r.points} point${r.points === 1 ? "" : "s"})${r.unsteady ? " — signal was unsteady, consider repeating" : ""}`
+                        : `⚠ B${n}: ${r?.error || "not recorded"}`}
+                    </Text>
+                  );
+                })
+              )}
+              <Text style={[styles.locateDiag, { color: C.textPrimary }]}>
+                Repeat at 3–5 spots spread over the room (near and far from each beacon) for the best accuracy.
+              </Text>
+              <View style={{ flexDirection: "row", marginTop: 8 }}>
+                <TouchableOpacity style={[styles.secondaryBtn, { flex: 1, marginRight: 8, paddingVertical: 10 }]} onPress={() => setSpotCal(null)}>
+                  <Text style={styles.secondaryBtnText}>Done</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={[styles.primaryBtn, { flex: 1, paddingVertical: 10 }]} onPress={handleStartSpotCal}>
+                  <Text style={styles.primaryBtnText}>📐 Another Spot</Text>
+                </TouchableOpacity>
+              </View>
+            </>
+          )}
+          {spotCal.stage !== "done" && (
+            <TouchableOpacity style={{ marginTop: 6 }} onPress={() => setSpotCal(null)}>
+              <Text style={[styles.locateDiag, { color: C.accent }]}>Cancel</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      )}
+
       {navPhase === "picking" && (
         <View style={[styles.statusBanner, styles.fixBannerWaiting]}>
           <Text style={styles.statusBannerText}>
@@ -1711,13 +2236,22 @@ export default function FusionMapScreen({
         onAnimateView={animateView}
         onGestureActive={setMapGestureActive}
         navPhase={navPhase}
+        obstacles={obstacleMap.items}
         pickMode={
+          Boolean(obstacleEdit) ||
+          spotCal?.stage === "pick" ||
           navPhase === "picking" ||
           navPhase === "locating" ||
           (navPhase === "navigating" && fusionState.positionAmbiguous)
         }
         onMapTap={handleMapTap}
-        pendingPoint={navPhase === "picking" ? pendingStart : null}
+        pendingPoint={
+          obstacleEdit?.first
+            ? obstacleEdit.first
+            : spotCal?.point && spotCal.stage !== "done"
+            ? spotCal.point
+            : navPhase === "picking" ? pendingStart : null
+        }
         savedRoutesOnMap={savedRoutes
           .filter((r) => shownRouteIds.has(r.id) && isFusionMapRoute(r))
           .map((r) => ({ id: r.id, points: r.points, color: routeColor(r.id) }))}
@@ -1796,6 +2330,21 @@ export default function FusionMapScreen({
       {!placementMode && navPhase === "idle" && (
         <TouchableOpacity style={[styles.secondaryBtn, { marginBottom: 12 }]} onPress={handleStartPicking}>
           <Text style={styles.secondaryBtnText}>👆 Set My Start on the Map</Text>
+        </TouchableOpacity>
+      )}
+      {!placementMode && navPhase === "idle" && !spotCal && (
+        <TouchableOpacity style={[styles.secondaryBtn, { marginBottom: 12 }]} onPress={handleStartSpotCal}>
+          <Text style={styles.secondaryBtnText}>📐 Calibrate Distance Here</Text>
+        </TouchableOpacity>
+      )}
+      {!placementMode && !obstacleEdit && !spotCal && (navPhase === "idle" || navPhase === "navigating") && (
+        <TouchableOpacity
+          style={[styles.secondaryBtn, { marginBottom: 12 }]}
+          onPress={() => setObstacleEdit({ type: "wall", first: null, erase: false })}
+        >
+          <Text style={styles.secondaryBtnText}>
+            🧱 Draw Walls / Pillars / Cabins ({obstacleMap.items.length} drawn)
+          </Text>
         </TouchableOpacity>
       )}
 
@@ -1929,6 +2478,34 @@ export default function FusionMapScreen({
           <View style={styles.card}>
             <Text style={styles.cardTitle}>Beacon Info</Text>
             <Text style={styles.locateDiag}>{describeRunningBundle()}</Text>
+            <TouchableOpacity
+              onPress={() => {
+                autoCalRef.current.setEnabled(!autoCalStatus.enabled);
+                setAutoCalStatus(autoCalRef.current.getStatus());
+              }}
+            >
+              <Text style={[styles.locateDiag, { color: autoCalStatus.active ? C.accentGreen : C.textSecondary }]}>
+                {describeAutoCal(autoCalStatus, headingCalibrated)}
+              </Text>
+            </TouchableOpacity>
+            <Text style={styles.locateDiag}>
+              {obstacleMap.items.length
+                ? (() => {
+                    const names = OBSTACLE_TYPES.map((t) => t.label.split(" ")[0].toLowerCase());
+                    const fmt = (num) => {
+                      const w = v2Scanner.getWallLosses(num);
+                      return w ? w.map((v, i) => `${names[i]} ${v}`).join(", ") : "—";
+                    };
+                    const here = navPhase === "navigating"
+                      ? ` · now B1: ${describeObstaclePath(fusionState, anchor1)}${fusionState.nlos?.b1 ? " ⚠blocked?" : ""}` +
+                        ` · B2: ${describeObstaclePath(fusionState, anchor2)}${fusionState.nlos?.b2 ? " ⚠blocked?" : ""}`
+                      : "";
+                    return `🧱 Obstacle loss (dB) B1: ${fmt(1)} | B2: ${fmt(2)}${here}\n`;
+                  })()
+                : "🧱 No obstacles drawn - draw walls, cabins and pillars so distances through them are corrected\n"}
+              {`🗺 Radio map (walls/pillars): B1 ${radioMapInfo[1]} · B2 ${radioMapInfo[2]} surveyed points` +
+                (radioMapInfo[1] + radioMapInfo[2] < 20 ? " — do 📐 spot calibrations around the office to build it" : "")}
+            </Text>
             <View style={styles.beaconInfoRow}>
               <View style={[styles.beaconChip, { borderColor: C.beacon1 }]}>
                 <Text style={[styles.beaconChipLabel, { color: C.beacon1 }]}>
@@ -1937,8 +2514,8 @@ export default function FusionMapScreen({
                 <Text style={styles.beaconChipValue}>
                   {bleStats.b1?.name || "—"} • {bleStats.b1?.rawRssi != null ? `${bleStats.b1.rawRssi} dBm` : "no signal"}
                 </Text>
-                <Text style={[styles.beaconChipMeta, { color: txSourceColor(bleStats.b1) }]}>
-                  {describeTxSource(bleStats.b1)}
+                <Text style={[styles.beaconChipMeta, { color: C.accent }]}>
+                  {describeSimple(1)}
                 </Text>
               </View>
               <View style={[styles.beaconChip, { borderColor: C.beacon2 }]}>
@@ -1948,8 +2525,8 @@ export default function FusionMapScreen({
                 <Text style={styles.beaconChipValue}>
                   {bleStats.b2?.name || "—"} • {bleStats.b2?.rawRssi != null ? `${bleStats.b2.rawRssi} dBm` : "no signal"}
                 </Text>
-                <Text style={[styles.beaconChipMeta, { color: txSourceColor(bleStats.b2) }]}>
-                  {describeTxSource(bleStats.b2)}
+                <Text style={[styles.beaconChipMeta, { color: C.accent }]}>
+                  {describeSimple(2)}
                 </Text>
               </View>
             </View>
@@ -2138,3 +2715,7 @@ const styles = StyleSheet.create({
   beaconChipValue: { fontSize: 12, color: C.textMuted },
   beaconChipMeta: { fontSize: 10, marginTop: 3, fontWeight: "600" },
 });
+
+// Memoised: the app shell re-renders on its own state changes, and this
+// screen should only re-render when its own props or state change.
+export default React.memo(FusionMapScreen);

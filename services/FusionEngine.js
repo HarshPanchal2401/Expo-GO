@@ -381,7 +381,7 @@ export class FusionEngine {
       let provisional = null;
       if (this._accumulator.hasProvisional()) {
         const c = this._accumulator.consolidate();
-        const peek = solveInitialPosition({
+        const peek = this._solveWithObstacles({
           anchor1: this._anchor1, anchor2: this._anchor2,
           d1: c.d1, d2: c.d2, conf1: c.conf, conf2: c.conf,
           room: this._roomBounds(),
@@ -502,8 +502,57 @@ export class FusionEngine {
       : null;
   }
 
+  /**
+   * Obstacle correction for locating: (x, y) feet -> { f1, f2 }, the factor
+   * each measured range must be multiplied by at that place, because walls,
+   * pillars or cabins between there and the beacon made it read long (f < 1).
+   * Set by the Fusion Map from the drawn obstacles; null = none.
+   */
+  setRangeCorrector(fn) {
+    this._rangeCorrector = typeof fn === "function" ? fn : null;
+  }
+
+  /**
+   * Position from two ranges, accounting for obstacles: solve, look up which
+   * obstacles lie between that position and each beacon, shorten the ranges
+   * by what they cost, solve again - a few rounds converge. Each of the two
+   * mirror candidates is refined on its own, because the obstacles between a
+   * point and the beacons are different on the two sides of the baseline.
+   */
+  _solveWithObstacles(params) {
+    const first = solveInitialPosition(params);
+    if (!this._rangeCorrector || !first.position) return first;
+    const refine = (start) => {
+      let p = start;
+      let res = null;
+      for (let i = 0; i < 4; i++) {
+        const f = this._rangeCorrector(p.x, p.y) || {};
+        const f1 = Number.isFinite(f.f1) ? f.f1 : 1;
+        const f2 = Number.isFinite(f.f2) ? f.f2 : 1;
+        res = solveInitialPosition({ ...params, d1: params.d1 * f1, d2: params.d2 * f2, priorPosition: p });
+        if (!res.position) return null;
+        const moved = Math.hypot(res.position.x - p.x, res.position.y - p.y);
+        p = res.position;
+        if (moved < 0.3) break;
+      }
+      return res;
+    };
+    const a = refine(first.position);
+    if (!a) return first;
+    if (first.alternate) {
+      const b = refine(first.alternate);
+      if (b?.position && Math.hypot(b.position.x - a.position.x, b.position.y - a.position.y) > 2) {
+        a.alternate = b.position;
+      } else {
+        a.alternate = null;
+      }
+    }
+    a.obstacleCorrected = true;
+    return a;
+  }
+
   initializeFromBeacons({ d1, d2, conf1, conf2, keepPrior = false, measuredRangeSigmaFt = null, sampleCount = 1, averaged = false }) {
-    const result = solveInitialPosition({
+    const result = this._solveWithObstacles({
       anchor1: this._anchor1,
       anchor2: this._anchor2,
       d1, d2, conf1, conf2,
@@ -636,8 +685,10 @@ export class FusionEngine {
    * @param {number} d2  - Filtered distance to Beacon 2, in FEET
    * @param {number} c1  - Beacon 1 confidence [0, 1]
    * @param {number} c2  - Beacon 2 confidence [0, 1]
+   * @param {number} [s1] - 1-sigma uncertainty of d1, FEET (optional)
+   * @param {number} [s2] - 1-sigma uncertainty of d2, FEET (optional)
    */
-  correct(d1, d2, c1, c2) {
+  correct(d1, d2, c1, c2, s1 = null, s2 = null) {
     // Guard: both distances must be valid finite positives
     if (!Number.isFinite(d1) || !Number.isFinite(d2)) return;
     if (d1 <= 0 || d2 <= 0) return;
@@ -678,6 +729,30 @@ export class FusionEngine {
     // Physical sanity check: correct() is called on every BLE packet, so
     // the "implied speed" from the innovation should not exceed human running.
     let R = this._bleConfidenceToR(wTotal);
+    // Distance-aware noise: t_geom moves by (d_i / L) per foot of range error,
+    // and range error grows with range (1 dB is far more distance at 15 m than
+    // at 2 m). Confidence alone ignored that, so a far, uncertain beacon pulled
+    // the position as hard as a near one.
+    if (Number.isFinite(s1) && Number.isFinite(s2)) {
+      // Unmodelled obstruction (a person, a door, a wall not drawn): it can
+      // only make a range LONGER. A range far longer than the current position
+      // implies is therefore far more likely blocked than right, so it is
+      // trusted much less - while one SHORTER than expected keeps full weight.
+      // Gaussian noise, by contrast, would treat both directions the same and
+      // let every blockage drag the position away from that beacon.
+      const posSd = Math.sqrt((this._pxx + this._pyy) / 2);
+      const pred1 = Math.hypot(this._x - this._anchor1.x, this._y - this._anchor1.y);
+      const pred2 = Math.hypot(this._x - this._anchor2.x, this._y - this._anchor2.y);
+      const k = this._cfg.NLOS_GATE_SIGMA ?? 2.5;
+      const nlos1 = d1 - pred1 > k * Math.hypot(s1, posSd);
+      const nlos2 = d2 - pred2 > k * Math.hypot(s2, posSd);
+      const inflate = this._cfg.NLOS_SIGMA_INFLATE ?? 3;
+      const e1 = nlos1 ? s1 * inflate : s1;
+      const e2 = nlos2 ? s2 * inflate : s2;
+      this._lastNlos = { b1: nlos1, b2: nlos2 };
+      const rGeom = ((d1 * e1) ** 2 + (d2 * e2) ** 2) / (baselineLen ** 2);
+      R = Math.max(R, rGeom);
+    }
 
     // ── Short-baseline geometry penalty ─────────────────────────────────────
     // t_geom above divides by baselineLen, so RSSI-distance noise gets scaled
@@ -869,6 +944,8 @@ export class FusionEngine {
         && Date.now() - this._lastStepAt < this._cfg.STATIONARY_AFTER_MS,
       // Surfaced so the map can show BOTH possibilities rather than presenting
       // a coin-flip as if it were a fix. It clears itself once resolved.
+      // Which beacon's last range looked blocked (much longer than expected).
+      nlos: this._lastNlos || null,
       positionAmbiguous: this._alt !== null,
       alternatePosition: this._alt
         ? { x: Number(this._alt.x.toFixed(2)), y: Number(this._alt.y.toFixed(2)) }

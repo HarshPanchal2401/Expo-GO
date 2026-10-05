@@ -42,6 +42,7 @@
 // ============================================================================
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { OBSTACLE_TYPES, ObstacleMap } from "./ObstacleMap.js";
 
 // ============================================================================
 // CONFIGURABLE CONSTANTS (Deploy-time tuning parameters — no magic numbers)
@@ -99,6 +100,26 @@ export const DEFAULT_ADAPTIVE_CONFIG = {
   STATIONARY_TREND_MAX: 0.35,      // trendRatio below this = looks white
   STATIONARY_INNOV_SIGMA_MAX: 1.0, // mean|innovation| below this×σ = tracking well
   STATIONARY_Q_SCALE: 0.12,        // Q multiplier once confirmed stationary
+  // The whiteness test alone cannot see a STEADY walk: the constant-velocity
+  // model tracks a steady ramp exactly, so its innovations come out white and
+  // the gate declared "stationary" in the middle of walking away. That one
+  // misjudgement held the shadow envelope for 8 s and rate-limited the range
+  // to 0.3 m/s, which is why walking AWAY from a beacon lagged by many
+  // seconds while walking toward it did not. So a large rate state also
+  // rules stationarity out.
+  STATIONARY_MAX_RATE_DB_S: 1.0,
+  // Evidence that the filter is LAGGING a real change: innovations mostly of
+  // one sign and larger than the noise. Overrides a "standing still" verdict
+  // from the step detector, because the link changing steadily is proof the
+  // range is changing - e.g. the beacon is being carried away, or steps are
+  // simply not being detected.
+  LAG_TREND_MIN: 0.6,
+  LAG_INNOV_SIGMA_MIN: 1.0,
+  // ...but only once it has lasted this long. A body blocking the beacon is a
+  // single DROP that the filter catches up with in a second or two; a range
+  // that keeps changing keeps the filter lagging. Without this wait, every
+  // fade while standing was released as if it were movement.
+  LAG_OVERRIDE_MS: 2500,
 
   // ── Constant-VELOCITY Kalman (replaces the old constant-position model) ──
   // The old filter assumed RSSI was a constant being measured repeatedly. That
@@ -158,7 +179,118 @@ export const DEFAULT_ADAPTIVE_CONFIG = {
   ENVELOPE_MAX_DECAY_DB_S: 12.0,
   MOTION_STATE_TIMEOUT_MS: 2000,
   ENVELOPE_WEIGHT: 0.85,
+  // Trend release. A shadow fade is a DROP that then sits flat (or recovers);
+  // walking away is a fall that keeps going. Once the filter's own rate has
+  // stayed below -TREND_RELEASE_RATE for TREND_RELEASE_AFTER_MS, the envelope
+  // is released: it falls at least as fast as the signal plus closes the gap
+  // within ~TREND_CLOSE_S. Not applied while the step detector says the user
+  // is standing (the true range is then constant, so a fall IS a fade) unless
+  // the filter is visibly lagging a real change.
+  TREND_RELEASE_RATE_DB_S: 0.8,
+  TREND_RELEASE_AFTER_MS: 700,
+  TREND_CLOSE_S: 0.8,
   MAX_ENVELOPE_CORRECTION_DB: 9.0,
+
+  // ── Unified ranging (2026-10) ──────────────────────────────────────────────
+  // Measured against a simulated office (multipath fading, slow shadowing,
+  // channel offsets, packet loss and the user's own body), the envelope above
+  // turned out to be a source of the "sometimes too long, sometimes too short"
+  // error rather than a cure: its correction depends on the motion state, so
+  // the same spot ranged differently standing and walking, and a calibration
+  // taken standing was wrong once walking. It is still computed for the
+  // diagnostics, but no longer applied to ranging.
+  SHADOW_ENVELOPE_RANGING: false,
+
+  // The user's own body. A phone held in front of you with the beacon BEHIND
+  // you loses several dB through your torso, which reads as 30-80 % too far -
+  // the single largest ranging error measured. The app knows which way you
+  // face (heading) and where the beacon is relative to you (map), so it
+  // supplies the fraction of that loss that applies (0 facing, 1 directly
+  // behind) via setBodyShadow(), and the loss is added back before ranging.
+  // 4 dB is deliberately conservative: it beat no correction whether the real
+  // loss was 3, 7 or 11 dB, whereas assuming a larger value backfires when the
+  // real loss is small.
+  BODY_SHADOW_LOSS_DB: 4.0,
+  // A body-shadow fraction older than this is ignored (e.g. the Fusion Map is
+  // closed, so nothing knows the user's position any more).
+  BODY_SHADOW_STALE_MS: 3000,
+
+  // Standing still the true range is CONSTANT, so the best estimate is the
+  // average of everything since the user stopped. The averaging window grows
+  // from 0.5 s to this as the user keeps standing, and restarts instantly on a
+  // step or a turn. This replaced a 0.3 m/s rate limit, which was calm far
+  // from a beacon but let +-20 % through up close, and froze the reading for
+  // 15+ s after the user turned round.
+  STILL_AVERAGE_TAU_MAX_S: 10.0,
+  // ...unless the live level walks away from that average and stays away.
+  // Steps are not always detected (phone moved by hand, very slow walking),
+  // and without this escape the reading sat on the old value - "stuck".
+  STILL_RELEASE_DB: 3.0,
+  STILL_RELEASE_MS: 1200,
+
+  // Output smoothing in log-distance while NOT standing still. Range noise is
+  // multiplicative, so smoothing ln(d) is unbiased where smoothing metres is
+  // not. Time constant in seconds; 0 disables.
+  MOVING_SMOOTH_TAU_S: 1.0, // simulated best: walking jitter -35 %, no added lag; 1.5 s began to lag
+
+  // A metres-per-second limit on how fast the distance may change. Off: range
+  // noise is multiplicative, so a linear limit clips the upward spikes harder
+  // than the downward ones and biased every approach to a beacon by +15-30 %.
+  // The Kalman filter's own rate cap (MAX_RSSI_RATE_DB_S) already rules out
+  // physically impossible jumps.
+  DISTANCE_SLEW_CLAMP: false,
+
+  // Priors for the calibration fit (see PathLossCalibrator.fitModel). They
+  // let a single calibration point already fix the 1 m level, while several
+  // points spread over the room fit the decay too.
+  // 4 dB, not wider: auto-calibration points mostly lie several metres out,
+  // and with a loose prior the fit pushed RSSI@1m wherever the far points
+  // pulled it, ruining distances near the beacon (simulated: +45 % at < 4 m).
+  // The configured RSSI@1m (-59) was observed to be right close up, so it is
+  // trusted to about this much; points near the beacon still override it.
+  CALIB_PRIOR_TX_SIGMA_DB: 4.0,
+  CALIB_PRIOR_N_SIGMA: 0.4,
+  CALIB_POINT_SIGMA_DB: 2.0,
+
+  // ── Distance-dependent RSSI@1m (attenuation-factor model) ──────────────────
+  // Field observation: with n = 2.9 the RSSI@1m that gives the right answer
+  // is about -59/-60 dBm close to the beacon but about -73/-74 dBm at 10 m.
+  // One fixed RSSI@1m therefore cannot be right everywhere. Indoors every
+  // extra metre crosses more desks, partitions and people, each costing a few
+  // dB, so the loss grows with distance faster than the log-distance law
+  // alone. That is the attenuation-factor model (Seidel & Rappaport, 1992;
+  // ITU-R P.1238 uses the same idea per wall/floor):
+  //
+  //   RSSI(d) = A - 10 n log10(d) - alpha (d - 1)        (d >= 1 m)
+  //
+  // read the way it was observed: the "effective RSSI@1m" at distance d is
+  //   Tx_eff(d) = A - alpha (d - 1)
+  // i.e. it drops by alpha dB for every metre away.
+  //
+  // Default 0, learned per beacon. A fixed 1.5 dB/m (the value one 10 m test
+  // suggested) was tried and was wrong for the other beacon: with -59 @ 1 m
+  // and n 2.9 it turned a true 10 m into 5.7 m. That 10 m test went through
+  // walls, and walls are a property of the PATH, not of every metre - they
+  // are handled by the radio map (setLocationCorrection) instead.
+  DEFAULT_EXCESS_LOSS_DB_PER_M: 0,
+  EXCESS_LOSS_MAX_DB_PER_M: 3.0,
+  CALIB_PRIOR_ALPHA_SIGMA: 0.5,
+
+  // Location correction from the radio map (walls, pillars, cabins): dB to
+  // add at the user's current position, supplied by the Fusion Map. Ignored
+  // once older than this.
+  LOCATION_CORRECTION_STALE_MS: 3000,
+  // Typical error of a range level in dB where nothing better is known
+  // (office shadowing). The radio map lowers it where it has data. Turned
+  // into a distance uncertainty (rangeSigmaM) for the position filter, so a
+  // far beacon - where 1 dB is many centimetres - is trusted less.
+  RANGE_SIGMA_DB_DEFAULT: 5.0,
+  // Robust fit: points further than this many sigma from the model are
+  // down-weighted (Huber), so one reading taken while someone stood in the
+  // way cannot tilt the whole model.
+  CALIB_HUBER_K: 1.5,
+  // Auto-calibration points kept per beacon (oldest dropped first).
+  AUTO_CALIB_MAX_POINTS: 80,
 
   // Fallback path loss parameters if beacon is not individually calibrated.
   //
@@ -235,6 +367,80 @@ export const DEFAULT_ADAPTIVE_CONFIG = {
   MAX_PLAUSIBLE_DISTANCE_M: null,
 };
 
+
+// ============================================================================
+// PATH-LOSS MODEL (shared by calibrated and uncalibrated ranging)
+// ============================================================================
+
+/**
+ * Received level predicted at distance d (metres):
+ *   A - 10 n log10(d) - alpha * max(0, d - 1)
+ * A is RSSI@1m, n the log-distance exponent and alpha the extra loss per
+ * metre (see DEFAULT_EXCESS_LOSS_DB_PER_M).
+ */
+export function predictLevelDb(d, A, n, alpha = 0) {
+  const dd = Math.max(0.05, d);
+  return A - 10.0 * n * Math.log10(dd) - (alpha > 0 ? alpha * Math.max(0, dd - 1) : 0);
+}
+
+/**
+ * Inverse of predictLevelDb: the distance at which the model gives `level`.
+ * The model falls monotonically with distance, so there is exactly one
+ * answer; it is found by bisection on ln(d), which is exact to < 1 mm.
+ */
+export function solveDistanceM(level, A, n, alpha = 0, maxM = 200) {
+  const logOnly = Math.pow(10, (A - level) / (10.0 * n));
+  if (!(alpha > 0) || !(logOnly > 1)) return logOnly;
+  // The alpha term only lowers the predicted level, so the answer lies
+  // between 1 m and the log-only distance.
+  let lo = 0, hi = Math.log(Math.min(logOnly, maxM));
+  if (predictLevelDb(Math.exp(hi), A, n, alpha) > level) return Math.exp(hi);
+  for (let i = 0; i < 40; i++) {
+    const mid = 0.5 * (lo + hi);
+    if (predictLevelDb(Math.exp(mid), A, n, alpha) > level) lo = mid;
+    else hi = mid;
+  }
+  return Math.exp(0.5 * (lo + hi));
+}
+
+/** Solves M x = v by Gaussian elimination with partial pivoting; null if singular. */
+function solveLinear(M, v) {
+  const n = v.length;
+  const A = M.map((row, i) => [...row, v[i]]);
+  for (let c = 0; c < n; c++) {
+    let piv = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(A[r][c]) > Math.abs(A[piv][c])) piv = r;
+    if (!(Math.abs(A[piv][c]) > 1e-12)) return null;
+    [A[c], A[piv]] = [A[piv], A[c]];
+    for (let r = c + 1; r < n; r++) {
+      const f = A[r][c] / A[c][c];
+      for (let k = c; k <= n; k++) A[r][k] -= f * A[c][k];
+    }
+  }
+  const x = new Array(n).fill(0);
+  for (let r = n - 1; r >= 0; r--) {
+    let sum = A[r][n];
+    for (let k = r + 1; k < n; k++) sum -= A[r][k] * x[k];
+    x[r] = sum / A[r][r];
+  }
+  return x;
+}
+
+/** Solves the 3x3 system M x = v (Cramer's rule); null when singular. */
+function solve3x3(M, v) {
+  const det = (m) =>
+    m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+    m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+    m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+  const D = det(M);
+  if (!(Math.abs(D) > 1e-12)) return null;
+  return [0, 1, 2].map((k) => det(M.map((row, i) => row.map((x, j) => (j === k ? v[i] : x)))) / D);
+}
+
+/** The "RSSI@1m" that, with exponent n alone, gives the right answer at d. */
+export function effectiveTx1m(d, A, alpha = 0) {
+  return A - (alpha > 0 ? alpha * Math.max(0, d - 1) : 0);
+}
 
 // ============================================================================
 // 1. BEACON PROFILE
@@ -500,12 +706,17 @@ export class AdaptiveKalmanFilter {
     // A fresh PDR verdict overrides the internal estimate outright: a step
     // detector observes the user directly, whereas the innovation test can only
     // infer motion from a signal that shadowing corrupts in the same direction.
+    this.isLagging =
+      stats.count >= (config.STATIONARY_MIN_SAMPLES ?? 6) &&
+      stats.trendRatio > (config.LAG_TREND_MIN ?? 0.6) &&
+      stats.meanAbs > (config.LAG_INNOV_SIGMA_MIN ?? 1.0) * sigma;
     this.isStationary =
       motionHint !== null
-        ? !motionHint
+        ? !motionHint && !this.isLagging
         : stats.count >= (config.STATIONARY_MIN_SAMPLES ?? 6) &&
           stats.trendRatio < (config.STATIONARY_TREND_MAX ?? 0.35) &&
-          stats.meanAbs < (config.STATIONARY_INNOV_SIGMA_MAX ?? 1.0) * sigma;
+          stats.meanAbs < (config.STATIONARY_INNOV_SIGMA_MAX ?? 1.0) * sigma &&
+          Math.abs(this.v) < (config.STATIONARY_MAX_RATE_DB_S ?? 1.0);
 
     this.currentQ = this.isStationary
       ? qBase * noiseScale * (config.STATIONARY_Q_SCALE ?? 0.12)
@@ -567,6 +778,7 @@ export class AdaptiveKalmanFilter {
       r: Number(this.currentR.toFixed(2)),
       trendRatio: Number(this.trendRatio.toFixed(3)),
       isStationary: this.isStationary,
+      isLagging: Boolean(this.isLagging),
       errorCovariance: Number(this.p00.toFixed(4)),
     };
   }
@@ -615,8 +827,29 @@ export class PathLossCalibrator {
     this.referencePoints = []; // Array of { distanceM, rssi, timestamp }
     this.fittedN = DEFAULT_ADAPTIVE_CONFIG.DEFAULT_PATH_LOSS_N;
     this.fittedTxPower1m = DEFAULT_ADAPTIVE_CONFIG.DEFAULT_TX_POWER_1M;
+    // Extra loss per metre (see DEFAULT_EXCESS_LOSS_DB_PER_M).
+    this.fittedAlpha = DEFAULT_ADAPTIVE_CONFIG.DEFAULT_EXCESS_LOSS_DB_PER_M;
     this.rSquared = null;
     this.isCalibrated = false;
+    // Points collected automatically while walking (RangeAutoCalibrator):
+    // { distanceM, rssi, shape, sigmaDb, timestamp, source }. Kept apart from
+    // the hand-logged referencePoints so the calibration list stays readable.
+    this.autoPoints = [];
+    // Prior on A used by the last fit, reused by automatic refits.
+    this.priorTx = null;
+    // RSSI@1m typed by hand (or set by Match Beacons): a fixed value, NOT a
+    // measurement. It used to be saved as a measured point at 1 m, so a test
+    // value typed once (e.g. -73) silently bent the beacon's model for good.
+    this.txOverride = null;
+    // Bumped on every refit, so the radio map knows to rebuild.
+    this.version = 0;
+    // Loss per obstacle crossed (dB), OBSTACLE_TYPES order, fitted with A and
+    // n - see ObstacleMap.js. Starts at typical values.
+    this.fittedWallLoss = OBSTACLE_TYPES.map((t) => t.lossDb);
+    // (point {x,y} in feet) -> obstacle crossing counts between that point
+    // and this beacon. Set by the scanner from the drawn obstacles; null when
+    // nothing is drawn or the beacon's place on the plan is unknown.
+    this.wallFeatureFn = null;
 
     // Dual-slope far-field state (populated only when enough far points exist)
     this.breakpointDistanceM = breakpointDistanceM;
@@ -649,13 +882,159 @@ export class PathLossCalibrator {
    * @param {number} distanceM - Known physical distance in meters (e.g. 1.0, 3.0, 5.0)
    * @param {number} rssi - Measured average RSSI at that distance
    */
-  addReferencePoint(distanceM, rssi) {
+  addReferencePoint(distanceM, rssi, meta = {}) {
     if (!Number.isFinite(distanceM) || distanceM <= 0 || !Number.isFinite(rssi)) return;
-    this.referencePoints.push({
+    const point = {
       distanceM: Number(distanceM.toFixed(2)),
       rssi: Number(rssi.toFixed(1)),
       timestamp: Date.now(),
+    };
+    // Fraction of body loss that applied while this point was measured
+    // (0 = facing the beacon, 1 = beacon behind the user). Unknown = null,
+    // treated as 0, which is what the instructions for manual points ask for.
+    if (Number.isFinite(meta.shape)) point.shape = Number(meta.shape.toFixed(2));
+    if (meta.source) point.source = meta.source;
+    // Where on the floor plan it was measured (feet), for the radio map.
+    if (Number.isFinite(meta.x) && Number.isFinite(meta.y)) {
+      point.x = Number(meta.x.toFixed(1));
+      point.y = Number(meta.y.toFixed(1));
+      // How exactly that place is known (feet): a tap on the plan.
+      point.posSigmaFt = Number.isFinite(meta.posSigmaFt) ? meta.posSigmaFt : 1.0;
+    }
+    this.referencePoints.push(point);
+  }
+
+  /**
+   * Regularised, robust fit of RSSI = A - 10 n log10(d) - alpha (d - 1) over
+   * points whose level has had the body loss they were measured with added
+   * back. Each point is weighted by its own uncertainty (sigmaDb).
+   *
+   * Plain least squares needs well-separated distances before it means
+   * anything, and with only a few points one noisy reading swings the slope
+   * to an absurd value. Gaussian priors on A (weak), n and alpha (moderate)
+   * fix both: one point already gives a good 1 m level with the decay held
+   * near its prior, and as points spread over the room the data takes over.
+   * A few Huber reweighting passes then stop a single bad point (someone
+   * walked between phone and beacon) from tilting the model.
+   */
+  _ridgeFit(pts, opts = {}) {
+    const cfg = DEFAULT_ADAPTIVE_CONFIG;
+    const tx0 = Number.isFinite(opts.priorTx) ? opts.priorTx : cfg.DEFAULT_TX_POWER_1M;
+    const n0 = Number.isFinite(opts.priorN) ? opts.priorN : cfg.DEFAULT_PATH_LOSS_N;
+    const al0 = Number.isFinite(opts.priorAlpha) ? opts.priorAlpha : (cfg.DEFAULT_EXCESS_LOSS_DB_PER_M ?? 0);
+    const sTx = Number.isFinite(opts.priorTxSigma) ? opts.priorTxSigma : (cfg.CALIB_PRIOR_TX_SIGMA_DB ?? 8.0);
+    const sN = cfg.CALIB_PRIOR_N_SIGMA ?? 0.4;
+    const sAl = cfg.CALIB_PRIOR_ALPHA_SIGMA ?? 1.0;
+    const huberK = cfg.CALIB_HUBER_K ?? 1.5;
+    const s0 = cfg.CALIB_POINT_SIGMA_DB ?? 2.0;
+    const bodyDb = Number.isFinite(opts.bodyLossDb) ? opts.bodyLossDb : (cfg.BODY_SHADOW_LOSS_DB ?? 0);
+    // Parameters: [A, n, alpha, L_type0 .. L_typeK]. Model:
+    //   y = A - n * 10 log10(d) - alpha * max(0, d - 1) - SUM_k L_k * crossings_k
+    const prior = [
+      [tx0, sTx],
+      [n0, sN],
+      [al0, sAl],
+      ...OBSTACLE_TYPES.map((t) => [t.lossDb, t.sigmaDb]),
+    ];
+    const P = prior.length;
+    const rows = pts.map((p) => {
+      const c = this._countsFor(p);
+      return {
+        f: [1, -10.0 * Math.log10(p.distanceM), -Math.max(0, p.distanceM - 1), ...c.map((v) => -v)],
+        y: p.rssi + bodyDb * (Number.isFinite(p.shape) ? p.shape : 0),
+        s: Number.isFinite(p.sigmaDb) && p.sigmaDb > 0 ? p.sigmaDb : s0,
+        w: 1,
+      };
     });
+    // Parameters pinned at a floor (alpha >= 0, losses >= 0.5 dB) when the
+    // free fit wants them below it.
+    const floors = [null, null, 0, ...OBSTACLE_TYPES.map(() => 0.5)];
+    const pinned = new Set();
+    const solve = () => {
+      const M = Array.from({ length: P }, () => new Array(P).fill(0));
+      const v = new Array(P).fill(0);
+      prior.forEach(([mu, sd], i) => {
+        const [m, s] = pinned.has(i) ? [floors[i], 1e-3] : [mu, sd];
+        M[i][i] += 1 / s ** 2;
+        v[i] += m / s ** 2;
+      });
+      for (const r of rows) {
+        const w = r.w / r.s ** 2;
+        for (let i = 0; i < P; i++) {
+          if (r.f[i] === 0) continue;
+          v[i] += w * r.f[i] * r.y;
+          for (let j = 0; j < P; j++) M[i][j] += w * r.f[i] * r.f[j];
+        }
+      }
+      return solveLinear(M, v);
+    };
+    let theta = null;
+    for (let pass = 0; pass < 4; pass++) {
+      for (let guard = 0; guard < P; guard++) {
+        theta = solve();
+        if (!theta) return null;
+        const low = theta.findIndex((x, i) => floors[i] !== null && !pinned.has(i) && x < floors[i]);
+        if (low < 0) break;
+        pinned.add(low);
+      }
+      for (const r of rows) {
+        const res = Math.abs(r.y - r.f.reduce((acc, f, i) => acc + f * theta[i], 0));
+        r.w = res > huberK * r.s ? (huberK * r.s) / res : 1;
+      }
+    }
+    return {
+      tx: theta[0],
+      n: theta[1],
+      alpha: Math.max(0, theta[2]),
+      wallLoss: theta.slice(3).map((x) => Math.max(0.5, x)),
+    };
+  }
+
+  /** Obstacle crossings between a calibration point and this beacon. */
+  _countsFor(p) {
+    if (this.wallFeatureFn && Number.isFinite(p?.x) && Number.isFinite(p?.y)) {
+      const c = this.wallFeatureFn({ x: p.x, y: p.y, posSigmaFt: p.posSigmaFt });
+      if (Array.isArray(c) && c.length === OBSTACLE_TYPES.length) return c;
+    }
+    return OBSTACLE_TYPES.map(() => 0);
+  }
+
+  /** Level the model predicts at distance d from place p (feet), obstacles included. */
+  predictAt(distanceM, p = null) {
+    const L = p ? ObstacleMap.lossFromCounts(this._countsFor(p), this.fittedWallLoss) : 0;
+    return this._predictRssi(distanceM) - L;
+  }
+
+  /**
+   * A point measured automatically (position from the walked track, so its
+   * distance carries some uncertainty - sigmaDb says how much, in dB).
+   */
+  addAutoPoint(distanceM, rssi, meta = {}) {
+    if (!Number.isFinite(distanceM) || distanceM <= 0 || !Number.isFinite(rssi)) return false;
+    this.autoPoints.push({
+      distanceM: Number(distanceM.toFixed(2)),
+      rssi: Number(rssi.toFixed(1)),
+      shape: Number.isFinite(meta.shape) ? Number(meta.shape.toFixed(2)) : null,
+      sigmaDb: Number((Number.isFinite(meta.sigmaDb) ? meta.sigmaDb : 4).toFixed(2)),
+      source: meta.source || "auto",
+      x: Number.isFinite(meta.x) ? Number(meta.x.toFixed(1)) : null,
+      y: Number.isFinite(meta.y) ? Number(meta.y.toFixed(1)) : null,
+      // Uncertainty of the walked-track position (feet).
+      posSigmaFt: Number.isFinite(meta.posSigmaFt) ? Number(meta.posSigmaFt.toFixed(1)) : 3.0,
+      timestamp: Date.now(),
+    });
+    const max = DEFAULT_ADAPTIVE_CONFIG.AUTO_CALIB_MAX_POINTS ?? 80;
+    if (this.autoPoints.length > max) this.autoPoints.splice(0, this.autoPoints.length - max);
+    return true;
+  }
+
+  /** Every point the fit uses, each with its own uncertainty. */
+  _allFitPoints() {
+    const s0 = DEFAULT_ADAPTIVE_CONFIG.CALIB_POINT_SIGMA_DB ?? 2.0;
+    return [
+      ...this.referencePoints.map((p) => ({ ...p, sigmaDb: s0 })),
+      ...this.autoPoints,
+    ];
   }
 
   removeReferencePoint(index) {
@@ -666,6 +1045,11 @@ export class PathLossCalibrator {
 
   clear() {
     this.referencePoints = [];
+    this.autoPoints = [];
+    this.fittedWallLoss = OBSTACLE_TYPES.map((t) => t.lossDb);
+    this.txOverride = null;
+    this.version += 1;
+    this.fittedAlpha = DEFAULT_ADAPTIVE_CONFIG.DEFAULT_EXCESS_LOSS_DB_PER_M;
     this.rSquared = null;
     this.isCalibrated = false;
     this.autoCalibrated = false;
@@ -703,19 +1087,25 @@ export class PathLossCalibrator {
    * Also updates or prepends the 1.0m reference point for OLS modeling.
    * @param {number} txPower1m 
    */
-  set1MeterTxPower(txPower1m) {
+  set1MeterTxPower(txPower1m, opts = {}) {
     const val = Number(Number(txPower1m).toFixed(1));
-    this.fittedTxPower1m = val;
-    this.isCalibrated = true;
     this.autoCalibrated = false;
-    const idx = this.referencePoints.findIndex((p) => Math.abs(p.distanceM - 1.0) < 0.1);
-    if (idx >= 0) {
-      this.referencePoints[idx] = { distanceM: 1.0, rssi: val, timestamp: Date.now() };
+    if (opts.measured) {
+      // Really measured at 1 m: a calibration point like any other.
+      this.txOverride = null;
+      const idx = this.referencePoints.findIndex((p) => p.source === "1m");
+      const point = { distanceM: 1.0, rssi: val, timestamp: Date.now(), source: "1m" };
+      if (idx >= 0) this.referencePoints[idx] = point;
+      else this.referencePoints.unshift(point);
     } else {
-      this.referencePoints.unshift({ distanceM: 1.0, rssi: val, timestamp: Date.now() });
+      // Typed: fixes RSSI@1m; the decay is still fitted from any real points.
+      this.txOverride = val;
     }
+    this.fitModel();
+    this.fittedTxPower1m = Number.isFinite(this.txOverride) ? this.txOverride : this.fittedTxPower1m;
+    this.isCalibrated = true;
     this.saveToStorage();
-    return { success: true, txPower1m: val };
+    return { success: true, txPower1m: this.fittedTxPower1m };
   }
 
   /**
@@ -734,88 +1124,62 @@ export class PathLossCalibrator {
    *
    * @returns {{ n: number, txPower1m: number, rSquared: number, pointCount: number, hasFarSegment: boolean, nFar: number|null } | null}
    */
-  fitModel() {
-    if (this.referencePoints.length < 2) {
+  fitModel(opts = {}) {
+    const pts = this._allFitPoints();
+    const override = Number.isFinite(this.txOverride);
+    if (pts.length < 1 && !override) {
       return null;
     }
+    if (Number.isFinite(opts.priorTx)) this.priorTx = opts.priorTx;
+    const ridge = this._ridgeFit(pts, {
+      ...opts,
+      priorTx: override ? this.txOverride : (opts.priorTx ?? this.priorTx ?? undefined),
+      priorTxSigma: override ? 0.2 : undefined,
+    });
+    if (!ridge) return null;
+    this.version += 1;
 
-    const toXY = (p) => ({ x: 10.0 * Math.log10(p.distanceM), y: p.rssi });
-    const nearRaw = this.referencePoints.filter((p) => p.distanceM <= this.breakpointDistanceM);
-    const farRaw = this.referencePoints.filter((p) => p.distanceM > this.breakpointDistanceM);
-
-    // Requires 3+ far points (not just 2) — a 2-point far fit is fully
-    // determined by a single pair, so one noisy reading can swing the slope
-    // to an implausible value with no data to contradict it.
-    const canFitDualSlope = nearRaw.length >= 2 && farRaw.length >= 3;
-
-    // ── Near-segment fit (or single-segment fit across ALL points as fallback) ──
-    const nearFit = this._olsFit((canFitDualSlope ? nearRaw : this.referencePoints).map(toXY));
-    if (!nearFit) return null;
-
-    const fittedN = Number(Math.max(1.2, Math.min(4.5, -nearFit.slopeA)).toFixed(2));
-    const fittedTxPower = Number(Math.max(-95.0, Math.min(-35.0, nearFit.interceptB)).toFixed(1));
-
-    this.fittedN = fittedN;
-    this.fittedTxPower1m = fittedTxPower;
+    const cfg = DEFAULT_ADAPTIVE_CONFIG;
+    this.fittedN = Number(Math.max(1.6, Math.min(4.5, ridge.n)).toFixed(2));
+    this.fittedTxPower1m = Number(Math.max(-95.0, Math.min(-35.0, ridge.tx)).toFixed(1));
+    this.fittedAlpha = Number(Math.max(0, Math.min(cfg.EXCESS_LOSS_MAX_DB_PER_M ?? 4, ridge.alpha)).toFixed(2));
+    this.fittedWallLoss = ridge.wallLoss.map((x) => Number(Math.min(25, x).toFixed(1)));
+    // The extra-loss term replaces the old near/far (dual-slope) split: it
+    // describes the same "decays faster far away" behaviour with one smooth
+    // curve and needs no breakpoint.
     this.hasFarSegment = false;
     this.fittedNFar = null;
     this.rssiAtBreakpoint = null;
 
-    // ── Far-segment fit: single unknown (n_far), regression through the
-    // breakpoint anchor so the piecewise model has no discontinuity ──
-    if (canFitDualSlope) {
-      const d0 = this.breakpointDistanceM;
-      const rssiAtD0 = fittedTxPower - 10.0 * fittedN * Math.log10(d0);
-
-      let sumXY = 0;
-      let sumXX = 0;
-      for (const p of farRaw) {
-        const x = 10.0 * Math.log10(p.distanceM / d0); // > 0
-        const y = rssiAtD0 - p.rssi; // expected > 0 (weaker signal further out)
-        sumXY += x * y;
-        sumXX += x * x;
-      }
-
-      if (sumXX > 1e-6) {
-        // Floor nFar at fittedN: walls/glass beyond the breakpoint can only
-        // ADD attenuation relative to the open near-field regime, never
-        // reduce it. Without this floor, a noisy or sparse far-point fit can
-        // land on an implausibly SHALLOW slope, which under-predicts
-        // attenuation and extrapolates ordinary weak RSSI into wildly
-        // inflated distances — e.g. 30+ m inside a room whose diagonal is
-        // 22 m. Clamping to [fittedN, 6.5] keeps the far segment physically
-        // sane even from a rough fit.
-        const nFar = Number(Math.max(fittedN, Math.min(6.5, sumXY / sumXX)).toFixed(2));
-        this.hasFarSegment = true;
-        this.fittedNFar = nFar;
-        this.rssiAtBreakpoint = Number(rssiAtD0.toFixed(2));
-      }
-    }
-
-    // ── Goodness of fit (R² ) evaluated against whichever model is active ──
-    const allPts = this.referencePoints;
-    const meanY = allPts.reduce((acc, p) => acc + p.rssi, 0) / allPts.length;
+    // ── Goodness of fit (R²) and typical miss, over every point ──
+    const bodyDb = cfg.BODY_SHADOW_LOSS_DB ?? 0;
+    const ys = pts.map((p) => p.rssi + bodyDb * (Number.isFinite(p.shape) ? p.shape : 0));
+    const meanY = ys.reduce((acc, y) => acc + y, 0) / ys.length;
     let ssTot = 0;
     let ssRes = 0;
-    for (const p of allPts) {
-      const yPred = this._predictRssi(p.distanceM);
-      ssTot += (p.rssi - meanY) ** 2;
-      ssRes += (p.rssi - yPred) ** 2;
-    }
+    pts.forEach((p, i) => {
+      ssTot += (ys[i] - meanY) ** 2;
+      ssRes += (ys[i] - this.predictAt(p.distanceM, p)) ** 2;
+    });
     const r2 = ssTot > 0 ? Math.max(0.0, 1.0 - ssRes / ssTot) : 1.0;
 
     this.rSquared = Number(r2.toFixed(3));
+    this.rmsDb = pts.length ? Number(Math.sqrt(ssRes / pts.length).toFixed(2)) : null;
     this.isCalibrated = true;
     this.autoCalibrated = false;
 
     return {
       n: this.fittedN,
-      nFar: this.fittedNFar,
-      hasFarSegment: this.hasFarSegment,
+      alpha: this.fittedAlpha,
+      nFar: null,
+      hasFarSegment: false,
       breakpointDistanceM: this.breakpointDistanceM,
       txPower1m: this.fittedTxPower1m,
+      wallLoss: this.fittedWallLoss,
       rSquared: this.rSquared,
-      pointCount: allPts.length,
+      rmsDb: this.rmsDb,
+      pointCount: this.referencePoints.length,
+      autoPointCount: this.autoPoints.length,
     };
   }
 
@@ -824,38 +1188,51 @@ export class PathLossCalibrator {
    * (dual-slope if active, otherwise single-slope). Inverse of distanceFromRssi().
    */
   _predictRssi(distanceM) {
-    if (this.hasFarSegment && distanceM > this.breakpointDistanceM) {
-      return this.rssiAtBreakpoint - 10.0 * this.fittedNFar * Math.log10(distanceM / this.breakpointDistanceM);
-    }
-    return this.fittedTxPower1m - 10.0 * this.fittedN * Math.log10(distanceM);
+    return predictLevelDb(distanceM, this.fittedTxPower1m, this.fittedN, this.fittedAlpha);
   }
 
   /**
-   * Converts a filtered RSSI reading to distance using the fitted model,
-   * automatically applying the far-field slope beyond the breakpoint when
-   * dual-slope calibration is active. This is the single source of truth for
-   * RSSI -> distance inversion once a beacon is calibrated.
+   * Converts a ranging level to distance with the fitted model. This is the
+   * single source of truth for level -> distance once a beacon is calibrated.
    *
    * @param {number} rssi
    * @returns {number} distance in metres (>= 0)
    */
   distanceFromRssi(rssi) {
-    const nearDist = Math.pow(10, (this.fittedTxPower1m - rssi) / (10.0 * this.fittedN));
+    const d = solveDistanceM(rssi, this.fittedTxPower1m, this.fittedN, this.fittedAlpha);
+    return Number.isFinite(d) && d >= 0 ? d : 1.0;
+  }
 
-    if (!this.hasFarSegment) {
-      return Number.isFinite(nearDist) && nearDist >= 0 ? nearDist : 1.0;
+  /**
+   * Points measured at a known place on the floor plan, with how far each
+   * one sits from the fitted model (dB, + = stronger than the model). This
+   * difference is what walls, pillars and cabins do at that place - the
+   * radio map interpolates it between points.
+   */
+  getRadioMapPoints() {
+    const cfg = DEFAULT_ADAPTIVE_CONFIG;
+    const bodyDb = cfg.BODY_SHADOW_LOSS_DB ?? 0;
+    const s0 = cfg.CALIB_POINT_SIGMA_DB ?? 2.0;
+    const out = [];
+    for (const p of [...this.referencePoints, ...this.autoPoints]) {
+      if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
+      const y = p.rssi + bodyDb * (Number.isFinite(p.shape) ? p.shape : 0);
+      out.push({
+        x: p.x,
+        y: p.y,
+        // What the drawn obstacles do not explain (people, furniture, walls
+        // not drawn, reflections). The map is built on this, i.e. the drawn
+        // obstacles are its prior mean - the Bayesian way to combine the two.
+        residualDb: y - this.predictAt(p.distanceM, p),
+        sigmaDb: Number.isFinite(p.sigmaDb) ? p.sigmaDb : s0,
+      });
     }
+    return out;
+  }
 
-    // If the near-segment inversion already lands beyond the breakpoint, or
-    // the reading is weaker than the breakpoint's predicted RSSI, use the
-    // far-field slope instead.
-    if (rssi <= this.rssiAtBreakpoint || nearDist > this.breakpointDistanceM) {
-      const farDist = this.breakpointDistanceM *
-        Math.pow(10, (this.rssiAtBreakpoint - rssi) / (10.0 * this.fittedNFar));
-      return Number.isFinite(farDist) && farDist >= 0 ? farDist : this.breakpointDistanceM;
-    }
-
-    return Number.isFinite(nearDist) && nearDist >= 0 ? nearDist : 1.0;
+  /** Effective RSSI@1m at distance d (A - alpha (d - 1)), for display. */
+  txAtDistance(distanceM) {
+    return effectiveTx1m(distanceM, this.fittedTxPower1m, this.fittedAlpha);
   }
 
   async saveToStorage() {
@@ -865,6 +1242,12 @@ export class PathLossCalibrator {
         referencePoints: this.referencePoints,
         fittedN: this.fittedN,
         fittedTxPower1m: this.fittedTxPower1m,
+        fittedAlpha: this.fittedAlpha,
+        autoPoints: this.autoPoints,
+        priorTx: this.priorTx,
+        txOverride: this.txOverride,
+        fittedWallLoss: this.fittedWallLoss,
+        modelVersion: 3,
         rSquared: this.rSquared,
         isCalibrated: this.isCalibrated,
         breakpointDistanceM: this.breakpointDistanceM,
@@ -885,6 +1268,14 @@ export class PathLossCalibrator {
       const raw = await AsyncStorage.getItem(`@v2_beacon_calib_${this.beaconId}`);
       if (raw) {
         const parsed = JSON.parse(raw);
+        // A model written by the removed automatic calibration replaced the
+        // measured RSSI@1m and n. It is ignored, so the baseline is always a
+        // measured calibration (or the advertised/default values) and only the
+        // bounded adaptive layer corrects on top of it.
+        if (parsed.autoCalibrated) {
+          console.log(`[PathLossCalibrator] ignoring auto-learned model for ${this.beaconId}`);
+          return;
+        }
         this.referencePoints = parsed.referencePoints || [];
         this.fittedN = parsed.fittedN || DEFAULT_ADAPTIVE_CONFIG.DEFAULT_PATH_LOSS_N;
         this.fittedTxPower1m = parsed.fittedTxPower1m || DEFAULT_ADAPTIVE_CONFIG.DEFAULT_TX_POWER_1M;
@@ -896,6 +1287,30 @@ export class PathLossCalibrator {
         this.rssiAtBreakpoint = parsed.rssiAtBreakpoint ?? null;
         this.autoCalibrated = Boolean(parsed.autoCalibrated);
         this.autoWindows = parsed.autoWindows || 0;
+        this.autoPoints = Array.isArray(parsed.autoPoints) ? parsed.autoPoints : [];
+        this.priorTx = Number.isFinite(parsed.priorTx) ? parsed.priorTx : null;
+        this.fittedAlpha = Number.isFinite(parsed.fittedAlpha)
+          ? parsed.fittedAlpha
+          : DEFAULT_ADAPTIVE_CONFIG.DEFAULT_EXCESS_LOSS_DB_PER_M;
+        this.txOverride = Number.isFinite(parsed.txOverride) ? parsed.txOverride : null;
+        if (Array.isArray(parsed.fittedWallLoss) && parsed.fittedWallLoss.length === OBSTACLE_TYPES.length) {
+          this.fittedWallLoss = parsed.fittedWallLoss;
+        }
+        if (parsed.modelVersion !== 3) {
+          // Older saves: auto points from the first auto-calibration were too
+          // noisy to keep, and a 1 m point without a source may be a value
+          // TYPED into Signal Lab rather than measured - which is how one test
+          // value could bend a beacon for good. Both are dropped; spot and
+          // two-stand points are kept.
+          this.autoPoints = [];
+          this.referencePoints = this.referencePoints.filter(
+            (p) => p.source || Math.abs(p.distanceM - 1.0) >= 0.05
+          );
+          this.fittedAlpha = DEFAULT_ADAPTIVE_CONFIG.DEFAULT_EXCESS_LOSS_DB_PER_M;
+          if (this._allFitPoints().length > 0) this.fitModel();
+          else this.isCalibrated = false;
+          this.saveToStorage();
+        }
       }
     } catch (e) {
       console.warn("[PathLossCalibrator] Load error:", e);
@@ -1042,8 +1457,21 @@ export class BeaconManager {
     // UNKNOWN and handled with intermediate settings rather than assumed to be
     // movement.
     let motionMode;
-    if (motionHint !== null) motionMode = motionHint ? "moving" : "still";
-    else motionMode = kalmanOut.isStationary ? "still" : "unknown";
+    if (motionHint !== null) {
+      // "Still" from the step detector is trusted unless the signal itself
+      // proves the range is changing (see LAG_TREND_MIN).
+      if (kalmanOut.isLagging) {
+        if (!Number.isFinite(entry.lagSince)) entry.lagSince = timestamp;
+      } else {
+        entry.lagSince = null;
+      }
+      const sustainedLag =
+        Number.isFinite(entry.lagSince) &&
+        timestamp - entry.lagSince >= (this.config.LAG_OVERRIDE_MS ?? 2500);
+      motionMode = motionHint ? "moving" : sustainedLag ? "unknown" : "still";
+    } else {
+      motionMode = kalmanOut.isStationary ? "still" : "unknown";
+    }
     const treatAsMoving = motionMode === "moving";
     const treatAsStill = motionMode === "still";
     const safeFilteredRssi = Number.isFinite(kalmanOut.filteredRssi) ? kalmanOut.filteredRssi : cleanRssi;
@@ -1104,11 +1532,27 @@ export class BeaconManager {
       : treatAsStill
         ? (this.config.ENVELOPE_DECAY_RAMP_STILL_DB_S2 ?? 1.5)
         : (this.config.ENVELOPE_DECAY_RAMP_UNKNOWN_DB_S2 ?? 4.0);
-    const envDecayRate = Math.min(
+    let envDecayRate = Math.min(
       this.config.ENVELOPE_MAX_DECAY_DB_S ?? 12.0,
       (this.config.ENVELOPE_DECAY_DB_S ?? 0.35)
         + Math.max(0, tSincePeakSec - envHoldSec) * envRamp
     );
+
+    // Trend release (see TREND_RELEASE_*): a sustained fall is movement, not a
+    // fade, so the envelope must follow it instead of holding the old peak.
+    const rate = Number.isFinite(kalmanOut.rateDbPerS) ? kalmanOut.rateDbPerS : 0;
+    if (rate < -(this.config.TREND_RELEASE_RATE_DB_S ?? 0.8)) {
+      if (!Number.isFinite(entry.fallSince)) entry.fallSince = timestamp;
+    } else {
+      entry.fallSince = null;
+    }
+    const sustainedFall =
+      Number.isFinite(entry.fallSince) &&
+      timestamp - entry.fallSince >= (this.config.TREND_RELEASE_AFTER_MS ?? 700);
+    if (sustainedFall && !treatAsStill && Number.isFinite(entry.shadowEnvelopeDb)) {
+      const gap = Math.max(0, entry.shadowEnvelopeDb - safeFilteredRssi);
+      envDecayRate = Math.max(envDecayRate, -rate + gap / (this.config.TREND_CLOSE_S ?? 0.8));
+    }
     const envDecayDb = envDecayRate * envDtSec;
 
     if (!Number.isFinite(entry.shadowEnvelopeDb)) {
@@ -1127,19 +1571,73 @@ export class BeaconManager {
     entry.lastEnvelopeUpdate = timestamp;
 
     const shadowGapDb = Math.max(0, entry.shadowEnvelopeDb - safeFilteredRssi);
-    const shadowCorrectionDb = Math.min(
-      this.config.MAX_ENVELOPE_CORRECTION_DB ?? 9.0,
-      shadowGapDb * (this.config.ENVELOPE_WEIGHT ?? 0.75)
-    );
-    const rangingRssi = safeFilteredRssi + shadowCorrectionDb;
+    const shadowCorrectionDb = this.config.SHADOW_ENVELOPE_RANGING
+      ? Math.min(
+          this.config.MAX_ENVELOPE_CORRECTION_DB ?? 9.0,
+          shadowGapDb * (this.config.ENVELOPE_WEIGHT ?? 0.75)
+        )
+      : 0;
+    // The level calibration is measured against: filtered, before the body
+    // correction and before standing-still averaging (both are re-applied
+    // identically when ranging, so calibration and ranging stay consistent).
+    const levelDb = safeFilteredRssi + shadowCorrectionDb;
+
+    // 5c. Body shadow (see BODY_SHADOW_LOSS_DB).
+    const shadowFresh =
+      Number.isFinite(entry.bodyShadowAt) &&
+      timestamp - entry.bodyShadowAt <= (this.config.BODY_SHADOW_STALE_MS ?? 3000);
+    const bodyLossDb = shadowFresh
+      ? (this.config.BODY_SHADOW_LOSS_DB ?? 0) * Math.max(0, Math.min(1, entry.bodyShadow))
+      : 0;
+
+    // 5d. Standing still: average since the user stopped (STILL_AVERAGE_TAU_MAX_S).
+    // 5c'. Radio map (see setLocationCorrection): what the walls between this
+    // place and the beacon take away, added back.
+    const locFresh =
+      Number.isFinite(entry.locCorrAt) &&
+      timestamp - entry.locCorrAt <= (this.config.LOCATION_CORRECTION_STALE_MS ?? 3000);
+    const locationCorrectionDb = locFresh ? entry.locCorrDb : 0;
+    let rangingRssi = levelDb + bodyLossDb + locationCorrectionDb;
+    // Release: the live level has stayed well away from the average - the
+    // range really changed even though no step was seen.
+    if (treatAsStill && Number.isFinite(entry.stillAvgDb)) {
+      if (Math.abs(rangingRssi - entry.stillAvgDb) > (this.config.STILL_RELEASE_DB ?? 3)) {
+        if (!Number.isFinite(entry.stillDivergeSince)) entry.stillDivergeSince = timestamp;
+      } else {
+        entry.stillDivergeSince = null;
+      }
+      if (
+        Number.isFinite(entry.stillDivergeSince) &&
+        timestamp - entry.stillDivergeSince >= (this.config.STILL_RELEASE_MS ?? 1200)
+      ) {
+        entry.stillAvgDb = null; // restart from the current level below
+        entry.stillDivergeSince = null;
+      }
+    }
+    if (treatAsStill && Number.isFinite(entry.stillAvgDb)) {
+      const dtA = Math.min(1.0, Math.max(0.02, (timestamp - entry.stillLastT) / 1000.0));
+      const tau = Math.max(
+        0.5,
+        Math.min(this.config.STILL_AVERAGE_TAU_MAX_S ?? 10, (timestamp - entry.stillSince) / 1000.0)
+      );
+      entry.stillAvgDb += (rangingRssi - entry.stillAvgDb) * Math.min(1, dtA / tau);
+      rangingRssi = entry.stillAvgDb;
+    } else {
+      entry.stillAvgDb = rangingRssi;
+      entry.stillSince = timestamp;
+    }
+    entry.stillLastT = timestamp;
 
     let slantDistM;
+    const safeAlpha = entry.calibrator.isCalibrated
+      ? entry.calibrator.fittedAlpha
+      : (this.config.DEFAULT_EXCESS_LOSS_DB_PER_M ?? 0);
     if (entry.calibrator.isCalibrated) {
       slantDistM = entry.calibrator.distanceFromRssi(rangingRssi);
     } else {
-      // Uncalibrated fallback: single-slope log-distance with default/advertised Tx & n
-      const ratio = (safeTx - rangingRssi) / (10.0 * safeN);
-      slantDistM = Math.pow(10, ratio);
+      // Uncalibrated: same model with the default/advertised RSSI@1m, default
+      // n and the default extra loss per metre.
+      slantDistM = solveDistanceM(rangingRssi, safeTx, safeN, safeAlpha);
     }
     if (!Number.isFinite(slantDistM) || slantDistM < 0) slantDistM = 1.0;
 
@@ -1201,7 +1699,10 @@ export class BeaconManager {
       : 0.05;
 
     let clampedDistM = rawDistM;
-    if (entry.totalPackets > 2 && prevDist !== null && Number.isFinite(prevDist)) {
+    if (
+      this.config.DISTANCE_SLEW_CLAMP &&
+      entry.totalPackets > 2 && prevDist !== null && Number.isFinite(prevDist)
+    ) {
       // The permitted rate of change depends on whether the user is actually
       // moving. Standing still, the true distance is CONSTANT, so a tight bound
       // removes residual flicker at zero cost in responsiveness — there is no
@@ -1224,6 +1725,17 @@ export class BeaconManager {
         clampedDistM = prevDist + Math.sign(delta) * maxDelta;
       }
     }
+
+    // Moving: light smoothing in log-distance (see MOVING_SMOOTH_TAU_S).
+    const smoothTau = this.config.MOVING_SMOOTH_TAU_S ?? 0;
+    if (smoothTau > 0 && !treatAsStill && clampedDistM > 0 && Number.isFinite(entry.smoothLnD)) {
+      const dtS = Math.min(1.0, Math.max(0.02, (timestamp - (entry.smoothT ?? timestamp)) / 1000.0));
+      entry.smoothLnD += (Math.log(clampedDistM) - entry.smoothLnD) * Math.min(1, dtS / smoothTau);
+      clampedDistM = Math.exp(entry.smoothLnD);
+    } else if (clampedDistM > 0) {
+      entry.smoothLnD = Math.log(clampedDistM);
+    }
+    entry.smoothT = timestamp;
 
     entry.lastDistanceM = Number(Math.max(0, clampedDistM).toFixed(2));
     entry.lastSlantDistanceM = Number(Math.max(0, slantDistM).toFixed(2));
@@ -1259,12 +1771,29 @@ export class BeaconManager {
       // off another injects a constant offset equal to the typical correction,
       // which is several dB and therefore metres of range error.
       rangingRssi: Number(rangingRssi.toFixed(2)),
+      // Calibration level (no body correction, no standing average) and the
+      // body correction that was applied - see levelDb / bodyLossDb above.
+      levelDb: Number(levelDb.toFixed(2)),
+      bodyLossDb: Number(bodyLossDb.toFixed(2)),
       packetGapMs: gapMs,
       stdDev: entry.profile.getStdDev(),
       stabilityScore: Number.isFinite(stabilityScore) ? stabilityScore : 0.5,
       confidenceScore,
       currentN: safeN,
       txPower1m: safeTx,
+      // Extra loss per metre, and the RSSI@1m actually in effect at this range
+      // (A - alpha (d - 1)) - the number observed by hand at known distances.
+      excessLossDbPerM: safeAlpha,
+      locationCorrectionDb: Number(locationCorrectionDb.toFixed(2)),
+      // 1-sigma distance uncertainty: level error / slope of the model here.
+      rangeSigmaM: Number(
+        (slantDistM * ((locFresh && Number.isFinite(entry.locSigmaDb)
+          ? entry.locSigmaDb
+          : (this.config.RANGE_SIGMA_DB_DEFAULT ?? 5)) /
+          ((10 * safeN) / Math.LN10 + safeAlpha * Math.max(slantDistM, 0.1)))).toFixed(2)
+      ),
+      txAtDistance: Number(effectiveTx1m(slantDistM, safeTx, safeAlpha).toFixed(1)),
+      autoPointsCount: entry.calibrator.autoPoints.length,
       isCalibrated: Boolean(entry.calibrator.isCalibrated),
       hasFarSegment: Boolean(entry.calibrator.hasFarSegment),
       currentNFar: entry.calibrator.fittedNFar,
@@ -1490,6 +2019,31 @@ export class BeaconManager {
    * @param {boolean} isMoving - true while steps are being detected
    * @param {number} timestamp - when this verdict was formed
    */
+  /**
+   * How much of the body loss applies to this beacon right now: 0 when the
+   * user faces it, 1 when it is directly behind them. Supplied by whoever
+   * knows the user's heading and position (the Fusion Map).
+   */
+  /**
+   * Radio-map correction at the user's current position: dB to add to this
+   * beacon's level (positive = something here weakens the signal), and how
+   * sure the map is (1-sigma, dB).
+   */
+  setLocationCorrection(beaconId, db, sigmaDb = null, timestamp = Date.now()) {
+    if (!beaconId || !Number.isFinite(db)) return;
+    const entry = this._getOrCreate(beaconId);
+    entry.locCorrDb = Math.max(-15, Math.min(15, db));
+    entry.locSigmaDb = Number.isFinite(sigmaDb) ? sigmaDb : null;
+    entry.locCorrAt = timestamp;
+  }
+
+  setBodyShadow(beaconId, fraction, timestamp = Date.now()) {
+    if (!beaconId || !Number.isFinite(fraction)) return;
+    const entry = this._getOrCreate(beaconId);
+    entry.bodyShadow = Math.max(0, Math.min(1, fraction));
+    entry.bodyShadowAt = timestamp;
+  }
+
   setMotionState(isMoving, timestamp = Date.now()) {
     this._motionIsMoving = Boolean(isMoving);
     this._motionUpdatedAt = timestamp;

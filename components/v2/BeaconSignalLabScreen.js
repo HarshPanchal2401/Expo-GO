@@ -32,6 +32,9 @@ import {
   checkRangeGeometry,
 } from "../../services/BeaconRangingCalibration.js";
 import RssiSignalGraph from "./RssiSignalGraph.js";
+// Distances shown here use the simple calculation (Kalman-smoothed RSSI ->
+// 10^((Measured Power - RSSI) / (10 n))), the same as the Raw tab.
+import { simpleRanging, SMOOTH_PRESETS, DIST_SMOOTH_PRESETS } from "../../services/SimpleRanging.js";
 
 const FT_PER_M = 3.28084;
 
@@ -41,7 +44,7 @@ const { width: SCREEN_WIDTH } = Dimensions.get("window");
 // after the user has walked up to the beacon.
 const CALIB_1M_SETTLE_MS = 3000;
 
-export default function BeaconSignalLabScreen() {
+function BeaconSignalLabScreen() {
   const [isScanning, setIsScanning] = useState(false);
   const [stats, setStats] = useState(v2Scanner.getStats());
   const [graphData, setGraphData] = useState({ b1: [], b2: [] });
@@ -52,7 +55,12 @@ export default function BeaconSignalLabScreen() {
 
   // Navigation Hub options
   const [distanceUnit, setDistanceUnit] = useState(stats.distanceUnit || "m");
-  const [pathLossN, setPathLossN] = useState(stats.pathLossN || 2.2);
+  // Highlighted preset: only when both beacons use the same n.
+  const sharedN = (st) => (st.n1 === st.n2 ? st.n1 : null);
+  const [pathLossN, setPathLossN] = useState(sharedN(simpleRanging.settings));
+  const [simple, setSimple] = useState(() => ({
+    1: simpleRanging.getBeacon(1), 2: simpleRanging.getBeacon(2), settings: simpleRanging.settings,
+  }));
 
   // Graph display options
   const [graphMode, setGraphMode] = useState("both"); // "raw" | "both" | "filtered"
@@ -106,7 +114,17 @@ export default function BeaconSignalLabScreen() {
     const unsubStats = v2Scanner.subscribeStats((newStats) => {
       setStats(newStats);
       if (newStats.distanceUnit) setDistanceUnit(newStats.distanceUnit);
-      if (newStats.pathLossN) setPathLossN(newStats.pathLossN);
+    });
+
+    // Simple distance (same as the Raw tab), refreshed at most 5x a second.
+    let simpleTimer = null;
+    const pushSimple = () => {
+      simpleTimer = null;
+      setSimple({ 1: simpleRanging.getBeacon(1), 2: simpleRanging.getBeacon(2), settings: simpleRanging.settings });
+      setPathLossN(sharedN(simpleRanging.settings));
+    };
+    const unsubSimple = simpleRanging.subscribe(() => {
+      if (!simpleTimer) simpleTimer = setTimeout(pushSimple, 200);
     });
 
     const unsubDiscovered = v2Scanner.subscribeDiscovered((list) => {
@@ -118,9 +136,11 @@ export default function BeaconSignalLabScreen() {
         setGraphData(v2Scanner.getGraphHistory());
         setPacketLog(v2Scanner.getPacketLog().slice(0, 20));
       }
-    }, 100);
+    }, 250); // 4 Hz is smooth for a graph; 10 Hz kept the JS thread busy
 
     return () => {
+      unsubSimple();
+      clearTimeout(simpleTimer);
       unsubStatus();
       unsubStats();
       unsubDiscovered();
@@ -144,7 +164,9 @@ export default function BeaconSignalLabScreen() {
         // The level the distance formula inverts. This used to be raw RSSI, so
         // the 1 m reference sat a few dB away from what ranging compares it
         // with, and every distance from that beacon was scaled by that offset.
-        const level = Number.isFinite(pkt.rangingRssi)
+        const level = Number.isFinite(pkt.levelDb)
+          ? pkt.levelDb
+          : Number.isFinite(pkt.rangingRssi)
           ? pkt.rangingRssi
           : Number.isFinite(pkt.filteredRssi)
           ? pkt.filteredRssi
@@ -226,7 +248,9 @@ export default function BeaconSignalLabScreen() {
       if (pkt.beaconNum !== 1 && pkt.beaconNum !== 2) return;
       // Fit against the level ranging consumes, not the raw or merely-filtered
       // one, so the calibrated model and the live model see the same input.
-      const level = Number.isFinite(pkt.rangingRssi)
+      const level = Number.isFinite(pkt.levelDb)
+        ? pkt.levelDb
+        : Number.isFinite(pkt.rangingRssi)
         ? pkt.rangingRssi
         : Number.isFinite(pkt.filteredRssi)
         ? pkt.filteredRssi
@@ -413,7 +437,8 @@ export default function BeaconSignalLabScreen() {
 
   const handleApply1mCalibration = () => {
     if (!calib1mResult) return;
-    const res = v2Scanner.set1MeterTxPower(calib1mTarget, calib1mResult.recommendedTx);
+    // A real measurement at 1 m (not a typed value) - see set1MeterTxPower.
+    const res = v2Scanner.set1MeterTxPower(calib1mTarget, calib1mResult.recommendedTx, { measured: true });
     if (res.success) {
       setApplied1mSuccess({
         beaconNum: calib1mTarget,
@@ -490,10 +515,11 @@ export default function BeaconSignalLabScreen() {
     );
   };
 
+  // "1m Tx" = Measured Power of the simple calculation (shared with the Raw tab).
   const handleTxChange = (beaconNum, val) => {
     const num = parseFloat(val);
-    if (!isNaN(num) && num < 0 && num > -100) {
-      v2Scanner.set1MeterTxPower(beaconNum, num);
+    if (!isNaN(num) && num < 0 && num > -120) {
+      simpleRanging.setSettings({ [beaconNum === 1 ? "mp1" : "mp2"]: num });
     }
   };
 
@@ -502,9 +528,10 @@ export default function BeaconSignalLabScreen() {
     v2Scanner.setDistanceUnit(u);
   };
 
+  // Sets BOTH beacons' n (per-beacon n is set on the Raw tab).
   const handleNChange = (nVal) => {
     setPathLossN(nVal);
-    v2Scanner.setPathLossN(nVal);
+    simpleRanging.setSettings({ n1: nVal, n2: nVal });
   };
 
   // Multi-point OLS Calibration handlers
@@ -557,8 +584,10 @@ export default function BeaconSignalLabScreen() {
     return { value: meters.toFixed(2), label: "m" };
   };
 
-  const b1 = stats?.b1 || {};
-  const b2 = stats?.b2 || {};
+  // distanceM = the simple calculation; the engine's own distance is kept as
+  // engineDistanceM for the parts that still use the engine (calibration tools).
+  const b1 = { ...(stats?.b1 || {}), engineDistanceM: stats?.b1?.distanceM, distanceM: simple[1]?.distanceM ?? null };
+  const b2 = { ...(stats?.b2 || {}), engineDistanceM: stats?.b2?.distanceM, distanceM: simple[2]?.distanceM ?? null };
   const targetBeaconsOnly = stats?.targetBeaconsOnly !== false;
 
   // Confidence-squared anchor weights: w_i = C_i^2
@@ -802,8 +831,10 @@ export default function BeaconSignalLabScreen() {
                   {done ? "✓ " : ""}Stand {standAt} — at Beacon {standAt}
                 </Text>
                 <Text style={styles.geoStandHint}>
-                  Stand about 1 m in front of Beacon {standAt}, phone at chest height,
-                  facing it. Stay still.
+                  Stand about 1 m from Beacon {standAt}, SIDE-ON to it (beacon at your
+                  shoulder, not in front of or behind you), phone at chest height. Stay
+                  still. Side-on keeps your body out of the path to BOTH beacons; facing
+                  one puts the other behind you, which skews the calibration.
                 </Text>
                 {active && geoProgress && (
                   <>
@@ -1155,7 +1186,9 @@ export default function BeaconSignalLabScreen() {
 
         {/* Path-Loss Exponent Presets */}
         <View style={styles.envPresetRow}>
-          <Text style={styles.envPresetLabel}>Path Loss (n={pathLossN}):</Text>
+          <Text style={styles.envPresetLabel}>
+            Path Loss (B1 n={simple.settings.n1}, B2 n={simple.settings.n2}) — sets both:
+          </Text>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.envPillsScroll}>
             {[
               { label: "Open Space", n: 2.0 },
@@ -1174,6 +1207,38 @@ export default function BeaconSignalLabScreen() {
               </Pressable>
             ))}
           </ScrollView>
+        </View>
+
+        <Text style={{ color: "#8b949e", fontSize: 11, marginBottom: 6 }}>
+          {`Distance = 10^((Measured Power − RSSI) / (10 × n)) · B1 n ${simple.settings.n1} · B2 n ${simple.settings.n2}` +
+            ` · B1 MP ${simple.settings.mp1} · B2 MP ${simple.settings.mp2} dBm · ` +
+            (simple.settings.kalman
+              ? `RSSI Kalman ${(SMOOTH_PRESETS[simple.settings.smooth] || SMOOTH_PRESETS.medium).label} (B1 ${Number.isFinite(simple[1].used) ? simple[1].used.toFixed(1) : "--"}, B2 ${Number.isFinite(simple[2].used) ? simple[2].used.toFixed(1) : "--"} dBm)`
+              : "raw RSSI (Kalman off)") +
+            (simple.settings.distKalman
+              ? ` · distance Kalman ${(DIST_SMOOTH_PRESETS[simple.settings.distSmooth] || DIST_SMOOTH_PRESETS.medium).label}`
+              : " · distance Kalman off")}
+        </Text>
+        {/* Kalman on the distance: on/off + strength (shared with Raw and Fusion Map) */}
+        <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", marginBottom: 8 }}>
+          <Text style={{ color: "#e6edf3", fontSize: 12, fontWeight: "700", marginRight: 8 }}>Distance Kalman:</Text>
+          <Pressable
+            style={[styles.envPill, simple.settings.distKalman && styles.envPillActive]}
+            onPress={() => simpleRanging.setSettings({ distKalman: !simple.settings.distKalman })}
+          >
+            <Text style={[styles.envPillText, simple.settings.distKalman && styles.envPillTextActive]}>
+              {simple.settings.distKalman ? "ON" : "OFF"}
+            </Text>
+          </Pressable>
+          {simple.settings.distKalman && Object.entries(DIST_SMOOTH_PRESETS).map(([key, pr]) => (
+            <Pressable
+              key={key}
+              style={[styles.envPill, simple.settings.distSmooth === key && styles.envPillActive]}
+              onPress={() => simpleRanging.setSettings({ distSmooth: key })}
+            >
+              <Text style={[styles.envPillText, simple.settings.distSmooth === key && styles.envPillTextActive]}>{pr.label}</Text>
+            </Pressable>
+          ))}
         </View>
 
         {/* Dual Distance Readout Cards */}
@@ -1570,11 +1635,20 @@ export default function BeaconSignalLabScreen() {
                         {dev.rawRssi} dBm
                       </Text>
                     </View>
-                    {Number.isFinite(dev.estimatedDistM) && (
-                      <Text style={{ fontSize: 11, fontWeight: "700", color: "#8b949e", marginTop: 4 }}>
-                        ~{formatDist(dev.estimatedDistM, distanceUnit).value}{formatDist(dev.estimatedDistM, distanceUnit).label}
-                      </Text>
-                    )}
+                    {Number.isFinite(dev.rawRssi) && (() => {
+                      // Raw reading, simple formula; the selected beacons use their own Measured Power.
+                      const mp = dev.id === stats.beacon1Id ? simple.settings.mp1
+                        : dev.id === stats.beacon2Id ? simple.settings.mp2
+                        : Number.isFinite(dev.advertisedTxPower) ? dev.advertisedTxPower : -59;
+                      const n = dev.id === stats.beacon1Id ? simple.settings.n1
+                        : dev.id === stats.beacon2Id ? simple.settings.n2 : null;
+                      const est = simpleRanging.estimateM(dev.rawRssi, mp, n);
+                      return (
+                        <Text style={{ fontSize: 11, fontWeight: "700", color: "#8b949e", marginTop: 4 }}>
+                          ~{formatDist(est, distanceUnit).value}{formatDist(est, distanceUnit).label}
+                        </Text>
+                      );
+                    })()}
                   </View>
 
                   {/* Right: Selection & Calibration Buttons */}
@@ -1674,7 +1748,7 @@ export default function BeaconSignalLabScreen() {
             <View style={styles.detailItem}>
               <Text style={styles.detailLabel}>Path Loss (n):</Text>
               <Text style={[styles.detailVal, { color: b1.isCalibrated ? "#3fb950" : "#8b949e", fontWeight: "700" }]}>
-                {Number.isFinite(b1.currentN) ? b1.currentN : "--"} {b1.isCalibrated ? "✓ OLS" : "(def)"}
+                {simple.settings.n1} (simple)
               </Text>
             </View>
 
@@ -1691,7 +1765,8 @@ export default function BeaconSignalLabScreen() {
             <Text style={styles.txLabel}>1m Tx:</Text>
             <TextInput
               style={styles.txInput}
-              defaultValue={String(Number.isFinite(b1.txPower) ? b1.txPower : -59)}
+              key={`tx-b1-${simple.settings.mp1}`}
+              defaultValue={String(simple.settings.mp1)}
               keyboardType="numbers-and-punctuation"
               onEndEditing={(e) => handleTxChange(1, e.nativeEvent.text)}
             />
@@ -1741,7 +1816,7 @@ export default function BeaconSignalLabScreen() {
             <View style={styles.detailItem}>
               <Text style={styles.detailLabel}>Path Loss (n):</Text>
               <Text style={[styles.detailVal, { color: b2.isCalibrated ? "#3fb950" : "#8b949e", fontWeight: "700" }]}>
-                {Number.isFinite(b2.currentN) ? b2.currentN : "--"} {b2.isCalibrated ? "✓ OLS" : "(def)"}
+                {simple.settings.n2} (simple)
               </Text>
             </View>
 
@@ -1758,7 +1833,8 @@ export default function BeaconSignalLabScreen() {
             <Text style={styles.txLabel}>1m Tx:</Text>
             <TextInput
               style={styles.txInput}
-              defaultValue={String(Number.isFinite(b2.txPower) ? b2.txPower : -59)}
+              key={`tx-b2-${simple.settings.mp2}`}
+              defaultValue={String(simple.settings.mp2)}
               keyboardType="numbers-and-punctuation"
               onEndEditing={(e) => handleTxChange(2, e.nativeEvent.text)}
             />
@@ -3897,3 +3973,7 @@ const styles = StyleSheet.create({
     lineHeight: 16,
   },
 });
+
+// Memoised: the app shell re-renders on its own state changes, and this
+// screen should only re-render when its own props or state change.
+export default React.memo(BeaconSignalLabScreen);
