@@ -22,6 +22,7 @@ import { v2Scanner } from "./services/v2BeaconScannerService.js";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { stepLengthModel, STEP_MODEL_CONFIG } from "./services/StepLengthModel.js";
 import { headingFilter } from "./services/HeadingFilter.js";
+import { StepGate } from "./services/StepGate.js";
 
 // Which sensor heading corresponds to the floor plan's "up". A property of
 // the building, so it is persisted rather than re-established each launch.
@@ -117,6 +118,10 @@ export default function AppIOS() {
   const lastMagUiRef = useRef(0);
 
   // Robust Peak-Valley Step Detector State Machine
+  // Walking gate: shaking the phone must not walk the user forward (see
+  // services/StepGate.js). Also starts and pauses walking automatically.
+  const stepGateRef = useRef(null);
+  if (!stepGateRef.current) stepGateRef.current = new StepGate();
   const stepStateRef = useRef({
     state: "IDLE",
     peakVal: 0,
@@ -326,6 +331,14 @@ export default function AppIOS() {
         // Gyroscope turn rate drives the heading - immune to the magnetic
         // disturbance that made the compass-only heading wander indoors.
         headingFilter.updateMotion(data, "ios");
+        // Fastest rotation since the last step candidate (deg/s), for the
+        // walking gate: a wrist shake twists the phone, walking hardly does.
+        const rr = data.rotationRate;
+        if (rr) {
+          const rot = Math.hypot(rr.alpha || 0, rr.beta || 0, rr.gamma || 0);
+          const st = stepStateRef.current;
+          if (Number.isFinite(rot) && rot > (st.rotPeak || 0)) st.rotPeak = rot;
+        }
         headingRef.current = headingFilter.heading;
         publishHeading();
       });
@@ -344,6 +357,26 @@ export default function AppIOS() {
 
         if (rawMag > 4.0) {
           rawMag = rawMag / 9.80665;
+        }
+
+        // Walking gate input: how much of the motion is up-and-down (along
+        // gravity) versus sideways. Gravity per axis by a slow low-pass; the
+        // rest is the dynamic part, split into its vertical component.
+        {
+          const unit = Math.sqrt(x * x + y * y + z * z) > 4.0 ? 9.80665 : 1;
+          const ax = x / unit, ay = y / unit, az = z / unit;
+          const st = stepStateRef.current;
+          if (!st.gVec) st.gVec = { x: ax, y: ay, z: az };
+          const g = st.gVec;
+          g.x += 0.02 * (ax - g.x); g.y += 0.02 * (ay - g.y); g.z += 0.02 * (az - g.z);
+          const gn = Math.hypot(g.x, g.y, g.z) || 1;
+          const dx = ax - g.x, dy = ay - g.y, dz = az - g.z;
+          const vert = (dx * g.x + dy * g.y + dz * g.z) / gn;
+          // Leaky sums (~1 s memory) so motion long before a step does not
+          // count toward it; same for the rotation peak.
+          st.vertE = (st.vertE || 0) * 0.97 + vert * vert;
+          st.totE = (st.totE || 0) * 0.97 + dx * dx + dy * dy + dz * dz;
+          st.rotPeak = (st.rotPeak || 0) * 0.97;
         }
 
         const ss = stepStateRef.current;
@@ -420,7 +453,6 @@ export default function AppIOS() {
             ) {
               const prevStepTime = ss.lastConfirmedStepTime;
               ss.lastConfirmedStepTime = now;
-              lastStepTimeRef.current = now;
 
               // Step length now comes from StepLengthModel, which corrects the
               // filter's speed-dependent attenuation and applies the personal
@@ -431,8 +463,27 @@ export default function AppIOS() {
               const stepInterval = isFirstStep ? null : now - prevStepTime;
               const stepEst = stepLengthModel.estimate(bounceDiff, stepInterval);
               const dynamicStepLen = Number(stepEst.lengthM.toFixed(2));
-              addStep(dynamicStepLen, bounceDiff);
-              setStatus(`Step: ${dynamicStepLen.toFixed(2)}m (bounce ${bounceDiff.toFixed(2)}g)`);
+              // Through the walking gate: shakes are refused, and walking
+              // only starts after a few rhythmic steps (released together).
+              const verticalRatio = ss.totE > 1e-6 ? ss.vertE / ss.totE : null;
+              const accepted = stepGateRef.current.candidate({
+                t: now,
+                bounce: bounceDiff,
+                verticalRatio,
+                rotDps: Number.isFinite(ss.rotPeak) ? ss.rotPeak : null,
+                step: { len: dynamicStepLen, bounce: bounceDiff },
+              });
+              ss.vertE = 0;
+              ss.totE = 0;
+              ss.rotPeak = 0;
+              for (const st of accepted) addStep(st.len, st.bounce);
+              if (accepted.length) {
+                lastStepTimeRef.current = now;
+                setStatus(`Step: ${dynamicStepLen.toFixed(2)}m (bounce ${bounceDiff.toFixed(2)}g)` +
+                  (accepted.length > 1 ? ` · walking started (+${accepted.length} steps)` : ""));
+              } else {
+                setStatus(`Not counted: ${stepGateRef.current.lastReason}`);
+              }
             }
             ss.state = "IDLE";
           } else if (now - ss.valleyTime > 600) {
@@ -474,7 +525,10 @@ export default function AppIOS() {
               lastPedometerTotal = result.steps;
               const now = Date.now();
               const ss = stepStateRef.current;
-              if (!ss.lastConfirmedStepTime || now - ss.lastConfirmedStepTime > 250) {
+              // Only while the walking gate says walking: the step counter
+              // on some phones also counts shakes.
+              if (stepGateRef.current.isWalking(now) &&
+                  (!ss.lastConfirmedStepTime || now - ss.lastConfirmedStepTime > 250)) {
                 ss.lastConfirmedStepTime = now;
                 lastStepTimeRef.current = now;
                 addStep(0.70, 0.20);
@@ -528,6 +582,7 @@ export default function AppIOS() {
   };
 
   const reset = () => {
+    stepGateRef.current.reset();
     setSteps(0);
     setTotalDistance(0);
     totalDistanceRef.current = 0;
