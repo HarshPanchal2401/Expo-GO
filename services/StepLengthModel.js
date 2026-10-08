@@ -80,6 +80,20 @@ export const STEP_MODEL_CONFIG = {
   // clear both comfortably.
   MIN_CALIBRATION_STEPS: 15,
   MIN_CALIBRATION_DISTANCE_M: 11,
+
+  // Step length from the step RATE, for a phone not held in front (pocket,
+  // swinging hand, at the ear). There the bounce Weinberg needs is dominated
+  // by the leg or arm swing instead of the body's bounce, so it says little
+  // about the step; the step rate is the same however the phone is carried.
+  // Adult walking: ~0.50 m at 1.4 steps/s, ~0.70 m at 1.85, ~0.80 m at 2.1.
+  CADENCE_SLOPE_M: 0.425,
+  CADENCE_OFFSET_M: -0.09,
+  CADENCE_MIN_HZ: 1.0,
+  CADENCE_MAX_HZ: 2.6,
+  // The cadence model is fitted to THIS user while the phone is held in
+  // front: Weinberg length / cadence length, averaged over that many steps.
+  CADENCE_RATIO_MIN_STEPS: 8,
+  CADENCE_RATIO_RATE: 0.05,
 };
 
 /**
@@ -126,6 +140,68 @@ export class StepLengthModel {
     this._calibrating = false;
     this._calRawSumM = 0;
     this._calSteps = 0;
+
+    // Raw Weinberg length / cadence-model length for this user (texting).
+    this.cadenceRatio = null;
+    this.cadenceRatioSteps = 0;
+    this._ratioUnsaved = 0;
+  }
+
+  /** Population step length (m) at a step rate (steps/s). */
+  cadenceLength(cadenceHz) {
+    const c = this.cfg;
+    const f = Math.min(c.CADENCE_MAX_HZ, Math.max(c.CADENCE_MIN_HZ, cadenceHz));
+    return c.CADENCE_SLOPE_M * f + c.CADENCE_OFFSET_M;
+  }
+
+  /**
+   * Step length for any way of carrying the phone.
+   *
+   * Held in front (texting): Weinberg from the bounce, as estimate(); and
+   * those steps teach the cadence model this user's stride. Otherwise: the
+   * cadence model, scaled to the user, then the personal (calibration) scale
+   * - so one calibration walk serves every carry mode.
+   *
+   * @param {number} bounceG
+   * @param {object} info  { cadenceHz, carry: texting|vertical|swinging|unknown }
+   */
+  estimateCarry(bounceG, info = {}) {
+    const f = Number.isFinite(info.cadenceHz) && info.cadenceHz > 0 ? info.cadenceHz : null;
+    const carry = info.carry || "unknown";
+    if (carry === "texting" || carry === "unknown" || f === null) {
+      const est = this.estimate(bounceG, null);
+      if (carry === "texting" && f !== null) this._learnCadenceRatio(est.rawLengthM / this.cadenceLength(f));
+      return { ...est, model: "weinberg" };
+    }
+    const ratio = this.cadenceRatioSteps >= this.cfg.CADENCE_RATIO_MIN_STEPS && this.cadenceRatio
+      ? this.cadenceRatio
+      : 1 / this.effectiveScale();
+    const raw = this.cadenceLength(f) * ratio;
+    const lengthM = Math.min(this.cfg.MAX_STEP_LENGTH_M, Math.max(this.cfg.MIN_STEP_LENGTH_M, raw * this.effectiveScale()));
+    if (this._calibrating) {
+      this._calRawSumM += raw;
+      this._calSteps += 1;
+    }
+    return {
+      lengthM,
+      lengthFt: lengthM * M_TO_FT,
+      rawLengthM: raw,
+      cadenceHz: f,
+      isCalibrated: this.calibrationK !== null,
+      model: "cadence",
+    };
+  }
+
+  _learnCadenceRatio(r) {
+    if (!Number.isFinite(r) || r < 0.5 || r > 2) return;
+    const n = this.cadenceRatioSteps;
+    const rate = Math.max(this.cfg.CADENCE_RATIO_RATE, 1 / (n + 1));
+    this.cadenceRatio = this.cadenceRatio === null ? r : this.cadenceRatio + rate * (r - this.cadenceRatio);
+    this.cadenceRatioSteps = n + 1;
+    if (++this._ratioUnsaved >= 40) {
+      this._ratioUnsaved = 0;
+      this.save();
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -333,6 +409,8 @@ export class StepLengthModel {
       calibratedAt: this.calibratedAt,
       calibrationSamples: this.calibrationSamples,
       calibrationDistanceM: this.calibrationDistanceM,
+      cadenceRatio: this.cadenceRatio,
+      cadenceRatioSteps: this.cadenceRatioSteps,
     };
   }
 
@@ -347,6 +425,11 @@ export class StepLengthModel {
     this.calibratedAt = obj.calibratedAt ?? null;
     this.calibrationSamples = obj.calibrationSamples ?? 0;
     this.calibrationDistanceM = obj.calibrationDistanceM ?? 0;
+    const cr = Number(obj.cadenceRatio);
+    if (obj.cadenceRatio != null && Number.isFinite(cr) && cr >= 0.5 && cr <= 2) {
+      this.cadenceRatio = cr;
+      this.cadenceRatioSteps = Number(obj.cadenceRatioSteps) || 0;
+    }
   }
 
   async save() {

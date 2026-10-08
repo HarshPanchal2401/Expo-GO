@@ -27,6 +27,7 @@
 // BLE → Correction step  (computes Kalman gain K, shrinks P)
 // ============================================================================
 
+import { ParticleFilter } from "./ParticleFilter.js";
 import { pdrEngine } from './PdrEngine.js';
 import { solveInitialPosition, isWalkable, RangeFixAccumulator } from './InitialPositionSolver.js';
 
@@ -253,6 +254,83 @@ export class FusionEngine {
     // Trail of recent positions for the map (feet)
     this._trail = [];
     this._maxTrailLength = this._cfg.MAX_TRAIL_POINTS;
+
+    // Particle filter (map matching), used while NAVIGATING when enabled -
+    // see ParticleFilter.js. Locating and the start fix are unchanged; the
+    // EKF below remains as the fallback when it is switched off.
+    this._pf = new ParticleFilter();
+    this._pfEnabled = true;
+    this._pfActive = false;
+    this._pfEst = null;
+    this._grid = null;
+  }
+
+  // --------------------------------------------------------------------------
+  // PARTICLE FILTER (map matching)
+  // --------------------------------------------------------------------------
+
+  /** On/off (Settings). Takes effect from the next navigation start. */
+  setParticleFilterEnabled(on) {
+    this._pfEnabled = Boolean(on);
+    if (!this._pfEnabled) this._pfActive = false;
+  }
+
+  /**
+   * The floor plan's walkable (green) area, a WalkableGrid. Every position
+   * this engine reports is kept on it: the particle filter cannot step off
+   * it, and any other estimate that lands on gray (EKF, start fix, a manual
+   * tap, the average of a cloud at a corner) is moved to the nearest green
+   * point. null = no restriction beyond the room.
+   */
+  setWalkableGrid(grid) {
+    this._grid = grid || null;
+    this._pf.setGrid(this._grid);
+  }
+
+  /** Nearest point on the walkable area, or p itself. */
+  _snap(p) {
+    if (!this._grid || !p || !Number.isFinite(p.x)) return p;
+    const s = this._grid.nearest(p);
+    return s ? { x: s.x, y: s.y } : p;
+  }
+
+  _snapState() {
+    const s = this._snap({ x: this._x, y: this._y });
+    this._x = s.x;
+    this._y = s.y;
+    if (this._alt) {
+      const a = this._snap(this._alt);
+      this._alt.x = a.x;
+      this._alt.y = a.y;
+    }
+  }
+
+  /** What blocks walking: ObstacleMap.walkableMap() output (feet). */
+  setWalkableMap(map) {
+    this._pf.setMap(map || {});
+  }
+
+  /** (x, y, beaconNum) -> expected measured / straight-line range (walls). */
+  setParticleRangeFactor(fn) {
+    this._pf.setRangeFactor(fn);
+  }
+
+  _pfSync() {
+    const e = this._pf.estimate();
+    this._pfEst = e;
+    if (!e) return;
+    const s = this._snap({ x: e.x, y: e.y });
+    this._x = s.x;
+    this._y = s.y;
+    if (e.alternate) {
+      const a = this._snap(e.alternate);
+      e.alternate.x = a.x;
+      e.alternate.y = a.y;
+    }
+    const v = Math.max(this._cfg.MIN_UNCERTAINTY_FT, e.sdFt) ** 2;
+    this._pxx = v;
+    this._pyy = v;
+    this._pxy = 0;
   }
 
   // --------------------------------------------------------------------------
@@ -287,6 +365,8 @@ export class FusionEngine {
    * @param {number} y0 - feet
    */
   reset(x0 = 0, y0 = 0) {
+    this._pfActive = false;
+    this._pfEst = null;
     this._x = Number(x0) || 0;
     this._y = Number(y0) || 0;
     this._pxx = this._cfg.INITIAL_COVARIANCE_FT2;
@@ -420,6 +500,19 @@ export class FusionEngine {
    * rather than including the standing-still period spent getting located.
    */
   beginNavigation() {
+    if (this._pfEnabled) {
+      // Seed particles at the fix (and at the mirror candidate, if any): the
+      // filter then settles the ambiguity itself from walls and ranges.
+      const sd = Math.sqrt(Math.max(this._pxx, this._pyy));
+      const cands = [{ x: this._x, y: this._y, sigmaFt: sd, weight: 1 }];
+      if (this._alt) cands.push({ x: this._alt.x, y: this._alt.y, sigmaFt: sd, weight: 1 });
+      this._pf.setBeacons(this._anchor1, this._anchor2);
+      this._pf.init(cands);
+      this._pf.lastBleAt = 0;
+      this._alt = null;
+      this._pfActive = this._pf.active;
+      if (this._pfActive) this._pfSync();
+    }
     this._startX = this._x;
     this._startY = this._y;
     this._trail = [{ x: Number(this._x.toFixed(2)), y: Number(this._y.toFixed(2)) }];
@@ -463,6 +556,8 @@ export class FusionEngine {
     let py = Number(y) || 0;
     if (this._roomWidth !== null) px = Math.max(0, Math.min(this._roomWidth, px));
     if (this._roomHeight !== null) py = Math.max(0, Math.min(this._roomHeight, py));
+    // A tap a little off the walkway (on a desk, a wall) means the walkway.
+    ({ x: px, y: py } = this._snap({ x: px, y: py }));
     this.reset(px, py);
     const v = Math.max(this._cfg.INITIAL_COVARIANCE_FT2, uncertaintyFt ** 2);
     this._pxx = v;
@@ -483,6 +578,11 @@ export class FusionEngine {
    * are standing on. Returns false if there is nothing to choose between.
    */
   chooseHypothesisNear(x, y) {
+    if (this._pfActive && this._pfEst?.ambiguous) {
+      this._pf.keepSideNear(x, y);
+      this._pfSync();
+      return true;
+    }
     if (!this._alt) return false;
     const dPrimary = Math.hypot(this._x - x, this._y - y);
     const dAlt = Math.hypot(this._alt.x - x, this._alt.y - y);
@@ -519,7 +619,8 @@ export class FusionEngine {
    * mirror candidates is refined on its own, because the obstacles between a
    * point and the beacons are different on the two sides of the baseline.
    */
-  _solveWithObstacles(params) {
+  _solveWithObstacles(params0) {
+    const params = { ...params0, snap: this._grid ? (p) => this._grid.nearest(p) : null };
     const first = solveInitialPosition(params);
     if (!this._rangeCorrector || !first.position) return first;
     const refine = (start) => {
@@ -621,12 +722,22 @@ export class FusionEngine {
    * @param {number} stepLengthFt - Weinberg step length in FEET (convert from
    *   metres with metresToFeet() before calling — see PdrEngine.js)
    * @param {number} headingDeg   - Smoothed heading (degrees, 0 = forward/north)
+   * @param {object} [opts]
+   * @param {number} [opts.headingJumpSdDeg] - extra heading doubt (deg) after
+   *   the phone was repositioned (map matching only)
    */
-  predict(stepLengthFt, headingDeg) {
+  predict(stepLengthFt, headingDeg, opts = {}) {
     const len = Math.max(1.48, Math.min(3.44, stepLengthFt || 2.3));
     // A step IS the motion signal the correction step needs. Recording it here
     // means the stationary gate needs no separate sensor or external wiring.
     this._lastStepAt = Date.now();
+    if (this._pfActive) {
+      this._pf.step(len, headingDeg, opts.headingJumpSdDeg || 0);
+      this._pfSync();
+      pdrEngine.applyStep(len, headingDeg);
+      this._pushTrail(this._x, this._y);
+      return;
+    }
     const rad = (headingDeg * Math.PI) / 180;
 
     // State transition — standard dead-reckoning
@@ -656,6 +767,9 @@ export class FusionEngine {
       this._alt.pxx += Q;
       this._alt.pyy += Q;
     }
+
+    // Keep the position on the walkable area.
+    this._snapState();
 
     // Update PDR engine for confidence tracking
     pdrEngine.applyStep(len, headingDeg);
@@ -692,6 +806,27 @@ export class FusionEngine {
     // Guard: both distances must be valid finite positives
     if (!Number.isFinite(d1) || !Number.isFinite(d2)) return;
     if (d1 <= 0 || d2 <= 0) return;
+    if (this._pfActive) {
+      // A beacon with almost no confidence (stale / just appeared) is left out.
+      const use1 = (c1 ?? 1) >= 0.15, use2 = (c2 ?? 1) >= 0.15;
+      const walking = this._lastStepAt !== null && Date.now() - this._lastStepAt < this._cfg.STATIONARY_AFTER_MS;
+      const applied = this._pf.updateBle(
+        use1 ? d1 : null, use2 ? d2 : null,
+        Number.isFinite(s1) ? s1 : 0.3 * d1, Number.isFinite(s2) ? s2 : 0.3 * d2,
+        walking
+      );
+      if (!applied) return;
+      this._pfSync();
+      // Ranges much longer than the estimate implies: probably blocked.
+      const pred1 = Math.hypot(this._x - this._anchor1.x, this._y - this._anchor1.y);
+      const pred2 = Math.hypot(this._x - this._anchor2.x, this._y - this._anchor2.y);
+      this._lastNlos = { b1: d1 > pred1 * 1.6 + 3, b2: d2 > pred2 * 1.6 + 3 };
+      this._lastCorrectionTime = Date.now();
+      this._lastBleConf = Math.min(1.0, ((c1 || 0) ** 2 + (c2 || 0) ** 2) / 2);
+      pdrEngine.applyCorrection(this._x, this._y, this._getUncertaintyRadius());
+      this._pushTrail(this._x, this._y);
+      return;
+    }
 
     const now = Date.now();
     const w1 = Math.max(0, c1 || 0) ** 2;
@@ -853,8 +988,9 @@ export class FusionEngine {
       this._resolveAmbiguity();
     }
 
-    // Soft-clamp to room bounds
+    // Soft-clamp to room bounds, and onto the walkable area
     this._clampToRoom();
+    this._snapState();
 
     // Sync corrected position back to PDR engine
     const newUncertainty = this._getUncertaintyRadius();
@@ -946,9 +1082,19 @@ export class FusionEngine {
       // a coin-flip as if it were a fix. It clears itself once resolved.
       // Which beacon's last range looked blocked (much longer than expected).
       nlos: this._lastNlos || null,
-      positionAmbiguous: this._alt !== null,
+      positionAmbiguous: this._alt !== null || Boolean(this._pfActive && this._pfEst?.ambiguous),
       alternatePosition: this._alt
         ? { x: Number(this._alt.x.toFixed(2)), y: Number(this._alt.y.toFixed(2)) }
+        : this._pfActive && this._pfEst?.alternate
+          ? { x: Number(this._pfEst.alternate.x.toFixed(2)), y: Number(this._pfEst.alternate.y.toFixed(2)) }
+          : null,
+      // Map matching: what the particles have learned about this walk.
+      particleFilter: this._pfActive && this._pfEst
+        ? {
+            stepScale: Number(this._pfEst.stepScale.toFixed(3)),
+            headingBiasDeg: Number(this._pfEst.headingBiasDeg.toFixed(1)),
+            spreadFt: Number(this._pfEst.sdFt.toFixed(2)),
+          }
         : null,
       ambiguityLogOdds: this._alt
         ? Number((this._primaryLogLik - this._alt.logLik).toFixed(2))

@@ -40,6 +40,17 @@ export const OBSTACLE_TYPES = [
   { key: "metal", label: "Metal cabinet", icon: "🗄", lossDb: 10, sigmaDb: 5, color: "#8b949e" },
 ];
 export const OBSTACLE_KEYS = OBSTACLE_TYPES.map((t) => t.key);
+
+/**
+ * Areas nobody can walk into (cabins, desks, reception counters). Drawn as a
+ * rectangle by two opposite corners. They do NOT weaken the BLE signal (walls
+ * and glass do that) - they only stop the walked track, see ParticleFilter.
+ */
+export const AREA_TYPES = [
+  { key: "nowalk", label: "No-walk area", icon: "🚫", color: "#f85149", area: true },
+];
+export const AREA_KEYS = AREA_TYPES.map((t) => t.key);
+const ALL_KEYS = [...OBSTACLE_KEYS, ...AREA_KEYS];
 export const DEFAULT_OBSTACLE_LOSS = OBSTACLE_TYPES.map((t) => t.lossDb);
 
 // A radio wave also gets round obstacles (reflections, diffraction through
@@ -55,6 +66,15 @@ function segmentsCross(ax, ay, bx, by, cx, cy, dx, dy) {
   const t = ((cx - ax) * (dy - cy) - (cy - ay) * (dx - cx)) / den;
   const u = ((cx - ax) * (by - ay) - (cy - ay) * (bx - ax)) / den;
   return t > 0 && t < 1 && u >= 0 && u <= 1;
+}
+
+/** Distance from (x, y) to a rectangle given by corners x1,y1 / x2,y2 (0 inside). */
+function rectDist(x, y, r) {
+  const x1 = Math.min(r.x1, r.x2), x2 = Math.max(r.x1, r.x2);
+  const y1 = Math.min(r.y1, r.y2), y2 = Math.max(r.y1, r.y2);
+  const dx = Math.max(x1 - x, 0, x - x2);
+  const dy = Math.max(y1 - y, 0, y - y2);
+  return Math.hypot(dx, dy);
 }
 
 /** Distance from point (px,py) to segment a-b. */
@@ -73,7 +93,7 @@ export class ObstacleMap {
   }
 
   add(item) {
-    if (!item || !OBSTACLE_KEYS.includes(item.type)) return null;
+    if (!item || !ALL_KEYS.includes(item.type)) return null;
     const it = { ...item, id: `${Date.now()}-${Math.round(Math.random() * 1e6)}` };
     this.items.push(it);
     this.version += 1;
@@ -90,7 +110,9 @@ export class ObstacleMap {
   removeNear(x, y, maxFt = 3) {
     let best = -1, bestD = maxFt;
     this.items.forEach((it, i) => {
-      const d = it.x1 !== undefined
+      const d = AREA_KEYS.includes(it.type)
+        ? rectDist(x, y, it)
+        : it.x1 !== undefined
         ? pointSegDist(x, y, it.x1, it.y1, it.x2, it.y2)
         : Math.hypot(x - it.x, y - it.y) - (it.r || 0);
       if (d < bestD) { bestD = d; best = i; }
@@ -172,6 +194,21 @@ export class ObstacleMap {
     return sum.map((v) => v / offsets.length);
   }
 
+  /**
+   * Geometry for the particle filter: what blocks WALKING. Walls, glass and
+   * metal cabinets as segments, pillars as circles, no-walk areas as
+   * rectangles.
+   */
+  walkableMap(room = null) {
+    const walls = [], circles = [], areas = [];
+    for (const it of this.items) {
+      if (AREA_KEYS.includes(it.type)) areas.push({ x1: it.x1, y1: it.y1, x2: it.x2, y2: it.y2 });
+      else if (it.x1 !== undefined) walls.push({ x1: it.x1, y1: it.y1, x2: it.x2, y2: it.y2 });
+      else if (Number.isFinite(it.x)) circles.push({ x: it.x, y: it.y, r: it.r || DEFAULT_PILLAR_RADIUS_FT });
+    }
+    return { walls, circles, areas, room };
+  }
+
   toJSON() {
     return { items: this.items };
   }
@@ -189,7 +226,7 @@ export class ObstacleMap {
       const raw = await AsyncStorage.getItem(STORAGE_KEY);
       if (!raw) return;
       const parsed = JSON.parse(raw);
-      this.items = Array.isArray(parsed.items) ? parsed.items.filter((it) => OBSTACLE_KEYS.includes(it.type)) : [];
+      this.items = Array.isArray(parsed.items) ? parsed.items.filter((it) => ALL_KEYS.includes(it.type)) : [];
       this.version += 1;
     } catch (e) {
       console.warn("[ObstacleMap] load error:", e);

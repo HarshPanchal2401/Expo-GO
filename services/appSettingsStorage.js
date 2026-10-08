@@ -35,6 +35,9 @@ export const DEFAULT_APP_SETTINGS = {
   nearFieldSaturationRssi: -43,    // Phone BLE hardware saturation threshold at 0 cm (dBm)
 
   // ─── PDR & Step Detector ──────────────────────────────────────────────────
+  motionEngine: "v2",              // "v2" (MotionEngine.js) | "classic" step detector
+  particleFilter: true,            // map matching while navigating (ParticleFilter.js)
+  stepShakeFilter: true,           // Refuse phone shakes as steps (services/StepGate.js)
   weinbergK: 0.74,                 // Weinberg dynamic step length coefficient (0.50 - 1.20)
   zuptVariance: 0.0008,            // ZUPT stationary gate (g²) — sensitive for natural handheld walking
   peakThreshold: 0.04,             // Accelerometer heel-strike peak threshold (g)

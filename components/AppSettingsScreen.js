@@ -161,6 +161,53 @@ export default function AppSettingsScreen() {
           </View>
         </View>
 
+
+        <Pressable
+          onPress={() => updateParam("motionEngine", settings.motionEngine === "classic" ? "v2" : "classic")}
+          style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: 10 }}
+        >
+          <View style={{ flex: 1, paddingRight: 12 }}>
+            <Text style={{ color: "#1e293b", fontSize: 13, fontWeight: "700" }}>Step Engine</Text>
+            <Text style={{ color: "#64748b", fontSize: 11, marginTop: 2 }}>
+              NEW: walking detected from the rhythm of the last 2.5 s, any phone position (hand, pocket, swinging); shakes and picking up the phone are ignored. CLASSIC: the old peak detector.
+            </Text>
+          </View>
+          <Text style={{ fontWeight: "800", fontSize: 13, color: settings.motionEngine !== "classic" ? "#3fb950" : "#f85149" }}>
+            {settings.motionEngine !== "classic" ? "NEW" : "CLASSIC"}
+          </Text>
+        </Pressable>
+
+        <Pressable
+          onPress={() => updateParam("particleFilter", settings.particleFilter === false)}
+          style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: 10 }}
+        >
+          <View style={{ flex: 1, paddingRight: 12 }}>
+            <Text style={{ color: "#1e293b", fontSize: 13, fontWeight: "700" }}>Map Matching</Text>
+            <Text style={{ color: "#64748b", fontSize: 11, marginTop: 2 }}>
+              ON: while navigating, the position can only move along walkable paths (walls, pillars and no-walk areas drawn on the Fusion Map) and learns your step length and heading drift. OFF: the previous filter.
+            </Text>
+          </View>
+          <Text style={{ fontWeight: "800", fontSize: 13, color: settings.particleFilter !== false ? "#3fb950" : "#f85149" }}>
+            {settings.particleFilter !== false ? "ON" : "OFF"}
+          </Text>
+        </Pressable>
+
+        {/* Shake filter (StepGate): CLASSIC step engine only */}
+        <Pressable
+          onPress={() => updateParam("stepShakeFilter", settings.stepShakeFilter === false)}
+          style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: 10 }}
+        >
+          <View style={{ flex: 1, paddingRight: 12 }}>
+            <Text style={{ color: "#1e293b", fontSize: 13, fontWeight: "700" }}>Shake Filter (classic engine only)</Text>
+            <Text style={{ color: "#64748b", fontSize: 11, marginTop: 2 }}>
+              ON: shaking the phone is not counted as steps. Turn OFF if walking is not detected.
+            </Text>
+          </View>
+          <Text style={{ fontWeight: "800", fontSize: 13, color: settings.stepShakeFilter === false ? "#f85149" : "#3fb950" }}>
+            {settings.stepShakeFilter === false ? "OFF" : "ON"}
+          </Text>
+        </Pressable>
+
         <SettingNumberRow
           label="Weinberg Stride Gain (K)"
           hint="StepLen = K · (Bounce)^0.25 (typical: 0.65 - 0.85)"

@@ -239,8 +239,20 @@ export function positionUncertaintyFt(p, a1, a2, config = SOLVER_CONFIG) {
 export function solveInitialPosition({
   anchor1, anchor2, d1, d2, conf1 = 1, conf2 = 1, room = null, priorPosition = null,
   requireConfidence = true,
+  // Optional floor-plan walkable area: p -> { x, y, distFt } = nearest point
+  // on it (distFt 0 when p is already on it). See WalkableGrid.nearest().
+  snap = null,
   config = SOLVER_CONFIG,
 }) {
+  // A candidate this close to the walkable area counts as on it (range noise
+  // easily puts a correct answer a few feet into a cabin wall); it is then
+  // moved onto it.
+  const SNAP_TOLERANCE_FT = 4;
+  const onPlan = (c) => (snap ? snap(c) : null);
+  const placed = (c) => {
+    const s = onPlan(c);
+    return s ? { x: s.x, y: s.y } : { x: c.x, y: c.y };
+  };
   const fail = (status, reason) => ({
     status, reason, position: null, alternate: null, candidates: [],
     uncertaintyFt: null, separationFt: 0, adjusted: false, geometryQuality: "poor",
@@ -279,7 +291,16 @@ export function solveInitialPosition({
     return fail("invalid", geo.reason);
   }
 
-  const candidates = geo.candidates.map((c) => ({ ...c, walkable: isWalkable(c, room, config) }));
+  const candidates = geo.candidates.map((c) => {
+    const s = onPlan(c);
+    // No walkable point found nearby at all = very far off the plan.
+    const offPlanFt = !snap ? 0 : s ? s.distFt : Infinity;
+    return {
+      ...c,
+      walkable: isWalkable(c, room, config) && offPlanFt <= SNAP_TOLERANCE_FT,
+      offPlanFt,
+    };
+  });
   const separation = 2 * geo.perpFt;
   const walkableOnes = candidates.filter((c) => c.walkable);
 
@@ -293,7 +314,7 @@ export function solveInitialPosition({
     const p = candidates[0];
     return {
       status: "ok",
-      position: { x: p.x, y: p.y },
+      position: placed(p),
       alternate: null,
       candidates,
       uncertaintyFt: positionUncertaintyFt(p, anchor1, anchor2, config),
@@ -310,7 +331,7 @@ export function solveInitialPosition({
     return {
       status: "ok",
       reason: "resolved-by-floor-plan",
-      position: { x: p.x, y: p.y },
+      position: placed(p),
       alternate: null,
       candidates,
       uncertaintyFt: positionUncertaintyFt(p, anchor1, anchor2, config),
@@ -324,12 +345,12 @@ export function solveInitialPosition({
   // Neither candidate is on the floor plan: the ranges disagree with the map.
   if (walkableOnes.length === 0) {
     const best = candidates
-      .map((c) => ({ c, d: outsideDistance(c, room) }))
+      .map((c) => ({ c, d: snap ? c.offPlanFt : outsideDistance(c, room) }))
       .sort((a, b) => a.d - b.d)[0].c;
     return {
       status: "ok",
       reason: "no-candidate-inside-floor-plan-using-closest",
-      position: { x: best.x, y: best.y },
+      position: placed(best),
       alternate: null,
       candidates,
       uncertaintyFt: Math.max(
@@ -359,8 +380,8 @@ export function solveInitialPosition({
   return {
     status: "ambiguous",
     reason: "two-valid-positions-walk-a-few-steps-to-resolve",
-    position: { x: primary.x, y: primary.y },
-    alternate: { x: secondary.x, y: secondary.y },
+    position: placed(primary),
+    alternate: placed(secondary),
     candidates,
     uncertaintyFt: positionUncertaintyFt(primary, anchor1, anchor2, config),
     separationFt: Number(separation.toFixed(2)),

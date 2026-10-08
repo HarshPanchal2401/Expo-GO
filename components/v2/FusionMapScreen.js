@@ -40,6 +40,7 @@ import {
   Dimensions,
   Alert,
   PanResponder,
+  Share,
 } from "react-native";
 import Svg, {
   Rect,
@@ -61,7 +62,13 @@ import { savePath, getSavedPaths, deleteSavedPath } from "../../PathStorage.js";
 import { RangeAutoCalibrator } from "../../services/RangeAutoCalibrator.js";
 import { RadioMap } from "../../services/RadioMap.js";
 import { simpleRanging, SMOOTH_PRESETS, DIST_SMOOTH_PRESETS } from "../../services/SimpleRanging.js";
-import { obstacleMap, OBSTACLE_TYPES, DEFAULT_PILLAR_RADIUS_FT } from "../../services/ObstacleMap.js";
+import { obstacleMap, OBSTACLE_TYPES, AREA_TYPES, DEFAULT_PILLAR_RADIUS_FT, ObstacleMap } from "../../services/ObstacleMap.js";
+import { testRecorder } from "../../services/TestRecorder.js";
+import { floorplanGrid } from "../../services/WalkableGrid.js";
+import { getAppSettings, subscribeAppSettings } from "../../services/appSettingsStorage.js";
+
+// Everything the obstacle editor can draw: RF obstacles + no-walk areas.
+const EDIT_TYPES = [...OBSTACLE_TYPES, ...AREA_TYPES];
 
 const FLOORPLAN_IMAGE = require("../../assets/floorplans/office-72x72.png");
 
@@ -69,7 +76,15 @@ const FLOORPLAN_IMAGE = require("../../assets/floorplans/office-72x72.png");
 // because an OTA update is only APPLIED on the next cold start after it
 // downloads, so "I published the fix and it still fails" is very often the
 // old bundle still running - this makes that visible instead of a guess.
-const ENGINE_TAG = "simple-range-v2";
+const ENGINE_TAG = "motion-v3-carry";
+
+// How the phone is carried (services/CarryDetector.js). Pocket / ear /
+// swinging: heading from the gyro alone, step length from the step rate.
+const CARRY_TEXT = {
+  texting: "in hand, screen up (compass + gyro)",
+  vertical: "upright: ear / chest pocket (gyro heading)",
+  swinging: "swinging hand / trouser pocket (gyro heading)",
+};
 
 let ExpoUpdates = null;
 try {
@@ -747,8 +762,21 @@ function OfficeMapCanvas({
 
         {/* ── Obstacles (walls, glass, pillars, cabinets) ──────────────────── */}
         {obstacles.map((o) => {
-          const t = OBSTACLE_TYPES.find((k) => k.key === o.type);
+          const t = EDIT_TYPES.find((k) => k.key === o.type);
           const color = t?.color || C.textSecondary;
+          if (t?.area) {
+            const a = toScreen(Math.min(o.x1, o.x2), Math.max(o.y1, o.y2));
+            const b = toScreen(Math.max(o.x1, o.x2), Math.min(o.y1, o.y2));
+            return (
+              <Rect
+                key={`ob-${o.id}`}
+                x={Math.min(a.cx, b.cx)} y={Math.min(a.cy, b.cy)}
+                width={Math.abs(b.cx - a.cx)} height={Math.abs(b.cy - a.cy)}
+                fill={color} fillOpacity={0.14} stroke={color} strokeOpacity={0.7}
+                strokeWidth={1.5 * inv} strokeDasharray={`${4 * inv},${3 * inv}`}
+              />
+            );
+          }
           if (o.x1 !== undefined) {
             const a = toScreen(o.x1, o.y1);
             const b = toScreen(o.x2, o.y2);
@@ -1284,6 +1312,10 @@ function FusionMapScreen({
       const s1 = Number.isFinite(r1.sigmaM) ? metresToFeet(r1.sigmaM) : null;
       const s2 = Number.isFinite(r2.sigmaM) ? metresToFeet(r2.sigmaM) : null;
       fusionEngine.correct(d1Ft, d2Ft, c1, c2, s1, s2);
+      if (testRecorder.active) {
+        const stAfter = fusionEngine.getState();
+        testRecorder.add("ble", { d1: d1Ft, d2: d2Ft, x: stAfter.x, y: stAfter.y });
+      }
       scheduleUiRefresh();
     });
     return () => statsUnsubRef.current?.();
@@ -1313,6 +1345,45 @@ function FusionMapScreen({
   }, [headingCalibrated, navPhase, spotCal?.stage, spotCal?.point, anchor1, anchor2]);
 
   anchorsRef.current = { a1: anchor1, a2: anchor2 };
+
+  // ── Map matching (particle filter): what blocks walking, and how walls
+  // lengthen the measured range at a place. On/off from Settings.
+  useEffect(() => {
+    // The floor plan's green area: the only place the user can be shown.
+    floorplanGrid.setRoom(roomW, roomH);
+    fusionEngine.setWalkableGrid(floorplanGrid);
+    fusionEngine.setWalkableMap(obstacleMap.walkableMap({ w: roomW, h: roomH }));
+    // Expected measured / straight-line range at (x, y): walls between there
+    // and the beacon weaken the signal, which the simple formula reads as
+    // extra distance. Cached on a 1 ft grid (particles ask a lot).
+    const cache = new Map();
+    fusionEngine.setParticleRangeFactor((x, y, num) => {
+      const n = simpleRanging.pathLossN(num) || 2.5;
+      const key = `${num}:${n}:${Math.round(x)}:${Math.round(y)}`;
+      let f = cache.get(key);
+      if (f === undefined) {
+        const a = num === 1 ? anchor1 : anchor2;
+        const L = obstacleMap.items.length
+          ? ObstacleMap.lossFromCounts(obstacleMap.crossingCounts({ x: Math.round(x), y: Math.round(y) }, a))
+          : 0;
+        f = Math.pow(10, L / (10 * n));
+        if (cache.size > 40000) cache.clear();
+        cache.set(key, f);
+      }
+      return f;
+    });
+  }, [obstacleVer, roomW, roomH, anchor1, anchor2]);
+  useEffect(() => {
+    const apply = (st) => fusionEngine.setParticleFilterEnabled(st?.particleFilter !== false);
+    apply(getAppSettings());
+    return subscribeAppSettings(apply);
+  }, []);
+  // How the phone is carried, from the last step (MotionEngine / CarryDetector).
+  const [carryMode, setCarryMode] = useState(null);
+  const [recState, setRecState] = useState(() => ({
+    active: testRecorder.active, rows: testRecorder.rows.length, truths: testRecorder.truthCount,
+  }));
+  useEffect(() => testRecorder.subscribe((r) => setRecState({ active: r.active, rows: r.rows.length, truths: r.truthCount })), []);
 
   // ── Obstacles: load once; push geometry to the calibration and locating ───
   useEffect(() => {
@@ -1430,7 +1501,7 @@ function FusionMapScreen({
   // ── PDR step hook: convert metres -> feet at this single boundary ──
   useEffect(() => {
     if (pdrStepCallbackRef) {
-      pdrStepCallbackRef.current = ({ stepLengthMeters, heading }) => {
+      pdrStepCallbackRef.current = ({ stepLengthMeters, heading, carry, headingReset }) => {
         // Steps are ignored until navigation starts. While locating, the user is
         // meant to be standing still, and feeding steps in would move the very
         // position being measured.
@@ -1453,8 +1524,13 @@ function FusionMapScreen({
           return;
         }
         const stepLengthFt = metresToFeet(stepLengthMeters);
-        fusionEngine.predict(stepLengthFt, heading);
-        setFusionState({ ...fusionEngine.getState() });
+        // After the phone was moved (pocket, ear) the walking direction was
+        // carried over, not measured: let the map matching re-check it.
+        fusionEngine.predict(stepLengthFt, heading, { headingJumpSdDeg: headingReset ? 15 : 0 });
+        if (carry) setCarryMode(carry);
+        const stAfter = fusionEngine.getState();
+        testRecorder.add("step", { len: stepLengthFt, heading, x: stAfter.x, y: stAfter.y, text: carry || "" });
+        setFusionState({ ...stAfter });
       };
       return () => {
         pdrStepCallbackRef.current = null;
@@ -1560,7 +1636,9 @@ function FusionMapScreen({
     coldStartDoneRef.current = true;
     setLocProgress(null);
     fusionEngine.beginNavigation();
-    setFusionState({ ...fusionEngine.getState() });
+    const st0 = fusionEngine.getState();
+    testRecorder.add("start", { x: st0.x, y: st0.y, text: fix?.status || "" });
+    setFusionState({ ...st0 });
     setNavPhase("navigating");
     setLocatedAt(Date.now());
     return true;
@@ -1652,9 +1730,16 @@ function FusionMapScreen({
     setObstacleVer((v) => v + 1);
   };
 
-  const handleMapTap = (xFt, yFt) => {
+  const handleMapTap = (xRaw, yRaw) => {
+    // Drawing obstacles uses the exact tap; everything else is about where a
+    // PERSON is, which can only be on the walkway (the plan's green area).
+    let xFt = xRaw, yFt = yRaw;
+    if (!obstacleEdit) {
+      const s = floorplanGrid.nearest({ x: xRaw, y: yRaw });
+      if (s) { xFt = s.x; yFt = s.y; }
+    }
     if (obstacleEdit) {
-      const t = OBSTACLE_TYPES.find((k) => k.key === obstacleEdit.type);
+      const t = EDIT_TYPES.find((k) => k.key === obstacleEdit.type);
       if (obstacleEdit.erase) {
         if (obstacleMap.removeNear(xFt, yFt)) obstaclesChanged();
       } else if (t?.point) {
@@ -1686,6 +1771,11 @@ function FusionMapScreen({
     }
     if (navPhase === "picking") {
       setPendingStart({ x: xFt, y: yFt });
+      return;
+    }
+    // Recording a test: a tap while navigating marks where you REALLY are.
+    if (testRecorder.active && navPhase === "navigating" && !fusionState.positionAmbiguous) {
+      testRecorder.add("truth", { x: xFt, y: yFt });
       return;
     }
     if (navPhase === "navigating" && fusionState.positionAmbiguous) {
@@ -1929,14 +2019,18 @@ function FusionMapScreen({
           <Text style={styles.statusBannerText}>
             {obstacleEdit.erase
               ? "🧽 Tap an obstacle to remove it."
-              : OBSTACLE_TYPES.find((t) => t.key === obstacleEdit.type)?.point
+              : EDIT_TYPES.find((t) => t.key === obstacleEdit.type)?.point
                 ? "Tap the centre of each pillar / cabinet."
+                : EDIT_TYPES.find((t) => t.key === obstacleEdit.type)?.area
+                  ? obstacleEdit.first
+                    ? "Now tap the OPPOSITE corner of the area."
+                    : "No-walk area (cabin, desks, counter): tap one corner, then the opposite corner. The walked track will never enter it."
                 : obstacleEdit.first
                   ? "Now tap where this wall ENDS."
                   : "Tap where a wall STARTS, then where it ends. Draw every wall, glass cabin side and partition between desks and the beacons."}
           </Text>
           <View style={{ flexDirection: "row", flexWrap: "wrap", marginTop: 6 }}>
-            {OBSTACLE_TYPES.map((t) => {
+            {EDIT_TYPES.map((t) => {
               const on = !obstacleEdit.erase && obstacleEdit.type === t.key;
               return (
                 <TouchableOpacity
@@ -2239,6 +2333,7 @@ function FusionMapScreen({
         obstacles={obstacleMap.items}
         pickMode={
           Boolean(obstacleEdit) ||
+          (recState.active && navPhase === "navigating") ||
           spotCal?.stage === "pick" ||
           navPhase === "picking" ||
           navPhase === "locating" ||
@@ -2343,9 +2438,39 @@ function FusionMapScreen({
           onPress={() => setObstacleEdit({ type: "wall", first: null, erase: false })}
         >
           <Text style={styles.secondaryBtnText}>
-            🧱 Draw Walls / Pillars / Cabins ({obstacleMap.items.length} drawn)
+            🧱 Draw Walls / Pillars / Cabins / No-walk ({obstacleMap.items.length} drawn)
           </Text>
         </TouchableOpacity>
+      )}
+      {!placementMode && !obstacleEdit && !spotCal && (
+        <View style={{ flexDirection: "row", marginBottom: 12 }}>
+          <TouchableOpacity
+            style={[styles.secondaryBtn, { flex: 1, marginRight: recState.rows ? 8 : 0 }, recState.active && { borderColor: C.accentRed }]}
+            onPress={() => {
+              if (recState.active) testRecorder.stop();
+              else testRecorder.start(`room ${roomW}x${roomH} ft; B1 (${anchor1.x},${anchor1.y}); B2 (${anchor2.x},${anchor2.y})`);
+            }}
+          >
+            <Text style={[styles.secondaryBtnText, recState.active && { color: C.accentRed }]}>
+              {recState.active
+                ? `⏹ Stop Recording (${recState.truths} marks)`
+                : "📝 Record Test Walk"}
+            </Text>
+          </TouchableOpacity>
+          {recState.rows > 0 && !recState.active && (
+            <TouchableOpacity
+              style={[styles.secondaryBtn, { flex: 1 }]}
+              onPress={() => Share.share({ title: "PDR test walk", message: testRecorder.toCSV() }).catch(() => {})}
+            >
+              <Text style={styles.secondaryBtnText}>📤 Share CSV ({recState.rows})</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      )}
+      {recState.active && (
+        <Text style={[styles.locateDiag, { marginTop: -6, marginBottom: 10 }]}>
+          Recording. While navigating, tap the map exactly where you are standing (e.g. at each corner / door) - those marks measure the real error.
+        </Text>
       )}
 
       {/* "Reset to Center" is gone deliberately: the room centre was never a
@@ -2477,6 +2602,16 @@ function FusionMapScreen({
           {/* Beacon info strip */}
           <View style={styles.card}>
             <Text style={styles.cardTitle}>Beacon Info</Text>
+            {fusionState.particleFilter && (
+              <Text style={styles.locateDiag}>
+                {`🧭 Map matching: step length ×${fusionState.particleFilter.stepScale} · heading correction ${fusionState.particleFilter.headingBiasDeg > 0 ? "+" : ""}${fusionState.particleFilter.headingBiasDeg}° · spread ±${fusionState.particleFilter.spreadFt} ft`}
+              </Text>
+            )}
+            {carryMode && (
+              <Text style={styles.locateDiag}>
+                {`📱 Phone: ${CARRY_TEXT[carryMode] || carryMode}`}
+              </Text>
+            )}
             <Text style={styles.locateDiag}>{describeRunningBundle()}</Text>
             <TouchableOpacity
               onPress={() => {

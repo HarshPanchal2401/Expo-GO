@@ -25,6 +25,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { stepLengthModel, STEP_MODEL_CONFIG } from "./services/StepLengthModel.js";
 import { headingFilter } from "./services/HeadingFilter.js";
 import { StepGate } from "./services/StepGate.js";
+import { MotionEngine } from "./services/MotionEngine.js";
 
 // Which sensor heading corresponds to the floor plan's "up". A property of
 // the building, so it is persisted rather than re-established each launch.
@@ -45,6 +46,14 @@ const signed = (d) => {
   let x = norm(d);
   if (x > 180) x -= 360;
   return x;
+};
+
+// How the phone is carried (services/CarryDetector.js), for status text.
+const CARRY_LABELS = {
+  texting: "in hand",
+  vertical: "upright (ear / chest pocket)",
+  swinging: "swinging hand / trouser pocket",
+  unknown: "",
 };
 
 const alphaDeg = (a) => (Math.abs(a) <= Math.PI * 2.2 ? (a * 180) / Math.PI : a);
@@ -128,6 +137,44 @@ export default function AppAndroid() {
   // services/StepGate.js). Also starts and pauses walking automatically.
   const stepGateRef = useRef(null);
   if (!stepGateRef.current) stepGateRef.current = new StepGate();
+
+  // Step engine v2 (services/MotionEngine.js): world-frame vertical
+  // acceleration, walking decided from the rhythm of the last 2.5 s, each step
+  // with its own stride heading. "classic" in Settings = the old detector.
+  const useClassicSteps = () => appSettingsRef.current?.motionEngine === "classic";
+  const addStepRef = useRef(null);
+  const motionEngineRef = useRef(null);
+  const lastMotionStatusRef = useRef({ at: 0, text: "" });
+  const carryVersionRef = useRef(null);
+  if (!motionEngineRef.current) {
+    motionEngineRef.current = new MotionEngine({
+      platform: "android",
+      // Held in front: Weinberg from the bounce. Pocket / swinging / at the
+      // ear: from the step rate, fitted to this user's in-hand steps.
+      stepLength: (bounceG, info) => {
+        stepLengthModel.cfg.WEINBERG_K = appSettingsRef.current?.weinbergK ?? WEINBERG_K;
+        return stepLengthModel.estimateCarry(bounceG, info || {}).lengthM;
+      },
+      onStep: (st) => {
+        if (useClassicSteps()) return;
+        if (!runningRef.current && !pdrStepCallbackRef.current) return;
+        lastStepTimeRef.current = Date.now();
+        // First step since the phone was repositioned: its walking direction
+        // was carried over, not measured - the map may widen its heading doubt.
+        const headingReset = carryVersionRef.current !== null && st.carryVersion !== carryVersionRef.current;
+        carryVersionRef.current = st.carryVersion;
+        addStepRef.current?.(st.lengthM, st.bounceG, st.headingDeg, { carry: st.carry, headingReset });
+        if (activeTabRef.current === "pdr") {
+          setStatus(
+            `Step ${st.lengthM.toFixed(2)} m` +
+            (st.cadenceHz ? ` · ${st.cadenceHz.toFixed(1)} steps/s` : "") +
+            (CARRY_LABELS[st.carry] ? ` · ${CARRY_LABELS[st.carry]}` : "") +
+            (st.backfilled ? " · walking started" : "")
+          );
+        }
+      },
+    });
+  }
   const stepStateRef = useRef({
     state: "IDLE", // "IDLE" | "ARMED_PEAK" | "ARMED_VALLEY"
     peakVal: 0,
@@ -210,7 +257,7 @@ export default function AppAndroid() {
   };
 
   // Add a step with dynamic sensor-detected length
-  const addStep = (dynamicLen = null, bounceAmp = 0) => {
+  const addStep = (dynamicLen = null, bounceAmp = 0, headingOverride = null, extra = {}) => {
     // Accept anything the step-length model is willing to emit. These bounds
     // used to be a separate hard-coded pair, which meant a legitimately short
     // stride from a calibrated model could fall outside them and be silently
@@ -232,7 +279,10 @@ export default function AppAndroid() {
 
     // Mean heading over this stride rather than the instant the step fired,
     // which would catch the phone mid-sway. See services/HeadingFilter.js.
-    const curHeading = headingFilter.takeStepHeading();
+    // The step engine supplies the mean heading over THIS stride; the classic
+    // detector uses the heading filter's own stride window.
+    const strideHeading = headingFilter.takeStepHeading();
+    const curHeading = Number.isFinite(headingOverride) ? headingOverride : strideHeading;
     const rad = (curHeading * Math.PI) / 180;
     const old = positionRef.current;
 
@@ -261,9 +311,16 @@ export default function AppAndroid() {
 
     // Feed step into Fusion Engine / map if it is listening
     if (pdrStepCallbackRef.current) {
-      pdrStepCallbackRef.current({ stepLengthMeters: len, heading: curHeading });
+      pdrStepCallbackRef.current({
+        stepLengthMeters: len,
+        heading: curHeading,
+        carry: extra.carry,
+        headingReset: !!extra.headingReset,
+      });
     }
   };
+
+  addStepRef.current = addStep;
 
   // --------------------------------------------------------------------------
   // Hardware Sensors (Dynamic Step Detection + Heading)
@@ -330,11 +387,16 @@ export default function AppAndroid() {
 
     // ── 2. DeviceMotion / Rotation (Gyroscope Fusion) ──
     try {
-      DeviceMotion.setUpdateInterval(50);
+      // 20 ms: the step engine needs the vertical bounce well sampled.
+      DeviceMotion.setUpdateInterval(20);
       motionSub = DeviceMotion.addListener((data) => {
         if (!data) return;
+        // How the phone is carried: switches the compass on/off and holds the
+        // walking direction while the phone is being repositioned.
+        headingFilter.setCarry(motionEngineRef.current.getCarry());
         // Absolute (compass-anchored) orientation: only used to remove slow
-        // gyro drift, never to steer the heading directly.
+        // gyro drift, never to steer the heading directly. The heading filter
+        // ignores it unless the phone is held in front.
         if (Number.isFinite(data.rotation?.alpha)) {
           hasMotionRotationRef.current = true;
           const raw = norm(alphaDeg(data.rotation.alpha));
@@ -357,6 +419,18 @@ export default function AppAndroid() {
         }
         headingRef.current = headingFilter.heading;
         publishHeading();
+        // Step engine v2.
+        const tMotion = Date.now();
+        const me = motionEngineRef.current;
+        me.pushHeading(tMotion, headingFilter.heading);
+        me.ingest(data, tMotion);
+        if (!useClassicSteps() && activeTabRef.current === "pdr" && !me.walking &&
+            tMotion - lastMotionStatusRef.current.at > 1000) {
+          const carry = CARRY_LABELS[me.getCarry().mode];
+          const text = `Not walking: ${me.reason}` + (carry ? ` (${carry})` : "");
+          lastMotionStatusRef.current = { at: tMotion, text };
+          if ((runningRef.current || pdrStepCallbackRef.current) && me.reason !== "standing") setStatus(text);
+        }
       });
     } catch (dme) {
       console.warn("DeviceMotion subscription error:", dme);
@@ -421,6 +495,9 @@ export default function AppAndroid() {
         }
 
         // Energy / Variance buffer (16 samples ≈ 480ms)
+        // The classic step detector below runs only when selected in Settings.
+        if (!useClassicSteps()) return;
+
         ss.varianceBuffer.push(dynamicAccel);
         if (ss.varianceBuffer.length > 16) {
           ss.varianceBuffer.shift();
@@ -494,7 +571,11 @@ export default function AppAndroid() {
               // Through the walking gate: shakes are refused, and walking
               // only starts after a few rhythmic steps (released together).
               const verticalRatio = ss.totE > 1e-6 ? ss.vertE / ss.totE : null;
-              const accepted = stepGateRef.current.candidate({
+              // Shake filter can be switched off in Settings (PDR): then every
+              // detected step counts, as before the filter existed.
+              const accepted = currentSettings.stepShakeFilter === false
+                ? [{ len: dynamicStepLen, bounce: bounceDiff }]
+                : stepGateRef.current.candidate({
                 t: now,
                 bounce: bounceDiff,
                 verticalRatio,
@@ -565,7 +646,8 @@ export default function AppAndroid() {
               // Redundant fusion: If accelerometer hasn't detected a step in the last 250ms, register native step
               // Only while the walking gate says walking: the step counter
               // on some phones also counts shakes.
-              if (stepGateRef.current.isWalking(now) &&
+              if (useClassicSteps() &&
+                  (appSettingsRef.current?.stepShakeFilter === false || stepGateRef.current.isWalking(now)) &&
                   (!ss.lastConfirmedStepTime || now - ss.lastConfirmedStepTime > 250)) {
                 ss.lastConfirmedStepTime = now;
                 lastStepTimeRef.current = now;
