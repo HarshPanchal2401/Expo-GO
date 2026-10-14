@@ -64,6 +64,17 @@ export const DIST_SMOOTH_PRESETS = {
   strong: { label: "Strong", q: 0.04 },
 };
 
+// ── How far behind the smoothed value is ───────────────────────────────────
+// A filter that takes in a fraction k of each new packet trails a steadily
+// changing value by (1 - k) / k packets. Walking changes the distance steadily,
+// so the smoothed distance describes where the user was that long ago - about
+// 1 s at a few metres, 3 s or more far from the beacon (smaller k). The map
+// matching uses this to compare the range with where the user was then.
+export function filterLagMs(k, packetMs) {
+  if (!Number.isFinite(k) || k <= 0 || !Number.isFinite(packetMs) || packetMs <= 0) return 0;
+  return (packetMs * (1 - Math.min(1, k))) / k;
+}
+
 /** One distance-Kalman step. f = {x, p, t} or null (start). */
 export function distanceKalmanStep(f, d, qPerS, t) {
   const r = Math.max(0.01, (DIST_NOISE_FRAC * d) ** 2);
@@ -96,6 +107,7 @@ class SimpleRanging {
     this.settings = { ...SIMPLE_DEFAULTS };
     this.kf = { 1: null, 2: null };
     this.dkf = { 1: null, 2: null }; // distance Kalman state
+    this.packetMs = { 1: null, 2: null }; // average time between packets
     this.last = { 1: null, 2: null }; // { rssi, kf, dFormula, dKalman, t, count }
     this.listeners = new Set();
     this._unsub = null;
@@ -130,6 +142,12 @@ class SimpleRanging {
     const num = pkt?.beaconNum;
     if ((num !== 1 && num !== 2) || !Number.isFinite(pkt.rawRssi)) return;
     const now = Date.now();
+    // Average packet interval (gaps over 2 s are a dropout, not the rate).
+    const prevT = this.last[num]?.t;
+    if (Number.isFinite(prevT) && now > prevT && now - prevT < 2000) {
+      const pm = this.packetMs[num];
+      this.packetMs[num] = pm ? pm + 0.1 * (now - prevT - pm) : now - prevT;
+    }
     const q = (SMOOTH_PRESETS[this.settings.smooth] || SMOOTH_PRESETS.medium).q;
     this.kf[num] = kalmanStep(this.kf[num], pkt.rawRssi, q, now);
     // Formula on the RSSI in use, then the distance filter on its result.
@@ -137,11 +155,15 @@ class SimpleRanging {
     const dFormula = rawDistanceM(used, this.measuredPower(num), this.pathLossN(num));
     const dq = (DIST_SMOOTH_PRESETS[this.settings.distSmooth] || DIST_SMOOTH_PRESETS.medium).q;
     this.dkf[num] = distanceKalmanStep(this.dkf[num], dFormula, dq, now);
+    const pm = this.packetMs[num] || 200;
     this.last[num] = {
       rssi: pkt.rawRssi,
       kf: this.kf[num].x,
       dFormula,
       dKalman: this.dkf[num].x,
+      // Lag of each filter stage, at this packet.
+      kfLagMs: filterLagMs(this.kf[num].k, pm),
+      dkfLagMs: filterLagMs(this.dkf[num].k, pm),
       t: now,
       count: (this.last[num]?.count || 0) + 1,
     };
@@ -197,12 +219,15 @@ class SimpleRanging {
     const mp = this.measuredPower(num);
     const n = this.pathLossN(num);
     if (!p) {
-      return { num, mp, n, rssi: null, kf: null, used: null, distanceM: null, formulaDistanceM: null, rawDistanceM: null, t: null, count: 0 };
+      return { num, mp, n, rssi: null, kf: null, used: null, distanceM: null, formulaDistanceM: null, rawDistanceM: null, lagMs: 0, t: null, count: 0 };
     }
     const used = this.settings.kalman && Number.isFinite(p.kf) ? p.kf : p.rssi;
     // Formula result on the RSSI in use (after a settings change, recomputed).
     const formulaDistanceM = rawDistanceM(used, mp, n);
-    const distanceM = this.settings.distKalman && Number.isFinite(p.dKalman) ? p.dKalman : formulaDistanceM;
+    const useDistKf = this.settings.distKalman && Number.isFinite(p.dKalman);
+    const distanceM = useDistKf ? p.dKalman : formulaDistanceM;
+    // How long ago distanceM describes, from smoothing (add the packet's age).
+    const lagMs = (this.settings.kalman ? p.kfLagMs || 0 : 0) + (useDistKf ? p.dkfLagMs || 0 : 0);
     return {
       num, mp, n,
       rssi: p.rssi,
@@ -213,6 +238,7 @@ class SimpleRanging {
       // Before the distance filter, and from the raw packet alone.
       formulaDistanceM,
       rawDistanceM: rawDistanceM(p.rssi, mp, n),
+      lagMs,
       t: p.t,
       count: p.count,
     };

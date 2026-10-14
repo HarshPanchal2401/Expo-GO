@@ -27,7 +27,7 @@
 // BLE → Correction step  (computes Kalman gain K, shrinks P)
 // ============================================================================
 
-import { ParticleFilter } from "./ParticleFilter.js";
+import { ParticleFilter, PF_CONFIG } from "./ParticleFilter.js";
 import { pdrEngine } from './PdrEngine.js';
 import { solveInitialPosition, isWalkable, RangeFixAccumulator } from './InitialPositionSolver.js';
 
@@ -270,6 +270,18 @@ export class FusionEngine {
   // --------------------------------------------------------------------------
 
   /** On/off (Settings). Takes effect from the next navigation start. */
+  /**
+   * "walking" | "wheelchair". A wheelchair's distance comes from an assumed
+   * speed (or push length), which is less certain than a counted step: its
+   * particles start with a wider spread of distance scales, and each move
+   * is noisier, so map matching and beacons can correct it.
+   */
+  setMobility(mode) {
+    const wc = mode === "wheelchair";
+    this._pf.cfg.SCALE_SD0 = wc ? 0.2 : PF_CONFIG.SCALE_SD0;
+    this._pf.cfg.STEP_LEN_NOISE = wc ? 0.12 : PF_CONFIG.STEP_LEN_NOISE;
+  }
+
   setParticleFilterEnabled(on) {
     this._pfEnabled = Boolean(on);
     if (!this._pfEnabled) this._pfActive = false;
@@ -499,7 +511,7 @@ export class FusionEngine {
    * that net displacement is measured from — so "walked" counts this trip
    * rather than including the standing-still period spent getting located.
    */
-  beginNavigation() {
+  beginNavigation({ keepSide = null } = {}) {
     if (this._pfEnabled) {
       // Seed particles at the fix (and at the mirror candidate, if any): the
       // filter then settles the ambiguity itself from walls and ranges.
@@ -508,6 +520,9 @@ export class FusionEngine {
       if (this._alt) cands.push({ x: this._alt.x, y: this._alt.y, sigmaFt: sd, weight: 1 });
       this._pf.setBeacons(this._anchor1, this._anchor2);
       this._pf.init(cands);
+      // The user said which side of the beacon line they are on: a fix close
+      // to that line spreads its cloud over both sides, so drop the other.
+      if (keepSide && Number.isFinite(keepSide.x)) this._pf.keepSideNear(keepSide.x, keepSide.y);
       this._pf.lastBleAt = 0;
       this._alt = null;
       this._pfActive = this._pf.active;
@@ -725,6 +740,8 @@ export class FusionEngine {
    * @param {object} [opts]
    * @param {number} [opts.headingJumpSdDeg] - extra heading doubt (deg) after
    *   the phone was repositioned (map matching only)
+   * @param {number} [opts.t] - when the step happened (ms, Date.now() clock);
+   *   steps released together after walking was confirmed keep their own time
    */
   predict(stepLengthFt, headingDeg, opts = {}) {
     const len = Math.max(1.48, Math.min(3.44, stepLengthFt || 2.3));
@@ -732,7 +749,7 @@ export class FusionEngine {
     // means the stationary gate needs no separate sensor or external wiring.
     this._lastStepAt = Date.now();
     if (this._pfActive) {
-      this._pf.step(len, headingDeg, opts.headingJumpSdDeg || 0);
+      this._pf.step(len, headingDeg, opts.headingJumpSdDeg || 0, Number.isFinite(opts.t) ? opts.t : Date.now());
       this._pfSync();
       pdrEngine.applyStep(len, headingDeg);
       this._pushTrail(this._x, this._y);
@@ -801,8 +818,12 @@ export class FusionEngine {
    * @param {number} c2  - Beacon 2 confidence [0, 1]
    * @param {number} [s1] - 1-sigma uncertainty of d1, FEET (optional)
    * @param {number} [s2] - 1-sigma uncertainty of d2, FEET (optional)
+   * @param {object} [opts]
+   * @param {number} [opts.lag1Ms] - how long ago d1 describes (its smoothing
+   *   lag plus its age); map matching scores it against the position then
+   * @param {number} [opts.lag2Ms] - the same for d2
    */
-  correct(d1, d2, c1, c2, s1 = null, s2 = null) {
+  correct(d1, d2, c1, c2, s1 = null, s2 = null, opts = {}) {
     // Guard: both distances must be valid finite positives
     if (!Number.isFinite(d1) || !Number.isFinite(d2)) return;
     if (d1 <= 0 || d2 <= 0) return;
@@ -813,7 +834,7 @@ export class FusionEngine {
       const applied = this._pf.updateBle(
         use1 ? d1 : null, use2 ? d2 : null,
         Number.isFinite(s1) ? s1 : 0.3 * d1, Number.isFinite(s2) ? s2 : 0.3 * d2,
-        walking
+        walking, Date.now(), { 1: opts.lag1Ms, 2: opts.lag2Ms }
       );
       if (!applied) return;
       this._pfSync();
@@ -824,7 +845,7 @@ export class FusionEngine {
       this._lastCorrectionTime = Date.now();
       this._lastBleConf = Math.min(1.0, ((c1 || 0) ** 2 + (c2 || 0) ** 2) / 2);
       pdrEngine.applyCorrection(this._x, this._y, this._getUncertaintyRadius());
-      this._pushTrail(this._x, this._y);
+      this._trailFollow(this._x, this._y, walking);
       return;
     }
 
@@ -998,7 +1019,7 @@ export class FusionEngine {
 
     this._lastCorrectionTime = now;
     this._lastBleConf = Math.min(1.0, (w1 + w2) / 2);
-    this._pushTrail(this._x, this._y);
+    this._trailFollow(this._x, this._y, isWalking);
   }
 
   // --------------------------------------------------------------------------
@@ -1351,9 +1372,42 @@ export class FusionEngine {
       if (dx * dx + dy * dy < minMove * minMove) return;
     }
     this._trail.push({ x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) });
+    this._trailTip = false;
     if (this._trail.length > this._maxTrailLength) {
       this._trail.shift();
     }
+  }
+
+  /**
+   * Trail after a BLE correction. While walking it follows the dot as before.
+   * Standing still nobody moved, so a correction must not draw track: it used
+   * to add a point each time, and the first seconds after locating - the
+   * position still being corrected - left lines across the map. Instead:
+   *   - before the first step, the start point itself moves (and with it the
+   *     origin of the net displacement);
+   *   - after walking, one "standing here" tip after the last step moves.
+   */
+  _trailFollow(x, y, walking) {
+    if (walking || !this._trail.length) {
+      this._pushTrail(x, y);
+      return;
+    }
+    const p = { x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) };
+    if (this._lastStepAt === null) {
+      this._trail[this._trail.length - 1] = p;
+      this._startX = x;
+      this._startY = y;
+      return;
+    }
+    if (this._trailTip) {
+      this._trail[this._trail.length - 1] = p;
+      return;
+    }
+    const last = this._trail[this._trail.length - 1];
+    const minMove = this._cfg.MIN_TRAIL_MOVE_FT;
+    if ((x - last.x) ** 2 + (y - last.y) ** 2 < minMove * minMove) return;
+    this._pushTrail(x, y);
+    this._trailTip = true;
   }
 }
 

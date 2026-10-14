@@ -46,6 +46,13 @@ export const DEFAULT_APP_SETTINGS = {
   minCadenceMs: 240,               // Fastest allowable step cadence (~4.1 steps/sec)
   maxCadenceMs: 1800,              // Slowest allowable step cadence (~0.55 steps/sec)
 
+  // ─── Mobility (services/WheelchairEngine.js) ─────────────────────────────
+  mobilityMode: "walking",         // "walking" (steps) | "wheelchair" (rolling + Push button)
+  wheelchairAuto: true,            // detect rolling from the wheels' vibration
+  wheelchairSpeedMps: 0.8,         // speed while rolling (m/s); calibrate in Settings
+  wheelchairPushM: 1.0,            // distance per tap of the Push button (m)
+  wheelchairSensitivity: "medium", // "low" | "medium" | "high": vibration needed to count as rolling
+
   // ─── Room & Map Environment ───────────────────────────────────────────────
   roomWidthFt: 18,                 // Room width in feet (X axis)
   roomHeightFt: 15,                // Room height in feet (Y axis)

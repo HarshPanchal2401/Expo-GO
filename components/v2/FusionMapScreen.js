@@ -41,6 +41,8 @@ import {
   Alert,
   PanResponder,
   Share,
+  Animated,
+  Easing,
 } from "react-native";
 import Svg, {
   Rect,
@@ -65,6 +67,7 @@ import { simpleRanging, SMOOTH_PRESETS, DIST_SMOOTH_PRESETS } from "../../servic
 import { obstacleMap, OBSTACLE_TYPES, AREA_TYPES, DEFAULT_PILLAR_RADIUS_FT, ObstacleMap } from "../../services/ObstacleMap.js";
 import { testRecorder } from "../../services/TestRecorder.js";
 import { floorplanGrid } from "../../services/WalkableGrid.js";
+import { wheelchairEngine } from "../../services/WheelchairEngine.js";
 import { getAppSettings, subscribeAppSettings } from "../../services/appSettingsStorage.js";
 
 // Everything the obstacle editor can draw: RF obstacles + no-walk areas.
@@ -76,7 +79,7 @@ const FLOORPLAN_IMAGE = require("../../assets/floorplans/office-72x72.png");
 // because an OTA update is only APPLIED on the next cold start after it
 // downloads, so "I published the fix and it still fails" is very often the
 // old bundle still running - this makes that visible instead of a guess.
-const ENGINE_TAG = "motion-v3-carry";
+const ENGINE_TAG = "motion-v15-card";
 
 // How the phone is carried (services/CarryDetector.js). Pocket / ear /
 // swinging: heading from the gyro alone, step length from the step rate.
@@ -84,6 +87,7 @@ const CARRY_TEXT = {
   texting: "in hand, screen up (compass + gyro)",
   vertical: "upright: ear / chest pocket (gyro heading)",
   swinging: "swinging hand / trouser pocket (gyro heading)",
+  wheelchair: "wheelchair mode (rolling / Push button, gyro heading)",
 };
 
 let ExpoUpdates = null;
@@ -109,6 +113,8 @@ const MAP_SIZE = SCREEN_W - 32; // canvas width (px) — height follows room asp
 const CANVAS_SIZE = MAP_SIZE - MAP_PADDING * 2; // drawable area (px, square axis unit)
 
 const DEFAULT_ROOM_W_FT = 72;
+// "Where are you?": a tap this close to spot A or B picks it (ft).
+const CHOICE_TAP_FT = 10;
 const DEFAULT_ROOM_H_FT = 72;
 const GRID_MINOR_FT = 2;   // matches the floor plan's own printed grid
 const GRID_MAJOR_FT = 10;  // heavier labeled lines every 10 ft
@@ -172,6 +178,15 @@ const SPOT_SETTLE_MS = 1500;
 // Fastest screen redraw driven by BLE packets (see scheduleUiRefresh).
 const UI_REFRESH_MS = 200;
 const SPOT_WINDOW_MS = 6000;
+// After a beacon fix the first corrections still move the position, often by
+// many feet, a few times over. Until it holds still the map keeps showing the
+// searching animation instead of a jumping dot: shown once the position has
+// stayed within SETTLE_STEADY_FT for SETTLE_WINDOW_MS (and at least
+// SETTLE_MIN_MS after the fix), at the first step, or after SETTLE_MAX_MS.
+const SETTLE_MIN_MS = 3000;
+const SETTLE_WINDOW_MS = 3000;
+const SETTLE_STEADY_FT = 3;
+const SETTLE_MAX_MS = 15000;
 
 /**
  * Fraction of the user's body loss that applies to a beacon: 0 when facing it,
@@ -219,7 +234,7 @@ function describeObstaclePath(p, anchor) {
 
 /**
  * Beacon distance for the Fusion Map: the SIMPLE calculation, the same as the
- * Raw tab and Signal Lab - Kalman-smoothed RSSI, then
+ * Raw tab - Kalman-smoothed RSSI, then
  *   d = 10 ^ ((Measured Power - RSSI) / (10 n)).
  * Everything after it (locating, the position solve, PDR + BLE fusion) is
  * unchanged. Also returns a 1-sigma range uncertainty for the fusion filter:
@@ -395,6 +410,72 @@ function BeaconMarker({
   );
 }
 
+// ─── Heading needle ──────────────────────────────────────────────────────────
+// Follows the heading by itself, 10x a second, redrawing only the needle.
+// Read from headingRef only when the map redrew, it lagged up to a second
+// behind a turn made standing still (nothing else redraws the map then) and
+// then jumped.
+function HeadingNeedle({ headingRef, fallbackDeg, cx, cy, lenPx, strokeWidth, opacity }) {
+  const [deg, setDeg] = useState(() => {
+    const h = headingRef?.current;
+    return Number.isFinite(h) ? h : fallbackDeg;
+  });
+  useEffect(() => {
+    if (!headingRef) return undefined;
+    const id = setInterval(() => {
+      const h = headingRef.current;
+      if (!Number.isFinite(h)) return;
+      setDeg((d) => (Number.isFinite(d) && Math.abs(((((h - d) % 360) + 540) % 360) - 180) < 1.5 ? d : h));
+    }, 100);
+    return () => clearInterval(id);
+  }, [headingRef]);
+  const h = headingRef ? deg : fallbackDeg;
+  if (!Number.isFinite(h)) return null;
+  const rad = (h * Math.PI) / 180;
+  // World heading (0°=+Y/up, 90°=+X/right) -> screen delta (Y flipped)
+  return (
+    <Line
+      x1={cx} y1={cy} x2={cx + Math.sin(rad) * lenPx} y2={cy - Math.cos(rad) * lenPx}
+      stroke="#fff" strokeWidth={strokeWidth} strokeOpacity={opacity} strokeLinecap="round"
+    />
+  );
+}
+
+// ─── Searching animation ─────────────────────────────────────────────────────
+// Shown over the map while the position is being found (and settled), in
+// place of a dot that would otherwise jump from guess to guess. Touches pass
+// through, so "tap where you are" still works.
+function SearchingOverlay({ label }) {
+  const pulse = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.timing(pulse, { toValue: 1, duration: 1600, easing: Easing.out(Easing.quad), useNativeDriver: true })
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [pulse]);
+  const ring = (delay) => {
+    const v = pulse.interpolate({ inputRange: [0, 1], outputRange: delay ? [0.5, 1.5] : [0, 1] });
+    const p = v.interpolate({ inputRange: [0, 1, 1.5], outputRange: [0, 1, 1], extrapolate: "clamp" });
+    return {
+      transform: [{ scale: p.interpolate({ inputRange: [0, 1], outputRange: [0.2, 1] }) }],
+      opacity: p.interpolate({ inputRange: [0, 1], outputRange: [0.9, 0] }),
+    };
+  };
+  return (
+    <View style={styles.searchOverlay} pointerEvents="none">
+      <View style={styles.searchPulseBox}>
+        <Animated.View style={[styles.searchRing, ring(false)]} />
+        <Animated.View style={[styles.searchRing, ring(true)]} />
+        <View style={styles.searchCore} />
+      </View>
+      <View style={styles.searchChip}>
+        <Text style={styles.searchChipText}>{label}</Text>
+      </View>
+    </View>
+  );
+}
+
 // ─── Live Office Map SVG ─────────────────────────────────────────────────────
 
 function OfficeMapCanvas({
@@ -408,6 +489,7 @@ function OfficeMapCanvas({
   b1Name,
   b2Name,
   headingDeg,
+  headingRef = null,
   placementMode,
   onBeaconDragEnd,
   view = { zoom: 1, cx: null, cy: null },
@@ -422,6 +504,15 @@ function OfficeMapCanvas({
   onMapTap,
   pendingPoint = null,
   obstacles = [],
+  // "choosing": which of the two start spots the user picked ("A" | "B" | null).
+  startChoice = null,
+  // Position not known yet (locating / settling): no dot, halo or track -
+  // the searching animation instead.
+  searching = false,
+  searchLabel = "",
+  // Small panel at the bottom of the map (the A/B choice), so it is in view
+  // without scrolling.
+  bottomPanel = null,
 }) {
   const {
     x, y, uncertaintyRadius, trail,
@@ -827,7 +918,7 @@ function OfficeMapCanvas({
             Only drawn while navigating. Before that there is no journey to
             show, and rendering a stub of a trail during the locating phase
             would suggest movement the user has not made. */}
-        {navPhase === "navigating" && trail.length > 1 && (
+        {navPhase === "navigating" && !searching && trail.length > 1 && (
           <Polyline
             points={trailPoints}
             fill="none" stroke={C.trail} strokeWidth={3 * inv}
@@ -840,8 +931,40 @@ function OfficeMapCanvas({
             which one you are standing on. Drawing the second candidate is more
             honest than picking one at random and rendering it like a certainty
             — and it shows the user immediately which way to walk to settle it. */}
-        {positionAmbiguous && alternatePosition && (() => {
+        {positionAmbiguous && alternatePosition && !searching && (() => {
           const altPx = toScreen(alternatePosition.x, alternatePosition.y);
+          // Asking "where are you?": both spots labelled, the chosen one ringed.
+          if (navPhase === "choosing") {
+            const spot = (p, label) => {
+              const on = startChoice === label;
+              const r = (USER_DOT_RADIUS + 7) * inv;
+              return (
+                <G key={`choice-${label}`}>
+                  <Circle
+                    cx={p.cx} cy={p.cy} r={r}
+                    fill={on ? C.accent : "#fff"} fillOpacity={on ? 0.25 : 0.6}
+                    stroke={on ? C.accent : C.textMuted} strokeWidth={(on ? 3 : 2) * inv}
+                    strokeDasharray={on ? undefined : `${4 * inv},${3 * inv}`}
+                  />
+                  <SvgText
+                    x={p.cx} y={p.cy - r - 5 * inv} fontSize={15 * inv} fontWeight="900"
+                    fill={on ? C.accent : C.textPrimary} textAnchor="middle"
+                  >{label}</SvgText>
+                </G>
+              );
+            };
+            return (
+              <>
+                <Line
+                  x1={userPx.cx} y1={userPx.cy} x2={altPx.cx} y2={altPx.cy}
+                  stroke={C.textMuted} strokeWidth={1.5 * inv}
+                  strokeDasharray={`${5 * inv},${5 * inv}`} strokeOpacity={0.5}
+                />
+                {spot(userPx, "A")}
+                {spot(altPx, "B")}
+              </>
+            );
+          }
           return (
             <>
               <Line
@@ -863,7 +986,7 @@ function OfficeMapCanvas({
         })()}
 
         {/* ── Uncertainty halo — grows honestly when the fix is unreliable ── */}
-        {haloPx > 3 && (
+        {!searching && haloPx > 3 && (
           <Circle cx={userPx.cx} cy={userPx.cy} r={Math.min(haloPx, CANVAS_SIZE)} fill="url(#haloGrad)" />
         )}
 
@@ -882,25 +1005,17 @@ function OfficeMapCanvas({
         />
 
         {/* ── Fused user position — opacity reflects confidence, never overstates certainty ── */}
-        {!placementMode && (
+        {!placementMode && !searching && (
           <>
             <Circle cx={userPx.cx} cy={userPx.cy} r={(USER_DOT_RADIUS + 4) * inv} fill={C.userDot} fillOpacity={quality.dotOpacity * 0.25} />
             <Circle cx={userPx.cx} cy={userPx.cy} r={USER_DOT_RADIUS * inv} fill={C.userDot} fillOpacity={quality.dotOpacity} />
             <Circle cx={userPx.cx} cy={userPx.cy} r={(USER_DOT_RADIUS - 3) * inv} fill="#fff" fillOpacity={quality.dotOpacity * 0.65} />
             {/* Heading indicator — short needle pointing the way the user is facing */}
-            {Number.isFinite(headingDeg) && (() => {
-              const rad = (headingDeg * Math.PI) / 180;
-              const needleLenPx = (USER_DOT_RADIUS + 10) * inv;
-              // World heading (0°=+Y/up, 90°=+X/right) -> screen delta (Y flipped)
-              const tipX = userPx.cx + Math.sin(rad) * needleLenPx;
-              const tipY = userPx.cy - Math.cos(rad) * needleLenPx;
-              return (
-                <Line
-                  x1={userPx.cx} y1={userPx.cy} x2={tipX} y2={tipY}
-                  stroke="#fff" strokeWidth={2.5 * inv} strokeOpacity={quality.dotOpacity} strokeLinecap="round"
-                />
-              );
-            })()}
+            <HeadingNeedle
+              headingRef={headingRef} fallbackDeg={headingDeg}
+              cx={userPx.cx} cy={userPx.cy} lenPx={(USER_DOT_RADIUS + 10) * inv}
+              strokeWidth={2.5 * inv} opacity={quality.dotOpacity}
+            />
           </>
         )}
         {/* ── Start point the user tapped (not yet confirmed) ── */}
@@ -921,6 +1036,8 @@ function OfficeMapCanvas({
         })()}
         </G>
       </Svg>
+      {searching && <SearchingOverlay label={searchLabel} />}
+      {bottomPanel}
 
       {/* ── Zoom controls ────────────────────────────────────────────────
           A 72 ft room on a phone screen puts roughly four feet in a
@@ -956,7 +1073,7 @@ function OfficeMapCanvas({
           </TouchableOpacity>
         )}
       </View>
-      {zoom !== 1 && (
+      {zoom !== 1 && !bottomPanel && (
         <View style={styles.zoomBadge} pointerEvents="none">
           <Text style={styles.zoomBadgeText}>{zoom.toFixed(1)}×</Text>
         </View>
@@ -1113,6 +1230,27 @@ function FusionMapScreen({
   const [locatedAt, setLocatedAt] = useState(0);
   // Start point tapped on the map in "picking", awaiting Start Here.
   const [pendingStart, setPendingStart] = useState(null);
+  // "choosing": the beacons fit two spots; which one the user says they are at.
+  const [startChoice, setStartChoice] = useState(null);
+  const startChoiceRef = useRef(null);
+  const pickStartChoice = (side) => {
+    startChoiceRef.current = side;
+    setStartChoice(side);
+  };
+  // Settling after a beacon fix (see SETTLE_*): the dot is not shown yet.
+  const [settling, setSettling] = useState(false);
+  const settlingRef = useRef(false);
+  settlingRef.current = settling;
+  const settleRef = useRef({ start: 0, hist: [] });
+  // "choosing" entered while settling: the filter already runs on both spots,
+  // so a choice keeps one of them instead of starting navigation over.
+  const choiceDuringNavRef = useRef(false);
+  const revealPosition = () => {
+    settlingRef.current = false;
+    setSettling(false);
+    setLocatedAt(Date.now());
+    setFusionState({ ...fusionEngine.getState() });
+  };
   // Spot calibration: { stage: "pick" | "measuring" | "done", point, startedAt, result }
   const [spotCal, setSpotCal] = useState(null);
   const [spotClock, setSpotClock] = useState(0);
@@ -1224,7 +1362,7 @@ function FusionMapScreen({
   useEffect(() => () => clearTimeout(uiRefreshRef.current.timer), []);
 
   // ── Simple distance calculation: make sure it is running (it listens to the
-  // scanner's packets) even if the Raw / Signal Lab tabs were never opened.
+  // scanner's packets) even if the Raw tab was never opened.
   // Settings changed on those tabs (n, Measured Power, Kalman) redraw here.
   useEffect(() => simpleRanging.subscribe(() => scheduleUiRefresh()), [scheduleUiRefresh]);
 
@@ -1239,6 +1377,9 @@ function FusionMapScreen({
       // Without this the "first reading places the user" path below would
       // overwrite the choice with a single-packet guess.
       if (navPhase === "picking") return;
+      // Choosing between the two start spots: hold them still. A correction
+      // now could quietly drop one of them while the user is deciding.
+      if (navPhase === "choosing") return;
 
       // Distances from the simple calculation (see simpleRange); confidence,
       // packet counts and freshness still come from the scanner.
@@ -1311,7 +1452,12 @@ function FusionMapScreen({
       // has data) so far, doubtful ranges pull the position less.
       const s1 = Number.isFinite(r1.sigmaM) ? metresToFeet(r1.sigmaM) : null;
       const s2 = Number.isFinite(r2.sigmaM) ? metresToFeet(r2.sigmaM) : null;
-      fusionEngine.correct(d1Ft, d2Ft, c1, c2, s1, s2);
+      // Each smoothed range describes where the user was a moment ago (its
+      // filter lag plus the age of its last packet); map matching compares it
+      // with the position then, so walking is not pulled back.
+      const nowMs = Date.now();
+      const lagOf = (r) => (r.b.lagMs || 0) + (Number.isFinite(r.b.t) ? Math.max(0, nowMs - r.b.t) : 0);
+      fusionEngine.correct(d1Ft, d2Ft, c1, c2, s1, s2, { lag1Ms: lagOf(r1), lag2Ms: lagOf(r2) });
       if (testRecorder.active) {
         const stAfter = fusionEngine.getState();
         testRecorder.add("ble", { d1: d1Ft, d2: d2Ft, x: stAfter.x, y: stAfter.y });
@@ -1374,10 +1520,18 @@ function FusionMapScreen({
     });
   }, [obstacleVer, roomW, roomH, anchor1, anchor2]);
   useEffect(() => {
-    const apply = (st) => fusionEngine.setParticleFilterEnabled(st?.particleFilter !== false);
+    const apply = (st) => {
+      fusionEngine.setParticleFilterEnabled(st?.particleFilter !== false);
+      fusionEngine.setMobility(st?.mobilityMode);
+      setMobilityMode(st?.mobilityMode === "wheelchair" ? "wheelchair" : "walking");
+    };
     apply(getAppSettings());
     return subscribeAppSettings(apply);
   }, []);
+  // Walking or wheelchair (Settings): wheelchair mode shows the Push button.
+  const [mobilityMode, setMobilityMode] = useState(
+    () => (getAppSettings()?.mobilityMode === "wheelchair" ? "wheelchair" : "walking")
+  );
   // How the phone is carried, from the last step (MotionEngine / CarryDetector).
   const [carryMode, setCarryMode] = useState(null);
   const [recState, setRecState] = useState(() => ({
@@ -1501,7 +1655,7 @@ function FusionMapScreen({
   // ── PDR step hook: convert metres -> feet at this single boundary ──
   useEffect(() => {
     if (pdrStepCallbackRef) {
-      pdrStepCallbackRef.current = ({ stepLengthMeters, heading, carry, headingReset }) => {
+      pdrStepCallbackRef.current = ({ stepLengthMeters, heading, carry, headingReset, t }) => {
         // Steps are ignored until navigation starts. While locating, the user is
         // meant to be standing still, and feeding steps in would move the very
         // position being measured.
@@ -1519,14 +1673,21 @@ function FusionMapScreen({
         // what has been collected and let this step be the first one tracked.
         if (navPhase === "locating") {
           const fix = fusionEngine.finishLocatingNow();
-          if (!fix || !completeLocating(fix)) return;
+          // Already moving: no time to ask; moving settles which spot it is.
+          if (!fix || !completeLocating(fix, { skipChoice: true })) return;
+        } else if (navPhase === "choosing") {
+          // Started moving without pressing Start: go with the spot picked so
+          // far, or let the movement decide between the two.
+          beginFromChoice(startChoiceRef.current);
         } else if (navPhase !== "navigating") {
           return;
         }
+        // Walking: the position is shown from the first step on.
+        if (settlingRef.current) revealPosition();
         const stepLengthFt = metresToFeet(stepLengthMeters);
         // After the phone was moved (pocket, ear) the walking direction was
         // carried over, not measured: let the map matching re-check it.
-        fusionEngine.predict(stepLengthFt, heading, { headingJumpSdDeg: headingReset ? 15 : 0 });
+        fusionEngine.predict(stepLengthFt, heading, { headingJumpSdDeg: headingReset ? 15 : 0, t });
         if (carry) setCarryMode(carry);
         const stAfter = fusionEngine.getState();
         testRecorder.add("step", { len: stepLengthFt, heading, x: stAfter.x, y: stAfter.y, text: carry || "" });
@@ -1538,6 +1699,37 @@ function FusionMapScreen({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pdrStepCallbackRef, navPhase, placementMode]);
+
+  // ── Settling after a beacon fix (see SETTLE_*) ──
+  useEffect(() => {
+    if (navPhase !== "navigating" || !settling) return undefined;
+    const id = setInterval(() => {
+      const now = Date.now();
+      const sr = settleRef.current;
+      const st = fusionEngine.getState();
+      // Two spots fit the beacons: ask the user, as at the start.
+      if (st.positionAmbiguous && st.alternatePosition) {
+        settlingRef.current = false;
+        setSettling(false);
+        choiceDuringNavRef.current = true;
+        pickStartChoice(null);
+        setFusionState({ ...st });
+        setNavPhase("choosing");
+        return;
+      }
+      sr.hist.push({ t: now, x: st.x, y: st.y });
+      while (sr.hist.length && sr.hist[0].t < now - SETTLE_WINDOW_MS) sr.hist.shift();
+      let spread = 0;
+      for (const a of sr.hist) for (const b of sr.hist) spread = Math.max(spread, Math.hypot(a.x - b.x, a.y - b.y));
+      const elapsed = now - sr.start;
+      const covered = sr.hist.length > 0 && now - sr.hist[0].t >= SETTLE_WINDOW_MS - 400;
+      if ((elapsed >= SETTLE_MIN_MS && covered && spread <= SETTLE_STEADY_FT) || elapsed >= SETTLE_MAX_MS) {
+        revealPosition();
+      }
+    }, 250);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [navPhase, settling]);
 
   // ── Tick interval (passive uncertainty growth + UI refresh) ──
   useEffect(() => {
@@ -1624,7 +1816,18 @@ function FusionMapScreen({
    * zeroing does not depend on the position and can be done at any time.
    * @returns true (navigation has started).
    */
-  const completeLocating = (fix) => {
+  const completeLocating = (fix, { skipChoice = false, keepSide = null } = {}) => {
+    // Two spots fit the beacons equally: ask the user which one, before
+    // navigating, instead of starting on a guess.
+    if (!skipChoice && fix?.status === "ambiguous" && fix.alternate && fusionEngine.getState().positionAmbiguous) {
+      setInitialFix(fix);
+      coldStartDoneRef.current = true;
+      setLocProgress(null);
+      pickStartChoice(null);
+      setFusionState({ ...fusionEngine.getState() });
+      setNavPhase("choosing");
+      return true;
+    }
     // A start chosen on the map starts an auto-calibration track. A BLE fix
     // does not: it comes from the very ranges being calibrated, so learning
     // from it would only confirm their errors.
@@ -1635,13 +1838,47 @@ function FusionMapScreen({
     setInitialFix(fix);
     coldStartDoneRef.current = true;
     setLocProgress(null);
-    fusionEngine.beginNavigation();
+    fusionEngine.beginNavigation({ keepSide });
     const st0 = fusionEngine.getState();
     testRecorder.add("start", { x: st0.x, y: st0.y, text: fix?.status || "" });
     setFusionState({ ...st0 });
     setNavPhase("navigating");
-    setLocatedAt(Date.now());
+    // A beacon fix is still being corrected for a while: hold the dot back
+    // until it settles. A spot the user chose, or a start while already
+    // walking, shows at once.
+    const settle = !skipChoice && fix?.status !== "manual";
+    choiceDuringNavRef.current = false;
+    settleRef.current = { start: Date.now(), hist: [] };
+    settlingRef.current = settle;
+    setSettling(settle);
+    setLocatedAt(settle ? 0 : Date.now());
     return true;
+  };
+
+  /**
+   * Leaves "choosing": side "A" / "B" keeps that spot; null keeps both and
+   * lets the first steps (walls, beacons) decide.
+   */
+  const beginFromChoice = (side) => {
+    const st = fusionEngine.getState();
+    let p = null;
+    if (side && st.positionAmbiguous && st.alternatePosition) {
+      p = side === "A" ? { x: st.x, y: st.y } : { ...st.alternatePosition };
+      fusionEngine.chooseHypothesisNear(p.x, p.y);
+    }
+    pickStartChoice(null);
+    if (choiceDuringNavRef.current) {
+      // Asked while settling: navigation is already running on both spots.
+      // Keep the chosen one (done above) - or both, to walk and decide.
+      choiceDuringNavRef.current = false;
+      setNavPhase("navigating");
+      revealPosition();
+      return;
+    }
+    completeLocating(
+      { ...initialFix, reason: side ? `user-chose-${side}` : "walk-to-decide" },
+      { skipChoice: true, keepSide: p }
+    );
   };
 
   /** Commits the fix and starts drawing the walked path from it. */
@@ -1773,6 +2010,23 @@ function FusionMapScreen({
       setPendingStart({ x: xFt, y: yFt });
       return;
     }
+    if (navPhase === "choosing") {
+      // Near A or B: that spot. Anywhere else: "I am somewhere else" - start
+      // there instead, as with Set My Start on the Map.
+      const st = fusionState;
+      const alt = st.alternatePosition;
+      const dA = Math.hypot(st.x - xFt, st.y - yFt);
+      const dB = alt ? Math.hypot(alt.x - xFt, alt.y - yFt) : Infinity;
+      if (Math.min(dA, dB) <= CHOICE_TAP_FT) {
+        pickStartChoice(dA <= dB ? "A" : "B");
+      } else {
+        pickStartChoice(null);
+        fusionEngine.cancelLocating();
+        setPendingStart({ x: xFt, y: yFt });
+        setNavPhase("picking");
+      }
+      return;
+    }
     // Recording a test: a tap while navigating marks where you REALLY are.
     if (testRecorder.active && navPhase === "navigating" && !fusionState.positionAmbiguous) {
       testRecorder.add("truth", { x: xFt, y: yFt });
@@ -1795,6 +2049,10 @@ function FusionMapScreen({
   };
 
   const handleStop = () => {
+    pickStartChoice(null);
+    settlingRef.current = false;
+    setSettling(false);
+    choiceDuringNavRef.current = false;
     autoCalRef.current.stop("stopped");
     setAutoCalStatus(autoCalRef.current.getStatus());
     setPendingStart(null);
@@ -1805,6 +2063,10 @@ function FusionMapScreen({
 
   /** Throws away the current fix and locates again from scratch. */
   const handleReLocate = () => {
+    pickStartChoice(null);
+    settlingRef.current = false;
+    setSettling(false);
+    choiceDuringNavRef.current = false;
     autoCalRef.current.stop("relocating");
     setAutoCalStatus(autoCalRef.current.getStatus());
     coldStartDoneRef.current = false;
@@ -1866,7 +2128,7 @@ function FusionMapScreen({
     const lines = [];
     for (const [k, b, base] of [[1, bleStats.b1, start.p1], [2, bleStats.b2, start.p2]]) {
       if (!b?.id) {
-        lines.push({ key: k, bad: true, text: `B${k}: not selected — pick it in Signal Lab` });
+        lines.push({ key: k, bad: true, text: `B${k}: not selected — pick it in the Raw tab` });
         continue;
       }
       const heard = Math.max(0, (b.totalPackets ?? 0) - base);
@@ -1959,7 +2221,7 @@ function FusionMapScreen({
             <View style={[styles.statusBanner, styles.statusBannerWarn]}>
               <Text style={styles.statusBannerText}>
                 📡 Scanning, but {!b1Selected && !b2Selected ? "no beacons are" : "one beacon isn't"} selected yet.
-                Pick B1/B2 in the Signal Lab tab.
+                Pick B1/B2 in the Raw tab.
               </Text>
             </View>
           );
@@ -2157,6 +2419,79 @@ function FusionMapScreen({
         </View>
       )}
 
+      <OfficeMapCanvas
+        roomW={roomW} roomH={roomH}
+        anchor1={anchor1} anchor2={anchor2}
+        fusionState={fusionState}
+        d1Ft={d1Ft} d2Ft={d2Ft}
+        b1Name={bleStats.b1?.name} b2Name={bleStats.b2?.name}
+        headingDeg={headingRef?.current ?? 0}
+        headingRef={headingRef}
+        searching={navPhase === "locating" || (navPhase === "navigating" && settling)}
+        searchLabel={navPhase === "locating" ? "Finding your position…" : "Fine-tuning your position…"}
+        bottomPanel={navPhase === "choosing" ? (
+          <View style={styles.choiceBar}>
+            <Text style={styles.choiceTitle}>📍 Where are you? Tap A or B</Text>
+            <View style={styles.choiceRow}>
+              {["A", "B"].map((side) => (
+                <TouchableOpacity
+                  key={side}
+                  style={[styles.choiceBtn, startChoice === side && styles.choiceBtnOn]}
+                  onPress={() => pickStartChoice(side)}
+                >
+                  <Text style={[styles.choiceBtnText, startChoice === side && { color: "#fff" }]}>
+                    {startChoice === side ? `✓ ${side}` : side}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+              <TouchableOpacity
+                style={[styles.choiceStart, !startChoice && { opacity: 0.4 }]}
+                disabled={!startChoice}
+                onPress={() => beginFromChoice(startChoice)}
+              >
+                <Text style={styles.choiceStartText}>▶ Start</Text>
+              </TouchableOpacity>
+            </View>
+            <TouchableOpacity onPress={() => beginFromChoice(null)}>
+              <Text style={styles.choiceLink}>Not sure? Walk to decide</Text>
+            </TouchableOpacity>
+          </View>
+        ) : null}
+        placementMode={placementMode}
+        onBeaconDragEnd={handleBeaconDragEnd}
+        view={view}
+        onViewChange={setView}
+        onAnimateView={animateView}
+        onGestureActive={setMapGestureActive}
+        navPhase={navPhase}
+        obstacles={obstacleMap.items}
+        pickMode={
+          Boolean(obstacleEdit) ||
+          (recState.active && navPhase === "navigating") ||
+          spotCal?.stage === "pick" ||
+          navPhase === "picking" ||
+          navPhase === "choosing" ||
+          navPhase === "locating" ||
+          (navPhase === "navigating" && fusionState.positionAmbiguous)
+        }
+        onMapTap={handleMapTap}
+        startChoice={startChoice}
+        pendingPoint={
+          obstacleEdit?.first
+            ? obstacleEdit.first
+            : spotCal?.point && spotCal.stage !== "done"
+            ? spotCal.point
+            : navPhase === "picking" ? pendingStart : null
+        }
+        savedRoutesOnMap={savedRoutes
+          .filter((r) => shownRouteIds.has(r.id) && isFusionMapRoute(r))
+          .map((r) => ({ id: r.id, points: r.points, color: routeColor(r.id) }))}
+      />
+
+      {/* ── Status cards ─────────────────────────────────────────────────
+          Below the map, not above it: these appear, grow and disappear as
+          locating goes on, and above the map every change pushed the map
+          down (a tall dark card where the map had just been). */}
       {navPhase === "picking" && (
         <View style={[styles.statusBanner, styles.fixBannerWaiting]}>
           <Text style={styles.statusBannerText}>
@@ -2168,22 +2503,16 @@ function FusionMapScreen({
       )}
 
       {navPhase === "locating" && (
-        <View style={[styles.statusBanner, styles.fixBannerWaiting]}>
-          <Text style={styles.statusBannerText}>
-            ◎ Finding your position — stand still ({Math.round((locateStartRef.current.t ? (locateClock || Date.now()) - locateStartRef.current.t : 0) / 1000)} s).{" "}
+        <View style={[styles.statusBanner, styles.fixBannerWaiting, styles.statusCard]}>
+          <Text style={[styles.statusCardText, { fontWeight: "700" }]}>
+            ◎ Finding your position — please stand still
+          </Text>
+          <Text style={styles.locateDiag}>
+            {Math.round((locateStartRef.current.t ? (locateClock || Date.now()) - locateStartRef.current.t : 0) / 1000)} s ·{" "}
             {locProgress?.samples
               ? `${locProgress.samples} readings collected`
               : "waiting for both beacons"}
           </Text>
-          <Text style={[styles.locateDiag, { color: C.textPrimary }]}>
-            Taking too long? Tap where you are on the map to start there.
-          </Text>
-          <Text style={styles.locateDiag}>{describeRunningBundle()}</Text>
-          {locateDiagnostics.map((line) => (
-            <Text key={line.key} style={[styles.locateDiag, line.bad && { color: C.accentOrange }]}>
-              {line.text}
-            </Text>
-          ))}
           <View style={styles.locateTrack}>
             <View
               style={[
@@ -2192,6 +2521,26 @@ function FusionMapScreen({
               ]}
             />
           </View>
+          {/* Only what needs attention: a beacon not heard, or barely. */}
+          {locateDiagnostics.filter((line) => line.bad).map((line) => (
+            <Text key={line.key} style={[styles.locateDiag, { color: C.accentOrange }]}>
+              {line.text}
+            </Text>
+          ))}
+          <Text style={styles.locateDiag}>
+            Taking too long? Tap where you are on the map to start there.
+          </Text>
+        </View>
+      )}
+
+      {navPhase === "navigating" && settling && (
+        <View style={[styles.statusBanner, styles.fixBannerWaiting, styles.statusCard]}>
+          <Text style={[styles.statusCardText, { fontWeight: "700" }]}>
+            ◎ Fine-tuning your position — a moment more
+          </Text>
+          <Text style={styles.locateDiag}>
+            Your dot appears as soon as the position is steady, or when you start walking.
+          </Text>
         </View>
       )}
 
@@ -2203,8 +2552,8 @@ function FusionMapScreen({
           come out pointing anywhere. This is asked once and then remembered,
           since it is a property of the building, not of the session. */}
       {(navPhase === "located" || navPhase === "navigating") && !headingCalibrated && (
-        <View style={[styles.statusBanner, styles.fixBannerWarn]}>
-          <Text style={styles.statusBannerText}>
+        <View style={[styles.statusBanner, styles.fixBannerWarn, styles.statusCard]}>
+          <Text style={styles.statusCardText}>
             🧭 Set your forward direction before walking. Stand facing the way the map's
             ↑ (up / +Y) points, then tap Zero Heading. Without this the path will be drawn
             rotated away from the direction you actually walk.
@@ -2242,7 +2591,7 @@ function FusionMapScreen({
           action that fixes it, instead of the app quietly picking one. */}
       {!placementMode && (() => {
         const st = fusionState;
-        if (st.positionAmbiguous) {
+        if (st.positionAmbiguous && navPhase !== "choosing") {
           return (
             <View style={[styles.statusBanner, styles.fixBannerAmbiguous]}>
               <Text style={styles.statusBannerText}>
@@ -2286,8 +2635,7 @@ function FusionMapScreen({
                   ? "Both ranges together are shorter than the gap between the beacons, which " +
                     "cannot happen. Ranging is reading short."
                   : "Beacon " + issue.suspectBeacon + " reports further away than the room is big."}
-                {" "}This is a calibration fault, not noise — run Ranging Calibration in Signal Lab
-                (two 20-second stands, no measuring needed).
+                {" "}This is a calibration fault, not noise — check Measured Power and n in the Raw tab.
               </Text>
             </View>
           );
@@ -2297,8 +2645,7 @@ function FusionMapScreen({
             <View style={[styles.statusBanner, styles.fixBannerWarn]}>
               <Text style={styles.statusBannerText}>
                 ⚠ Beacon distances disagree with their measured spacing by ~{initialFix.adjustmentFt.toFixed(0)} ft.
-                That is a calibration problem, not noise — run Ranging Calibration in Signal Lab,
-                which measures both beacons against their spacing on this floor plan.
+                That is a calibration problem, not noise — check Measured Power and n in the Raw tab.
               </Text>
             </View>
           );
@@ -2315,42 +2662,6 @@ function FusionMapScreen({
         }
         return null;
       })()}
-
-      <OfficeMapCanvas
-        roomW={roomW} roomH={roomH}
-        anchor1={anchor1} anchor2={anchor2}
-        fusionState={fusionState}
-        d1Ft={d1Ft} d2Ft={d2Ft}
-        b1Name={bleStats.b1?.name} b2Name={bleStats.b2?.name}
-        headingDeg={headingRef?.current ?? 0}
-        placementMode={placementMode}
-        onBeaconDragEnd={handleBeaconDragEnd}
-        view={view}
-        onViewChange={setView}
-        onAnimateView={animateView}
-        onGestureActive={setMapGestureActive}
-        navPhase={navPhase}
-        obstacles={obstacleMap.items}
-        pickMode={
-          Boolean(obstacleEdit) ||
-          (recState.active && navPhase === "navigating") ||
-          spotCal?.stage === "pick" ||
-          navPhase === "picking" ||
-          navPhase === "locating" ||
-          (navPhase === "navigating" && fusionState.positionAmbiguous)
-        }
-        onMapTap={handleMapTap}
-        pendingPoint={
-          obstacleEdit?.first
-            ? obstacleEdit.first
-            : spotCal?.point && spotCal.stage !== "done"
-            ? spotCal.point
-            : navPhase === "picking" ? pendingStart : null
-        }
-        savedRoutesOnMap={savedRoutes
-          .filter((r) => shownRouteIds.has(r.id) && isFusionMapRoute(r))
-          .map((r) => ({ id: r.id, points: r.points, color: routeColor(r.id) }))}
-      />
 
       {/* Controls */}
       <View style={styles.btnRow}>
@@ -2399,6 +2710,12 @@ function FusionMapScreen({
                 </TouchableOpacity>
               </>
             )}
+            {/* A / B, Start and Walk to decide are on the map (choice bar). */}
+            {navPhase === "choosing" && (
+              <TouchableOpacity style={[styles.secondaryBtn, { flex: 1 }]} onPress={handleStop}>
+                <Text style={styles.secondaryBtnText}>✕ Cancel</Text>
+              </TouchableOpacity>
+            )}
             {navPhase === "located" && (
               <>
                 <TouchableOpacity style={[styles.secondaryBtn, { flex: 1, marginRight: 10 }]} onPress={handleReLocate}>
@@ -2422,6 +2739,19 @@ function FusionMapScreen({
           </>
         )}
       </View>
+      {/* Wheelchair mode: one tap = one push of the wheels (Settings sets its
+          length). Rolling is also detected from the wheels' vibration. */}
+      {!placementMode && mobilityMode === "wheelchair" &&
+        (navPhase === "navigating" || navPhase === "choosing" || navPhase === "locating") && (
+        <TouchableOpacity
+          style={[styles.primaryBtn, { marginBottom: 12, paddingVertical: 20 }]}
+          onPress={() => wheelchairEngine.push()}
+        >
+          <Text style={[styles.primaryBtnText, { fontSize: 17 }]}>
+            ♿ Push ({wheelchairEngine.settings.pushM.toFixed(1)} m)
+          </Text>
+        </TouchableOpacity>
+      )}
       {!placementMode && navPhase === "idle" && (
         <TouchableOpacity style={[styles.secondaryBtn, { marginBottom: 12 }]} onPress={handleStartPicking}>
           <Text style={styles.secondaryBtnText}>👆 Set My Start on the Map</Text>
@@ -2717,6 +3047,44 @@ const styles = StyleSheet.create({
     borderRadius: 6, paddingHorizontal: 7, paddingVertical: 3,
   },
   zoomBadgeText: { color: "#8b949e", fontSize: 11, fontWeight: "700" },
+  searchOverlay: {
+    position: "absolute", top: 0, left: 0, right: 0, bottom: 0,
+    alignItems: "center", justifyContent: "center",
+    backgroundColor: "rgba(13,17,23,0.35)",
+  },
+  searchPulseBox: { width: 130, height: 130, alignItems: "center", justifyContent: "center" },
+  searchRing: {
+    position: "absolute", width: 130, height: 130, borderRadius: 65,
+    borderWidth: 3, borderColor: C.accent, backgroundColor: "rgba(31,111,235,0.10)",
+  },
+  searchCore: {
+    width: 18, height: 18, borderRadius: 9, backgroundColor: C.accent,
+    borderWidth: 3, borderColor: "#fff",
+  },
+  searchChip: {
+    marginTop: 10, backgroundColor: "rgba(13,17,23,0.88)", borderRadius: 16,
+    borderWidth: 1, borderColor: C.accent, paddingHorizontal: 14, paddingVertical: 6,
+  },
+  searchChipText: { color: "#e6edf3", fontSize: 13, fontWeight: "700" },
+  choiceBar: {
+    position: "absolute", left: 10, right: 10, bottom: 10,
+    backgroundColor: "rgba(13,17,23,0.92)", borderRadius: 12,
+    borderWidth: 1, borderColor: C.accent, paddingHorizontal: 10, paddingVertical: 8,
+  },
+  choiceTitle: { color: "#e6edf3", fontSize: 13, fontWeight: "800" },
+  choiceRow: { flexDirection: "row", alignItems: "center", marginTop: 6 },
+  choiceBtn: {
+    flex: 1, height: 36, marginRight: 6, borderRadius: 8, borderWidth: 1, borderColor: "#30363d",
+    alignItems: "center", justifyContent: "center", backgroundColor: "rgba(255,255,255,0.06)",
+  },
+  choiceBtnOn: { backgroundColor: C.accent, borderColor: C.accent },
+  choiceBtnText: { color: "#e6edf3", fontSize: 15, fontWeight: "800" },
+  choiceStart: {
+    flex: 1.3, height: 36, borderRadius: 8, backgroundColor: "#238636",
+    alignItems: "center", justifyContent: "center",
+  },
+  choiceStartText: { color: "#fff", fontSize: 14, fontWeight: "800" },
+  choiceLink: { color: "#8b949e", fontSize: 12, marginTop: 6, textAlign: "center" },
 
   fixBannerReady: { backgroundColor: "rgba(63,185,80,0.13)", borderColor: "#3fb950" },
   locateTrack: {
@@ -2831,6 +3199,11 @@ const styles = StyleSheet.create({
   statusBannerWarn: { backgroundColor: "#2b2111", borderColor: C.accentOrange },
   statusBannerError: { backgroundColor: "#2b1618", borderColor: C.accentRed },
   statusBannerText: { flex: 1, fontSize: 12, color: C.textPrimary, lineHeight: 17 },
+  // A status card with several lines: stacked top to bottom. In the banner's
+  // row layout each line became a narrow column side by side - a tall card,
+  // mostly empty, under the map while locating.
+  statusCard: { flexDirection: "column", alignItems: "stretch", justifyContent: "flex-start", gap: 0 },
+  statusCardText: { fontSize: 12, color: C.textPrimary, lineHeight: 17 },
   statusBannerBtn: {
     backgroundColor: C.surfaceAlt, borderRadius: 6, paddingHorizontal: 10,
     paddingVertical: 6, borderWidth: 1, borderColor: C.border,

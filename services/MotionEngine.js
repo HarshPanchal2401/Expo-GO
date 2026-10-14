@@ -52,6 +52,8 @@ export const MOTION_CONFIG = {
   // remove jitter above the gait band (low-pass).
   HP_TAU_S: 0.75,
   LP_CUTOFF_HZ: 3.0,
+  // Vertical acceleration is clipped to this (g) before the band-pass.
+  VERT_CLIP_G: 4,
   // Activity window and how often it is evaluated.
   WINDOW_S: 2.5,
   EVAL_EVERY_MS: 250,
@@ -88,6 +90,8 @@ export const MOTION_CONFIG = {
   // A peak must be at least this fraction of the recent steps' bounce
   // (slowing down / standing after a walk makes small bumps).
   MIN_BOUNCE_FRAC: 0.45,
+  // ...and at most this multiple of it (more is a knock, not a step).
+  MAX_BOUNCE_FRAC: 4,
   // ...unless it lands right on the beat: a phone in one trouser pocket feels
   // the far leg's steps much weaker than its own leg's.
   ON_BEAT_TOLERANCE: 0.25,
@@ -95,13 +99,22 @@ export const MOTION_CONFIG = {
   EXIT_EVALS: 3,
   // Peak detection.
   PEAK_STD_FRAC: 0.35,
+  // Window samples beyond this many median absolute deviations are a jolt,
+  // clipped before the spread and the rhythm are measured.
+  JOLT_CLIP_MAD: 5,
   MIN_PEAK_G: 0.015,
   MIN_STEP_GAP_S: 0.25,
   GAP_PERIOD_FRAC: 0.6,
   // Walking also ends after this many step periods without a peak.
   STOP_NO_STEP_PERIODS: 2.5,
-  // Heading samples kept for per-stride heading.
-  HEADING_HISTORY_S: 6,
+  // Candidate peaks are kept this long before walking is confirmed. When it
+  // is, the steps of the confirming window are released and, before them,
+  // every earlier peak that continues the same rhythm: confirming can take
+  // several seconds (a restart with the phone in a pocket), and steps older
+  // than the window used to be lost.
+  PEAK_HISTORY_S: 8,
+  // Heading samples kept for per-stride heading (covers PEAK_HISTORY_S).
+  HEADING_HISTORY_S: 10,
 };
 
 const wrap180 = (d) => ((((d + 180) % 360) + 360) % 360) - 180;
@@ -202,6 +215,7 @@ export class MotionEngine {
     this.lastStepT = null;
     this.periodS = null;
     this.stats = { corr: 0, stdG: 0, vertShare: 0, rotDps: 0, periodS: null };
+    this.peakSpreadG = null;   // robust spread of the window (g), for peaks
     this.steps = 0;
     this.reason = "standing";
   }
@@ -234,7 +248,11 @@ export class MotionEngine {
     const grav = gt.g, acc = gt.a;
     const gn = Math.hypot(grav.x, grav.y, grav.z) || 1;
     const dx = acc.x - grav.x, dy = acc.y - grav.y, dz = acc.z - grav.z;
-    const vert = (dx * grav.x + dy * grav.y + dz * grav.z) / gn;
+    // A knock is clipped to what walking can produce: unclipped, one large
+    // sample stays in the band-pass filter's memory for seconds and hides
+    // the steps that follow it.
+    const vertRaw = (dx * grav.x + dy * grav.y + dz * grav.z) / gn;
+    const vert = Math.max(-cfg.VERT_CLIP_G, Math.min(cfg.VERT_CLIP_G, vertRaw));
     const h2 = Math.max(0, dx * dx + dy * dy + dz * dz - vert * vert);
 
     // Band-pass.
@@ -314,10 +332,26 @@ export class MotionEngine {
     let mean = 0;
     for (const xi of x) mean += xi;
     mean /= n;
+    for (let i = 0; i < n; i++) x[i] -= mean;
+    // A single jolt (the phone knocked, put down, bumped in a pocket) is
+    // tens of times bigger than a step. Left in, it swamps the spread - every
+    // real step then falls under the peak threshold - and the rhythm check,
+    // for the 2.5 s it stays in the window. So: a spread a jolt cannot move
+    // (median absolute deviation; about the std for walking), and samples
+    // beyond JOLT_CLIP_MAD of it clipped before the std and the rhythm.
+    const absDev = x.map(Math.abs).sort((p, q) => p - q);
+    const mad = Math.max(cfg.MIN_PEAK_G, absDev[Math.floor(n / 2)]);
+    const clip = cfg.JOLT_CLIP_MAD * mad;
     let varV = 0;
-    for (let i = 0; i < n; i++) { x[i] -= mean; varV += x[i] * x[i]; }
+    for (let i = 0; i < n; i++) {
+      if (x[i] > clip) x[i] = clip;
+      else if (x[i] < -clip) x[i] = -clip;
+      varV += x[i] * x[i];
+    }
     varV /= n;
     const stdG = Math.sqrt(varV);
+    // Peak threshold spread: never above the plain std.
+    this.peakSpreadG = Math.min(stdG, mad);
 
     const kMin = Math.max(1, Math.round(cfg.MIN_PERIOD_S * cfg.RESAMPLE_HZ));
     const kMax = Math.min(n - 10, Math.round(cfg.MAX_PERIOD_S * cfg.RESAMPLE_HZ));
@@ -439,17 +473,50 @@ export class MotionEngine {
       const med = sb[Math.floor(sb.length / 2)];
       while (sel.length && sel[0].bounce < cfg.MIN_BOUNCE_FRAC * med) sel.shift();
     }
-    // They must be enough, and evenly spaced at the measured cadence.
+    // They must be enough, and evenly spaced at the measured cadence. A gap
+    // of two periods is one step that made no peak - with the phone in one
+    // trouser pocket the far leg's steps are often too weak - and counts as
+    // that step (it cannot be a pause: walking is continuous here).
     const period = (this.periodS || 0.6) * 1000;
-    const even = sel.slice(1).every((p, i) => Math.abs(p.t - sel[i].t - period) <= cfg.START_GAP_TOLERANCE * period);
+    const tol = cfg.START_GAP_TOLERANCE * period;
+    const stepsIn = (gap) => (Math.abs(gap - period) <= tol ? 1 : Math.abs(gap - 2 * period) <= tol ? 2 : 0);
+    const even = sel.slice(1).every((p, i) => stepsIn(p.t - sel[i].t) > 0);
     if (sel.length < cfg.START_MIN_PEAKS || !even) {
       this.reason = "checking walking rhythm";
       return;
     }
     this.walking = true;
     this.enterCount = 0;
-    // Release them, each with its own time (and so its own heading).
-    for (const p of sel) this._emit(p.t, p.bounce, true);
+    // Earlier steps of the same walk: going back from the first released
+    // step, each older peak one (or two) periods before it and as strong as
+    // the walking. An extra bump in between is skipped; a longer gap or a
+    // weak bump is where the walk began. Never before the last step already
+    // counted. Confirming can take several seconds (a restart with the phone
+    // in a pocket); these steps used to be lost.
+    const relB = sel.map((p) => p.bounce).sort((x, y) => x - y);
+    const medB = relB[Math.floor(relB.length / 2)];
+    const earlier = [];
+    let first = sel[0];
+    for (let i = this.peaks.length - 1; i >= 0; i--) {
+      const p = this.peaks[i];
+      if (p.t >= first.t) continue;
+      if (this.lastStepT !== null && p.t <= this.lastStepT) break;
+      const gap = first.t - p.t;
+      if (gap < period - tol) continue;
+      if (!stepsIn(gap) || p.bounce < cfg.MIN_BOUNCE_FRAC * medB) break;
+      earlier.unshift(p);
+      first = p;
+    }
+    // Release them, each with its own time (and so its own heading), with
+    // the missing step of a two-period gap half way between its neighbours.
+    const all = [...earlier, ...sel];
+    all.forEach((p, i) => {
+      const prev = all[i - 1];
+      if (prev && stepsIn(p.t - prev.t) === 2) {
+        this._emit((prev.t + p.t) / 2, Math.min(prev.bounce, p.bounce), true);
+      }
+      this._emit(p.t, p.bounce, true);
+    });
     this.peaks = [];
   }
 
@@ -461,7 +528,7 @@ export class MotionEngine {
 
   _onPeak(p) {
     const cfg = this.cfg;
-    const thr = Math.max(cfg.MIN_PEAK_G, cfg.PEAK_STD_FRAC * (this.stats.stdG || 0));
+    const thr = Math.max(cfg.MIN_PEAK_G, cfg.PEAK_STD_FRAC * (this.peakSpreadG ?? this.stats.stdG ?? 0));
     if (p.v < thr) return;
     const bounce = p.v - (Number.isFinite(this.valleyMin) ? this.valleyMin : -p.v);
     this.valleyMin = Infinity;
@@ -470,6 +537,9 @@ export class MotionEngine {
     if (this.walking) {
       const rb = [...this.recentBounces].sort((a, b) => a - b);
       const med = rb.length >= 3 ? rb[Math.floor(rb.length / 2)] : null;
+      // Far stronger than the steps so far: the phone was knocked or put
+      // down (stopping often ends with one), not a step.
+      if (med !== null && bounce > cfg.MAX_BOUNCE_FRAC * med) return;
       if (med !== null && bounce < cfg.MIN_BOUNCE_FRAC * med) {
         const period = (this.periodS || 0.6) * 1000;
         const onBeat = this.lastStepT !== null && Math.abs(p.t - this.lastStepT - period) <= cfg.ON_BEAT_TOLERANCE * period;
@@ -478,7 +548,7 @@ export class MotionEngine {
       this._emit(p.t, bounce, false);
     } else {
       this.peaks.push({ t: p.t, bounce });
-      const cut = p.t - this.cfg.WINDOW_S * 1000;
+      const cut = p.t - this.cfg.PEAK_HISTORY_S * 1000;
       while (this.peaks.length && this.peaks[0].t < cut) this.peaks.shift();
     }
   }

@@ -24,7 +24,9 @@ import {
   saveAppSettings,
   resetAppSettings,
   DEFAULT_APP_SETTINGS,
+  getAppSettings,
 } from "../services/appSettingsStorage.js";
+import { wheelchairEngine } from "../services/WheelchairEngine.js";
 
 let Updates = null;
 try {
@@ -147,6 +149,8 @@ export default function AppSettingsScreen() {
           <Text style={s.successText}>✅ Parameters saved and active immediately!</Text>
         </View>
       )}
+
+      <MobilityCard settings={settings} updateParam={updateParam} onSaved={(cfg) => setSettings(cfg)} />
 
       {/* ──────────────────────────────────────────────────────────────────── */}
       {/* SECTION 3: PDR STEP DETECTOR & WEINBERG STRIDE                       */}
@@ -277,6 +281,195 @@ export default function AppSettingsScreen() {
         </Pressable>
       </View>
     </ScrollView>
+  );
+}
+
+// ============================================================================
+// MobilityCard — walking or wheelchair, and the wheelchair's speed / push
+// ============================================================================
+const FT_PER_M = 3.2808;
+const SENSITIVITIES = [
+  { key: "low", label: "Low" },
+  { key: "medium", label: "Medium" },
+  { key: "high", label: "High" },
+];
+
+function MobilityCard({ settings, updateParam, onSaved }) {
+  const wheelchair = settings.mobilityMode === "wheelchair";
+  // The engine only runs once wheelchair mode is SAVED (it is the app's
+  // sensors that feed it), so calibration waits for that.
+  const savedWheelchair = getAppSettings()?.mobilityMode === "wheelchair";
+  const [cal, setCal] = useState(null);       // null | {progress}
+  const [distFt, setDistFt] = useState("");
+
+  useEffect(() => {
+    if (!cal) return undefined;
+    const id = setInterval(() => setCal({ progress: wheelchairEngine.getCalibrationProgress() }), 400);
+    return () => clearInterval(id);
+  }, [cal !== null]);
+
+  const startCal = () => {
+    wheelchairEngine.beginCalibration();
+    setDistFt("");
+    setCal({ progress: wheelchairEngine.getCalibrationProgress() });
+  };
+  const cancelCal = () => {
+    wheelchairEngine.cancelCalibration();
+    setCal(null);
+  };
+  const finishCal = async () => {
+    const ft = parseFloat(distFt);
+    const res = wheelchairEngine.finishCalibration(ft / FT_PER_M);
+    setCal(null);
+    if (!res.ok) {
+      Alert.alert("Calibration not saved", res.reason);
+      return;
+    }
+    const patch = res.pushM !== undefined ? { wheelchairPushM: res.pushM } : { wheelchairSpeedMps: res.speedMps };
+    const cfg = await saveAppSettings(patch);
+    onSaved?.(cfg);
+    Alert.alert(
+      "Wheelchair calibrated",
+      res.pushM !== undefined
+        ? `${res.pushes} pushes → ${res.pushM.toFixed(2)} m (${(res.pushM * FT_PER_M).toFixed(1)} ft) per push.`
+        : `${res.rollS} s of rolling → ${res.speedMps.toFixed(2)} m/s.`
+    );
+  };
+
+  return (
+    <View style={s.card}>
+      <View style={s.cardHeader}>
+        <View style={{ flex: 1 }}>
+          <Text style={s.cardTitle}>♿ Mobility</Text>
+          <Text style={s.cardDesc}>
+            Walking counts steps. A wheelchair makes no steps, so in Wheelchair mode movement comes from the wheels'
+            vibration (rolling) and from the Push button on the Fusion Map. Direction comes from the gyro in both.
+          </Text>
+        </View>
+      </View>
+
+      <View style={s.unitGroup}>
+        {[{ key: "walking", label: "🚶 Walking" }, { key: "wheelchair", label: "♿ Wheelchair" }].map((m) => {
+          const on = (settings.mobilityMode || "walking") === m.key;
+          return (
+            <Pressable key={m.key} onPress={() => updateParam("mobilityMode", m.key)} style={[s.unitBtn, on && s.unitBtnActive]}>
+              <Text style={[s.unitBtnText, on && s.unitBtnTextActive]}>{m.label}</Text>
+            </Pressable>
+          );
+        })}
+      </View>
+
+      {wheelchair && (
+        <>
+          <Pressable
+            onPress={() => updateParam("wheelchairAuto", settings.wheelchairAuto === false)}
+            style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: 10, marginTop: 6 }}
+          >
+            <View style={{ flex: 1, paddingRight: 12 }}>
+              <Text style={{ color: "#1e293b", fontSize: 13, fontWeight: "700" }}>Detect Rolling Automatically</Text>
+              <Text style={{ color: "#64748b", fontSize: 11, marginTop: 2 }}>
+                ON: the wheels' vibration moves you at the speed below. OFF: only the Push button moves you (best on carpet).
+              </Text>
+            </View>
+            <Text style={{ fontWeight: "800", fontSize: 13, color: settings.wheelchairAuto !== false ? "#3fb950" : "#f85149" }}>
+              {settings.wheelchairAuto !== false ? "ON" : "OFF"}
+            </Text>
+          </Pressable>
+
+          <View style={s.inputRowStacked}>
+            <Text style={s.inputLabel}>Rolling Sensitivity</Text>
+            <Text style={[s.inputHint, { marginBottom: 6 }]}>
+              Higher = less vibration needed to count as rolling. Raise it if rolling is missed; lower it if you move while still.
+              The PDR tab shows the live vibration level.
+            </Text>
+            <View style={s.unitGroup}>
+              {SENSITIVITIES.map((o) => {
+                const on = (settings.wheelchairSensitivity || "medium") === o.key;
+                return (
+                  <Pressable key={o.key} onPress={() => updateParam("wheelchairSensitivity", o.key)} style={[s.unitBtn, on && s.unitBtnActive]}>
+                    <Text style={[s.unitBtnText, on && s.unitBtnTextActive]}>{o.label}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+          </View>
+
+          <SettingNumberRow
+            label="Rolling Speed"
+            hint="How fast you roll (typical manual chair indoors: 0.6 - 1.0). Calibrate below."
+            unit="m/s"
+            value={settings.wheelchairSpeedMps}
+            step={0.05}
+            min={0.2}
+            max={2.5}
+            decimals={2}
+            onChange={(val) => updateParam("wheelchairSpeedMps", val)}
+          />
+
+          <SettingNumberRow
+            label="Push Length"
+            hint="Distance moved by one tap of the Push button. Calibrate below."
+            unit="m"
+            value={settings.wheelchairPushM}
+            step={0.1}
+            min={0.3}
+            max={3}
+            decimals={2}
+            onChange={(val) => updateParam("wheelchairPushM", val)}
+          />
+
+          {/* Calibration: move a measured distance. Pushes counted -> push
+              length; otherwise the rolling time -> speed. */}
+          <View style={s.inputRowStacked}>
+            <Text style={s.inputLabel}>Calibrate</Text>
+            <Text style={[s.inputHint, { marginBottom: 6 }]}>
+              Mark a start and end at least 15 ft apart. Press Start, then either roll there normally (sets the speed) or
+              tap Push once for each push you make (sets the push length). Enter the distance and press Finish.
+            </Text>
+            {!savedWheelchair ? (
+              <Text style={[s.inputHint, { color: "#b45309" }]}>Save Wheelchair mode first (Save & Apply above).</Text>
+            ) : !cal ? (
+              <Pressable onPress={startCal} style={[s.unitBtn, s.unitBtnActive]}>
+                <Text style={[s.unitBtnText, s.unitBtnTextActive]}>▶ Start Calibration</Text>
+              </Pressable>
+            ) : (
+              <>
+                <Text style={[s.inputHint, { color: "#0f172a", fontWeight: "700" }]}>
+                  {`Rolling detected: ${(cal.progress.rollS || 0).toFixed(1)} s · Pushes: ${cal.progress.pushes || 0}`}
+                </Text>
+                <View style={[s.unitGroup, { marginTop: 6 }]}>
+                  <Pressable onPress={() => wheelchairEngine.push()} style={[s.unitBtn, { paddingVertical: 14 }]}>
+                    <Text style={s.unitBtnText}>♿ Push</Text>
+                  </Pressable>
+                </View>
+                <View style={[s.inputRow, { borderTopWidth: 0 }]}>
+                  <Text style={s.inputLabel}>Distance moved (ft)</Text>
+                  <TextInput
+                    style={s.stepperInput}
+                    value={distFt}
+                    onChangeText={setDistFt}
+                    keyboardType="decimal-pad"
+                    placeholder="ft"
+                  />
+                </View>
+                <View style={s.unitGroup}>
+                  <Pressable onPress={cancelCal} style={s.unitBtn}>
+                    <Text style={s.unitBtnText}>Cancel</Text>
+                  </Pressable>
+                  <Pressable
+                    onPress={finishCal}
+                    disabled={!(parseFloat(distFt) > 0)}
+                    style={[s.unitBtn, s.unitBtnActive, !(parseFloat(distFt) > 0) && { opacity: 0.45 }]}
+                  >
+                    <Text style={[s.unitBtnText, s.unitBtnTextActive]}>✓ Finish</Text>
+                  </Pressable>
+                </View>
+              </>
+            )}
+          </View>
+        </>
+      )}
+    </View>
   );
 }
 

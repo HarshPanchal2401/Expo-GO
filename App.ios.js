@@ -12,7 +12,6 @@ import {
 import { Pedometer, DeviceMotion, Accelerometer, Magnetometer } from "expo-sensors";
 import { getSavedPaths, savePath, deleteSavedPath, clearAllSavedPaths } from "./PathStorage.js";
 import AppSettingsScreen from "./components/AppSettingsScreen.js";
-import BeaconSignalLabScreen from "./components/v2/BeaconSignalLabScreen.js";
 import RawDistanceScreen from "./components/v2/RawDistanceScreen.js";
 import FusionMapScreen from "./components/v2/FusionMapScreen.js";
 import PdrTrackerScreen from "./components/v2/PdrTrackerScreen.js";
@@ -24,6 +23,8 @@ import { stepLengthModel, STEP_MODEL_CONFIG } from "./services/StepLengthModel.j
 import { headingFilter } from "./services/HeadingFilter.js";
 import { StepGate } from "./services/StepGate.js";
 import { MotionEngine } from "./services/MotionEngine.js";
+import { wheelchairEngine } from "./services/WheelchairEngine.js";
+import { testRecorder } from "./services/TestRecorder.js";
 
 // Which sensor heading corresponds to the floor plan's "up". A property of
 // the building, so it is persisted rather than re-established each launch.
@@ -80,7 +81,7 @@ export default function AppIOS() {
   const [savedPaths, setSavedPaths] = useState([]);
   const [selectedPreviousPath, setSelectedPreviousPath] = useState(null);
 
-  // Active Tab: 'pdr' | 'fusionMap' | 'signalLab' | 'settings'
+  // Active Tab: 'pdr' | 'fusionMap' | 'raw' | 'settings' (beacon setup is on 'raw')
   const [activeTab, setActiveTab] = useState("pdr");
   // Read inside sensor callbacks. Live readouts (bounce, heading, magnetic
   // field) are only pushed into React state while the PDR tab shows them:
@@ -135,7 +136,11 @@ export default function AppIOS() {
   // Step engine v2 (services/MotionEngine.js): world-frame vertical
   // acceleration, walking decided from the rhythm of the last 2.5 s, each step
   // with its own stride heading. "classic" in Settings = the old detector.
-  const useClassicSteps = () => appSettingsRef.current?.motionEngine === "classic";
+  // Wheelchair mode (Settings): no steps exist, so neither step detector runs;
+  // movement comes from services/WheelchairEngine.js instead.
+  const isWheelchair = () => appSettingsRef.current?.mobilityMode === "wheelchair";
+  const useClassicSteps = () => !isWheelchair() && appSettingsRef.current?.motionEngine === "classic";
+  const lastWheelStatusRef = useRef(0);
   const addStepRef = useRef(null);
   const motionEngineRef = useRef(null);
   const lastMotionStatusRef = useRef({ at: 0, text: "" });
@@ -150,14 +155,14 @@ export default function AppIOS() {
         return stepLengthModel.estimateCarry(bounceG, info || {}).lengthM;
       },
       onStep: (st) => {
-        if (useClassicSteps()) return;
+        if (useClassicSteps() || isWheelchair()) return;
         if (!runningRef.current && !pdrStepCallbackRef.current) return;
         lastStepTimeRef.current = Date.now();
         // First step since the phone was repositioned: its walking direction
         // was carried over, not measured - the map may widen its heading doubt.
         const headingReset = carryVersionRef.current !== null && st.carryVersion !== carryVersionRef.current;
         carryVersionRef.current = st.carryVersion;
-        addStepRef.current?.(st.lengthM, st.bounceG, st.headingDeg, { carry: st.carry, headingReset });
+        addStepRef.current?.(st.lengthM, st.bounceG, st.headingDeg, { carry: st.carry, headingReset, t: st.t });
         if (activeTabRef.current === "pdr") {
           setStatus(
             `Step ${st.lengthM.toFixed(2)} m` +
@@ -168,6 +173,17 @@ export default function AppIOS() {
         }
       },
     });
+    // Wheelchair: each roll segment / push is handed over like a step.
+    wheelchairEngine.platform = "ios";
+    wheelchairEngine.onMove = (mv) => {
+      if (!isWheelchair()) return;
+      if (!runningRef.current && !pdrStepCallbackRef.current) return;
+      lastStepTimeRef.current = Date.now();
+      addStepRef.current?.(mv.lengthM, 0, mv.headingDeg, { carry: "wheelchair", source: mv.source, t: mv.t });
+      if (activeTabRef.current === "pdr") {
+        setStatus(`♿ ${mv.source === "push" ? "Push" : "Rolling"} ${mv.lengthM.toFixed(2)} m`);
+      }
+    };
   }
   const stepStateRef = useRef({
     state: "IDLE",
@@ -206,9 +222,25 @@ export default function AppIOS() {
       }
     })();
 
+    const applyWheelchair = (s, prevMode) => {
+      wheelchairEngine.setSettings({
+        speedMps: s?.wheelchairSpeedMps,
+        pushM: s?.wheelchairPushM,
+        sensitivity: s?.wheelchairSensitivity,
+        auto: s?.wheelchairAuto !== false,
+      });
+      // Switching mode: start each engine clean, nothing carried over.
+      if (prevMode !== undefined && prevMode !== s?.mobilityMode) {
+        wheelchairEngine.reset();
+        motionEngineRef.current?.reset();
+      }
+    };
+    applyWheelchair(appSettingsRef.current);
     const unsub = subscribeAppSettings((newSettings) => {
+      const prevMode = appSettingsRef.current?.mobilityMode;
       appSettingsRef.current = newSettings;
       setAppSettings(newSettings);
+      applyWheelchair(newSettings, prevMode);
     });
     return () => unsub();
   }, []);
@@ -303,6 +335,7 @@ export default function AppIOS() {
         heading: curHeading,
         carry: extra.carry,
         headingReset: !!extra.headingReset,
+        t: extra.t,
       });
     }
   };
@@ -320,8 +353,11 @@ export default function AppIOS() {
       // Turn detection for BLE ranging (see v2Scanner.notifyHeading).
       v2Scanner.notifyHeading(headingRef.current, nowMs);
       if (activeTabRef.current === "pdr") {
+        // Every PDR-tab readout in one redraw: a separate one per sensor was
+        // ~2x the redraws, and each redraw of that tab delays the steps.
         setHeading(headingRef.current);
         setRawHeading(rawHeadingRef.current);
+        setLiveBounce(stepStateRef.current.liveBounce || 0);
       }
     };
     let isMounted = true;
@@ -408,7 +444,26 @@ export default function AppIOS() {
         const me = motionEngineRef.current;
         me.pushHeading(tMotion, headingFilter.heading);
         me.ingest(data, tMotion);
-        if (!useClassicSteps() && activeTabRef.current === "pdr" && !me.walking &&
+        // Wheelchair mode: movement from the wheels' vibration (and the Push
+        // button on the Fusion Map). Its vibration level is shown once a
+        // second and logged in a recorded test, to tune Sensitivity.
+        if (isWheelchair()) {
+          wheelchairEngine.pushHeading(tMotion, headingFilter.heading);
+          wheelchairEngine.ingest(data, tMotion);
+          if (tMotion - lastWheelStatusRef.current > 1000) {
+            lastWheelStatusRef.current = tMotion;
+            const ws = wheelchairEngine.getStatus();
+            if (testRecorder.active) {
+              testRecorder.add("note", {
+                text: `wheel ${ws.reason} rms=${ws.rmsG.toFixed(4)} start=${ws.thresholdG} tilt=${ws.tiltDps} yaw=${ws.yawDps}`,
+              });
+            }
+            if (activeTabRef.current === "pdr" && (runningRef.current || pdrStepCallbackRef.current)) {
+              setStatus(`♿ ${ws.reason} · vibration ${ws.rmsG.toFixed(3)} g (rolling from ${ws.thresholdG} g)`);
+            }
+          }
+        }
+        if (!isWheelchair() && !useClassicSteps() && activeTabRef.current === "pdr" && !me.walking &&
             tMotion - lastMotionStatusRef.current.at > 1000) {
           const carry = CARRY_LABELS[me.getCarry().mode];
           const text = `Not walking: ${me.reason}` + (carry ? ` (${carry})` : "");
@@ -468,10 +523,9 @@ export default function AppIOS() {
         gravityRef.current = 0.98 * gravityRef.current + 0.02 * ss.filteredMag;
         const dynamicAccel = ss.filteredMag - gravityRef.current;
 
-        if (activeTabRef.current === "pdr" && (!ss.lastLiveBounceUpdate || now - ss.lastLiveBounceUpdate > 100)) {
-          ss.lastLiveBounceUpdate = now;
-          setLiveBounce(Math.abs(dynamicAccel));
-        }
+        // Live bounce readout: shown with the heading (publishHeading), not
+        // as a redraw of its own.
+        ss.liveBounce = Math.abs(dynamicAccel);
 
         // The classic step detector below runs only when selected in Settings.
         if (!useClassicSteps()) return;
@@ -811,15 +865,6 @@ export default function AppIOS() {
         </Pressable>
 
         <Pressable
-          style={[styles.tabBtn, activeTab === "signalLab" && styles.tabBtnActive]}
-          onPress={() => setActiveTab("signalLab")}
-        >
-          <Text style={[styles.tabBtnText, activeTab === "signalLab" && styles.tabBtnTextActive]}>
-            📡 Signal Lab
-          </Text>
-        </Pressable>
-
-        <Pressable
           style={[styles.tabBtn, activeTab === "raw" && styles.tabBtnActive]}
           onPress={() => setActiveTab("raw")}
         >
@@ -875,8 +920,6 @@ export default function AppIOS() {
             handleClearAllPaths={handleClearAllPaths}
             appSettings={appSettings}
           />
-        ) : activeTab === "signalLab" ? (
-          <BeaconSignalLabScreen />
         ) : activeTab === "raw" ? (
           <RawDistanceScreen />
         ) : (

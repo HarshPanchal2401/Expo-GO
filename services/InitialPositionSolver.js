@@ -248,6 +248,10 @@ export function solveInitialPosition({
   // easily puts a correct answer a few feet into a cabin wall); it is then
   // moved onto it.
   const SNAP_TOLERANCE_FT = 4;
+  // ...but asking the user "A or B?" needs both spots really ON the walkable
+  // area (within the plan's resolution). One on it and the other only near it
+  // (on a desk, in a wall) is one spot, not two.
+  const ON_PLAN_FT = 1;
   const onPlan = (c) => (snap ? snap(c) : null);
   const placed = (c) => {
     const s = onPlan(c);
@@ -362,6 +366,30 @@ export function solveInitialPosition({
       adjustmentFt: geo.adjustmentFt,
       geometryQuality: "poor",
     };
+  }
+
+  // Both are near the walkable area, but only one is on it: that one.
+  // Neither on it: the nearer one, if clearly nearer.
+  if (snap) {
+    const onIt = candidates.filter((c) => c.walkable && c.offPlanFt <= ON_PLAN_FT);
+    const byOff = [...candidates].sort((a, b) => a.offPlanFt - b.offPlanFt);
+    const pick = onIt.length === 1 ? onIt[0]
+      : onIt.length === 0 && byOff[1].offPlanFt - byOff[0].offPlanFt >= ON_PLAN_FT ? byOff[0]
+      : null;
+    if (pick) {
+      return {
+        status: "ok",
+        reason: "resolved-by-floor-plan",
+        position: placed(pick),
+        alternate: null,
+        candidates,
+        uncertaintyFt: positionUncertaintyFt(pick, anchor1, anchor2, config),
+        separationFt: Number(separation.toFixed(2)),
+        adjusted: geo.adjusted,
+        adjustmentFt: geo.adjustmentFt,
+        geometryQuality: qualityOf(pick),
+      };
+    }
   }
 
   // Both candidates are legitimately inside the room. Ranges cannot separate

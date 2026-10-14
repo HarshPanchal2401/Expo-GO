@@ -9,7 +9,13 @@
 //          pillar or a no-walk area, or leaves the room is removed - so the
 //          track can only follow walkable paths.
 //   BLE:   (at most twice a second) every particle is weighted by how well it
-//          explains both beacons' ranges. The expected range at a particle
+//          explains both beacons' ranges. A range is smoothed before it gets
+//          here, so it describes where the user was a second or more AGO
+//          (lagMs): each particle is scored at where IT was then - its own
+//          position minus its own moves since. Scored at the current position
+//          instead, the ranges pulled the dot back while walking and taught
+//          the particles that steps were shorter than they are.
+//          The expected range at a particle
 //          includes the walls between it and the beacon (they make the
 //          measured range read long), and a range that is much LONGER than
 //          expected is tolerated more than one that is shorter (an unmodelled
@@ -39,6 +45,9 @@ export const PF_CONFIG = {
   // BLE update: at most this often; tempered (power < 1) because consecutive
   // filtered ranges are strongly correlated, and more so when standing.
   BLE_MIN_INTERVAL_MS: 500,
+  // Ranges older than this are not trusted to be compensated (ms), and moves
+  // are remembered this long for it.
+  BLE_MAX_LAG_MS: 6000,
   BLE_TEMPER_WALKING: 0.6,
   BLE_TEMPER_STILL: 0.25,
   // Range error in log-distance (multiplicative), floor; longer-than-expected
@@ -56,6 +65,10 @@ export const PF_CONFIG = {
   // and the two sides are this far apart.
   AMBIGUITY_MIN_WEIGHT: 0.2,
   AMBIGUITY_MIN_SEP_FT: 4,
+  // ...and two separate groups: at least this many times either side's own
+  // spread apart. One position near the beacon line is cut in half by it,
+  // and its two halves (about 2 spreads apart) are not two places.
+  AMBIGUITY_SEP_SPREAD: 3,
 };
 
 // ── geometry ────────────────────────────────────────────────────────────────
@@ -86,6 +99,8 @@ export class ParticleFilter {
     this.grid = null;
     this.p = [];
     this.lastBleAt = 0;
+    // Recent moves {t, len, h} (feet, deg), for scoring lagged ranges.
+    this.moves = [];
     this._rand = Math.random;
   }
 
@@ -164,6 +179,7 @@ export class ParticleFilter {
   init(candidates) {
     const cfg = this.cfg;
     const cands = candidates.filter((c) => Number.isFinite(c.x) && Number.isFinite(c.y));
+    this.moves = [];
     if (!cands.length) { this.p = []; return; }
     const wSum = cands.reduce((a, c) => a + (c.weight ?? 1), 0);
     this.p = [];
@@ -193,9 +209,12 @@ export class ParticleFilter {
    * carried over rather than measured, so each particle's heading bias is
    * re-spread once by that much and the map / beacons pick the right one.
    */
-  step(lenFt, headingDeg, headingJumpSdDeg = 0) {
+  step(lenFt, headingDeg, headingJumpSdDeg = 0, now = Date.now()) {
     if (!this.active || !Number.isFinite(lenFt) || !Number.isFinite(headingDeg)) return;
     const cfg = this.cfg;
+    const last = this.moves[this.moves.length - 1];
+    this.moves.push({ t: last && last.t > now ? last.t : now, len: lenFt, h: headingDeg });
+    while (this.moves.length && this.moves[0].t < now - cfg.BLE_MAX_LAG_MS - 2000) this.moves.shift();
     const moved = [];
     let okW = 0, allW = 0;
     const jump = Number.isFinite(headingJumpSdDeg) && headingJumpSdDeg > 0 ? headingJumpSdDeg : 0;
@@ -223,10 +242,30 @@ export class ParticleFilter {
   }
 
   /**
+   * The moves made since `since` (ms), as sums of len*sin(h) and len*cos(h).
+   * A move is spread over the time since the previous one (at most 1.5 s), so
+   * a cut-off inside it counts the matching part.
+   */
+  _movedSince(since) {
+    let sx = 0, sy = 0;
+    for (let i = this.moves.length - 1; i >= 0; i--) {
+      const m = this.moves[i];
+      if (m.t <= since) break;
+      const prevT = i > 0 ? Math.max(this.moves[i - 1].t, m.t - 1500) : m.t - 1500;
+      const f = m.t - prevT > 0 ? Math.min(1, (m.t - since) / (m.t - prevT)) : 1;
+      const r = (m.h * Math.PI) / 180;
+      sx += f * m.len * Math.sin(r);
+      sy += f * m.len * Math.cos(r);
+    }
+    return { sx, sy };
+  }
+
+  /**
    * BLE ranges (feet) and their 1-sigma (feet); a beacon with no usable range
    * is passed as null. walking: tempers the update less while moving.
+   * lagMs {1, 2}: how long ago each range describes (smoothing + age).
    */
-  updateBle(d1, d2, s1, s2, walking, now = Date.now()) {
+  updateBle(d1, d2, s1, s2, walking, now = Date.now(), lagMs = null) {
     if (!this.active) return false;
     const cfg = this.cfg;
     if (now - this.lastBleAt < cfg.BLE_MIN_INTERVAL_MS) return false;
@@ -235,7 +274,8 @@ export class ParticleFilter {
       const b = this.beacons[num];
       if (!b || !Number.isFinite(d) || d <= 0) continue;
       const sig = Math.max(cfg.BLE_LN_SIGMA_MIN, Number.isFinite(s) && s > 0 ? s / d : 0.3);
-      meas.push({ num, b, lnD: Math.log(Math.max(0.3, d)), sig });
+      const lag = Math.min(cfg.BLE_MAX_LAG_MS, Math.max(0, Number(lagMs?.[num]) || 0));
+      meas.push({ num, b, lnD: Math.log(Math.max(0.3, d)), sig, back: lag > 0 ? this._movedSince(now - lag) : null });
     }
     if (!meas.length) return false;
     this.lastBleAt = now;
@@ -244,9 +284,17 @@ export class ParticleFilter {
     for (const q of this.p) {
       if (q.lw === -Infinity) continue;
       let ll = 0;
+      const cb = Math.cos((q.b * Math.PI) / 180), sb = Math.sin((q.b * Math.PI) / 180);
       for (const m of meas) {
-        const geo = Math.max(0.5, Math.hypot(q.x - m.b.x, q.y - m.b.y));
-        const f = this.rangeFactor ? this.rangeFactor(q.x, q.y, m.num) : 1;
+        // Where this particle was when the range was measured: its own scale
+        // and heading bias applied to the moves made since.
+        let px = q.x, py = q.y;
+        if (m.back) {
+          px -= q.s * (cb * m.back.sx + sb * m.back.sy);
+          py -= q.s * (cb * m.back.sy - sb * m.back.sx);
+        }
+        const geo = Math.max(0.5, Math.hypot(px - m.b.x, py - m.b.y));
+        const f = this.rangeFactor ? this.rangeFactor(px, py, m.num) : 1;
         const r = m.lnD - Math.log(geo * (Number.isFinite(f) && f > 0 ? f : 1));
         const sd = r > 0 ? m.sig * cfg.NLOS_LONG_SIGMA_FACTOR : m.sig;
         // Gaussian with a floor: a gross outlier costs a bounded amount.
@@ -343,16 +391,22 @@ export class ParticleFilter {
     const neg = this._stats((q) => this._side(q.x, q.y) < 0);
     const main = !neg || (pos && pos.w >= neg.w) ? pos : neg;
     const other = main === pos ? neg : pos;
+    const sep = other ? Math.hypot(other.x - main.x, other.y - main.y) : 0;
+    // One group that the beacon line merely cuts through (AMBIGUITY_SEP_SPREAD)
+    const oneGroup = Boolean(other && sep < this.cfg.AMBIGUITY_SEP_SPREAD * Math.max(main.sd, other.sd));
     const ambiguous = Boolean(
-      other && other.w >= this.cfg.AMBIGUITY_MIN_WEIGHT &&
-      Math.hypot(other.x - main.x, other.y - main.y) >= this.cfg.AMBIGUITY_MIN_SEP_FT
+      other && !oneGroup && other.w >= this.cfg.AMBIGUITY_MIN_WEIGHT &&
+      sep >= this.cfg.AMBIGUITY_MIN_SEP_FT
     );
+    // ...is reported as a whole: the stronger half alone sits off to one side
+    // and hopped across the line whenever the halves traded weight.
+    const e = oneGroup ? this._stats(() => true) || main : main;
     return {
-      x: main.x,
-      y: main.y,
-      sdFt: main.sd,
-      stepScale: main.scale,
-      headingBiasDeg: main.biasDeg,
+      x: e.x,
+      y: e.y,
+      sdFt: e.sd,
+      stepScale: e.scale,
+      headingBiasDeg: e.biasDeg,
       ambiguous,
       alternate: ambiguous ? { x: other.x, y: other.y, weight: other.w } : null,
     };

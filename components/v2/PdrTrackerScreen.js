@@ -432,23 +432,7 @@ export default function PdrTrackerScreen({
       </View>
 
       {/* ── Live Waypoints History ── */}
-      <View style={styles.card}>
-        <Text style={styles.cardLabel}>WAYPOINTS BUFFER ({path.length} PTS)</Text>
-        <ScrollView style={styles.waypointsList} nestedScrollEnabled>
-          {path.map((pt, idx) => (
-            <Text
-              key={idx}
-              style={[
-                styles.waypointItem,
-                idx === path.length - 1 ? styles.waypointActive : styles.waypointHistory,
-              ]}
-            >
-              #{idx.toString().padStart(3, "0")}: X={pt.x.toFixed(2)}m, Y={pt.y.toFixed(2)}m{" "}
-              {idx === 0 ? "🏁 [ORIGIN]" : idx === path.length - 1 ? "📍 [CURRENT]" : ""}
-            </Text>
-          ))}
-        </ScrollView>
-      </View>
+      <WaypointsList path={path} />
 
       {/* ── Saved Paths History ── */}
       <View style={styles.card}>
@@ -532,11 +516,40 @@ function MetricCard({ label, value, unit, color = C.accent }) {
 }
 
 // ── 2D Path Canvas ──
-function PathCanvas({ points, heading, previousPath }) {
-  const canvasWidth = Math.max(280, Math.min(SCREEN_WIDTH - 48, 520));
-  const canvasHeight = 320;
-  const pad = 36;
+// The most recent waypoints only, redrawn only when a step adds one. Listing
+// every point of the walk made each redraw of this tab (10x a second) slower
+// the longer the walk - enough to delay the steps reaching the map.
+const WAYPOINTS_SHOWN = 20;
+const WaypointsList = React.memo(function WaypointsList({ path }) {
+  const first = Math.max(0, path.length - WAYPOINTS_SHOWN);
+  return (
+    <View style={styles.card}>
+      <Text style={styles.cardLabel}>
+        WAYPOINTS BUFFER ({path.length} PTS{first > 0 ? `, LAST ${WAYPOINTS_SHOWN} SHOWN` : ""})
+      </Text>
+      <ScrollView style={styles.waypointsList} nestedScrollEnabled>
+        {path.slice(first).map((pt, i) => {
+          const idx = first + i;
+          return (
+            <Text
+              key={idx}
+              style={[
+                styles.waypointItem,
+                idx === path.length - 1 ? styles.waypointActive : styles.waypointHistory,
+              ]}
+            >
+              #{idx.toString().padStart(3, "0")}: X={pt.x.toFixed(2)}m, Y={pt.y.toFixed(2)}m{" "}
+              {idx === 0 ? "🏁 [ORIGIN]" : idx === path.length - 1 ? "📍 [CURRENT]" : ""}
+            </Text>
+          );
+        })}
+      </ScrollView>
+    </View>
+  );
+});
 
+/** Bounds, scale and the polyline strings of the walked (and a saved) path. */
+function pathGeometry(points, previousPath, canvasWidth, canvasHeight, pad) {
   const validPts = points && points.length > 0 ? points : [{ x: 0, y: 0 }];
   let allPts = [...validPts];
   if (previousPath?.points?.length > 0) {
@@ -589,6 +602,22 @@ function PathCanvas({ points, heading, previousPath }) {
           })
           .join(" ")
       : null;
+
+  return { scale, originCanvas, curCanvas, polylineStr, prevPolylineStr };
+}
+
+// Memoised, with the path geometry computed only when a step adds a point:
+// the heading arrow redraws 10x a second, and rebuilding the whole path on
+// each of those kept the JS thread busy enough on a long walk to delay the
+// steps themselves.
+const PathCanvas = React.memo(function PathCanvas({ points, heading, previousPath }) {
+  const canvasWidth = Math.max(280, Math.min(SCREEN_WIDTH - 48, 520));
+  const canvasHeight = 320;
+  const pad = 36;
+  const { scale, originCanvas, curCanvas, polylineStr, prevPolylineStr } = React.useMemo(
+    () => pathGeometry(points, previousPath, canvasWidth, canvasHeight, pad),
+    [points, previousPath, canvasWidth]
+  );
 
   // Arrow calculations for heading
   const arrowLen = 22;
@@ -724,7 +753,7 @@ function PathCanvas({ points, heading, previousPath }) {
       </Svg>
     </View>
   );
-}
+});
 
 const styles = StyleSheet.create({
   // ── Step length calibration card ──

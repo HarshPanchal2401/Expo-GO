@@ -34,7 +34,7 @@ The application operates across four specialized navigation tabs:
   ┌────────────────┼──────────────────────────────┐                │
   ▼                ▼                              ▼                ▼
 ┌────────────┐  ┌──────────────────┐  ┌───────────────────────┐  ┌────────────┐
-│   👣 PDR   │  │  📶 BLE Scanner  │  │  🛰️ 2-Beacon Module   │  │⚙️ Settings │
+│   👣 PDR   │  │  📶 BLE Scanner │  │  🛰️ 2-Beacon Module   │  │⚙️ Settings│
 │ Step FSM   │  │ 1€ RSSI Filter   │  │ 4-Stage Calibration   │  │ Live Tuning│
 │ Weinberg K │  │ iBeacon Decoder  │  │ Analytical 2-Circle   │  │ No-Rebuild │
 │ Gyro Yaw   │  │ Distance Graphs  │  │ Adaptive Kalman Filter│  │ Local Cache│

@@ -9,16 +9,16 @@
 // averaging, no body / wall / radio-map correction, no calibration model. Measured Power (RSSI at 1 m) is set per
 // beacon and n is shared; both can be changed while scanning and apply to the
 // very next packet. Settings here are stored separately and do NOT change the
-// main ranging engine used by the Fusion Map. Signal Lab shows the same numbers
-// (see services/SimpleRanging.js).
+// main ranging engine used by the Fusion Map (see services/SimpleRanging.js).
 //
-// The beacons themselves are the B1 / B2 chosen in Signal Lab.
+// The beacons themselves (B1 / B2) are chosen on this tab too: BeaconSetupCard.
 // ============================================================================
 
 import React, { useEffect, useRef, useState } from "react";
 import { View, Text, TextInput, Pressable, ScrollView, StyleSheet, Alert } from "react-native";
 import { v2Scanner } from "../../services/v2BeaconScannerService.js";
-// The calculation itself lives in SimpleRanging.js, shared with Signal Lab.
+import BeaconSetupCard from "./BeaconSetupCard.js";
+// The calculation itself lives in SimpleRanging.js, shared with the Fusion Map.
 import {
   simpleRanging, SIMPLE_DEFAULTS as DEFAULTS, SMOOTH_PRESETS, DIST_SMOOTH_PRESETS, rawDistanceM, kalmanStep,
 } from "../../services/SimpleRanging.js";
@@ -152,7 +152,7 @@ function RawDistanceScreen() {
           return (
             <View key={b.num} style={[styles.card, { flex: 1, marginRight: b.num === 1 ? 8 : 0 }]}>
               <Text style={[styles.beaconTitle, { color }]}>Beacon {b.num}</Text>
-              <Text style={styles.small} numberOfLines={1}>{b.id ? (b.name || b.id) : "Not selected (choose in Signal Lab)"}</Text>
+              <Text style={styles.small} numberOfLines={1}>{b.id ? (b.name || b.id) : "Not selected (choose below)"}</Text>
               <Text style={styles.rssi}>
                 {b.p ? (settings.kalman ? b.used.toFixed(1) : `${b.p.rssi}`) : "--"}
                 <Text style={styles.rssiUnit}> dBm{settings.kalman ? " (Kalman)" : ""}</Text>
@@ -186,6 +186,9 @@ function RawDistanceScreen() {
           );
         })}
       </View>
+
+      {/* ── Which beacons are B1 / B2 ── */}
+      <BeaconSetupCard />
 
       {/* ── Kalman filter ── */}
       <View style={styles.card}>
@@ -243,7 +246,7 @@ function RawDistanceScreen() {
               ))}
             </View>
             <Text style={styles.small}>
-              Smooths the distance itself; far readings (noisier) are smoothed more. Applies to Raw, Signal Lab and the Fusion Map.
+              Smooths the distance itself; far readings (noisier) are smoothed more. Applies to Raw and the Fusion Map.
             </Text>
           </>
         )}

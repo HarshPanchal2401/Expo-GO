@@ -47,6 +47,14 @@ export const CARRY_CONFIG = {
   // heading is rewound to the last moment the tilt was within CALM_DEG of it.
   SHORT_WINDOW_S: 0.4,
   FAST_TRANSITION_DEG: 45,
+  // ...or further than the phone's own swing has reached (its tilt from the
+  // settled one, from 2 s to SWING_REACH_GAP_S ago) plus this margin. A hand
+  // swinging hard (+-50 deg and more) passes FAST_TRANSITION_DEG on every
+  // swing, which held the heading nearly all the time - turns were lost and
+  // the dot walked into walls. Held in front or in a pocket the reach is
+  // small and the threshold stays FAST_TRANSITION_DEG.
+  SWING_REACH_MARGIN_DEG: 10,
+  SWING_REACH_GAP_S: 0.6,
   // Calm = the recent tilt this close to the settled one and, for a phone that
   // was held steady, not tilting faster than CALM_ROT_DPS (deg/s, ~0.2 s mean).
   CALM_DEG: 10,
@@ -221,11 +229,21 @@ export class CarryDetector {
       }
       const ql = Math.hypot(qx, qy, qz) || 1e-9;
       const shortAng = angleDeg({ x: qx / ql, y: qy / ql, z: qz / ql }, this.ref);
+      // How far the phone's own swing reached before that.
+      const gapT = t - cfg.SWING_REACH_GAP_S * 1000;
+      let minDot = 1;
+      for (const w of this.win) {
+        if (w.t > gapT) break;
+        const d = w.x * this.ref.x + w.y * this.ref.y + w.z * this.ref.z;
+        if (d < minDot) minDot = d;
+      }
+      const reach = (Math.acos(Math.max(-1, Math.min(1, minDot))) * 180) / Math.PI;
+      const fastDeg = Math.max(cfg.FAST_TRANSITION_DEG, reach + cfg.SWING_REACH_MARGIN_DEG);
       const calm = this.mode === "swinging"
         ? shortAng < cfg.CALM_DEG_SWINGING
         : shortAng < cfg.CALM_DEG && this.rtFast < cfg.CALM_ROT_DPS && this.rotFast < cfg.CALM_TOTAL_ROT_DPS;
       if (calm) this.lastCalmT = t;
-      if (shortAng > cfg.FAST_TRANSITION_DEG || angleDeg(gm, this.ref) > cfg.TRANSITION_DEG) {
+      if (shortAng > fastDeg || angleDeg(gm, this.ref) > cfg.TRANSITION_DEG) {
         this.transitioning = true;
         this.transitionStart = t;
         this.transitionFromT = Math.max(this.lastCalmT, t - cfg.MAX_REWIND_S * 1000);

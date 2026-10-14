@@ -92,6 +92,11 @@ export const HEADING_CONFIG = {
   ANCHOR_S: 1.2,
   // How fast the orientation's tilt is pulled to gravity (1/s).
   ATTITUDE_GAIN: 2.0,
+  // A hold that ends with the phone tilted within this (deg) of where it was
+  // before, in the same hand-held carry, was the wrist tilting during a turn,
+  // not the phone moving to a new place: the turn the gyro measured meanwhile
+  // is kept. (Dropping it froze the arrow, then left it pointing the old way.)
+  SAME_POSITION_DEG: 20,
 };
 
 const wrap180 = (d) => {
@@ -123,7 +128,13 @@ export class HeadingFilter {
     this._carry = null;         // CarryDetector state
     this._held = false;         // heading held while the phone is repositioned
     this._anchor = null;        // averaging the new axis after it settled
-    this._history = [];         // {t (ms), h} for the rewind
+    this._history = [];         // {t (ms), h, y} for the rewind
+    // Turn about the vertical integrated from the gyro, never held (deg,
+    // unwrapped): what the user turned while the heading was held.
+    this._yaw = 0;
+    this._holdYaw0 = null;
+    this._holdDown = null;      // phone tilt (unit down) before the hold
+    this._holdMode = null;      // carry mode before the hold
     this._carryVersion = null;
     this._q = null;             // orientation, see _attitudeStep()
     this._axis = null;          // phone-fixed axis whose direction is followed
@@ -148,11 +159,15 @@ export class HeadingFilter {
     if (!carry) return;
     this._carry = carry;
     // The phone settled in a new position: follow a new level axis.
+    let settledNow = false;
     if (carry.version !== this._carryVersion) {
+      settledNow = this._carryVersion !== null;
       this._carryVersion = carry.version;
       this._axis = null;
       this._prevAz = null;
     }
+    // Settled back where it was: keep the turn (SAME_POSITION_DEG).
+    if (settledNow && this._held && !carry.transitioning && this._releaseIfSamePosition()) return;
     if (carry.transitioning && !this._held) {
       this._held = true;
       // Back to before the phone started moving.
@@ -162,21 +177,50 @@ export class HeadingFilter {
         ? carry.transitionFromT - 400
         : nowMs - this.cfg.REPOSITION_REWIND_S * 1000;
       // The average over the second before that: the phone sways each step.
-      let s = 0, c = 0;
+      let s = 0, c = 0, ys = 0, yn = 0;
       for (const p of this._history) {
         if (p.t > cut) break;
         if (p.t < cut - 1000) continue;
         s += Math.sin((p.h * Math.PI) / 180);
         c += Math.cos((p.h * Math.PI) / 180);
+        ys += p.y; yn++;
       }
       let h = s || c ? (Math.atan2(s, c) * 180) / Math.PI : null;
-      if (h === null && this._history.length) h = this._history[0].h;
+      // The gyro turn and the tilt at the same moment, to add the turn back
+      // if the phone returns to that tilt.
+      this._holdYaw0 = yn ? ys / yn : this._yaw;
+      if (h === null && this._history.length) { h = this._history[0].h; this._holdYaw0 = this._history[0].y; }
+      let down = null;
+      for (const p of this._history) { if (p.t > cut) break; down = p.d; }
+      this._holdDown = down || (this._history.length ? this._history[0].d : null);
+      this._holdMode = carry.mode;
       if (h !== null) this._heading = wrap180(h);
       this._anchor = null;
       this._clearStepWindow();
     } else if (!carry.transitioning && this._held && !this._anchor) {
       this._anchor = { until: nowMs + this.cfg.ANCHOR_S * 1000, s: 0, c: 0 };
     }
+  }
+
+  /**
+   * End of a hold: if the phone is back at the tilt it had before, in a
+   * hand-held carry (not swinging), the hold was a wrist tilt during a turn -
+   * release it with the turn the gyro measured meanwhile. Returns true if so.
+   */
+  _releaseIfSamePosition() {
+    const b = this._holdDown, d = this._down;
+    if (this._holdYaw0 === null || !b || !d || this._holdMode === "swinging") return false;
+    const nd = Math.hypot(d.x, d.y, d.z) || 1;
+    const cos = (b.x * d.x + b.y * d.y + b.z * d.z) / nd;
+    if ((Math.acos(Math.max(-1, Math.min(1, cos))) * 180) / Math.PI > this.cfg.SAME_POSITION_DEG) return false;
+    this._heading = wrap180(this._heading + (this._yaw - this._holdYaw0));
+    this._held = false;
+    this._anchor = null;
+    this._holdYaw0 = null;
+    this._disagreeSince = null;
+    this._lastAbsT = null;
+    this._clearStepWindow();
+    return true;
   }
 
   /** Hand the held heading over to the new axis, on its average direction. */
@@ -187,6 +231,8 @@ export class HeadingFilter {
       a.c += Math.cos((az * Math.PI) / 180);
     }
     if (nowMs < a.until || !(a.s || a.c) || az === null) return;
+    // Back where it was after all (settled mid-tilt): keep the turn.
+    if (this._releaseIfSamePosition()) { this._prevAz = az; return; }
     const mean = (Math.atan2(a.s, a.c) * 180) / Math.PI;
     this._heading = wrap180(this._heading + wrap180(az - mean));
     this._prevAz = az;
@@ -294,6 +340,7 @@ export class HeadingFilter {
     const wAvg = this._prevW ? { x: 0.5 * (w.x + this._prevW.x), y: 0.5 * (w.y + this._prevW.y), z: 0.5 * (w.z + this._prevW.z) } : w;
     this._prevW = w;
     this._attitudeStep(wAvg, { x: dx, y: dy, z: dz }, dt <= this.cfg.MAX_DT_S ? dt : 0);
+    if (dt <= this.cfg.MAX_DT_S) this._yaw += headingRate * dt;
     if (!this._axis) this._chooseAxis(this._carry?.gMean || { x: dx, y: dy, z: dz });
     const az = this._axisAzimuth();
     if (this._anchor) this._anchorStep(az, nowMs);
@@ -305,7 +352,7 @@ export class HeadingFilter {
     this._sampleForStep();
     const last = this._history[this._history.length - 1];
     if (!last || nowMs - last.t >= 50) {
-      this._history.push({ t: nowMs, h: this._heading });
+      this._history.push({ t: nowMs, h: this._heading, y: this._yaw, d: { x: dx, y: dy, z: dz } });
       while (this._history.length && this._history[0].t < nowMs - 4000) this._history.shift();
     }
   }
