@@ -1,6 +1,6 @@
 # PDR_ExpoGo: Project Context
 
-Context for answering questions about this project. It describes the code as of engine tag **`motion-v15-card`** (October 2026).
+Context for answering questions about this project. It describes the code as of engine tag **`motion-v16-cal1m`** (October 2026).
 
 > The other files in this folder (`architecture.md`, `logic.md`, `design-system.md`, `product-requirement-document.md`) describe the older `range-v1` engine. Where they disagree with this file, this file is correct.
 
@@ -39,7 +39,7 @@ An **indoor navigation app** for one office. It shows the user's live position o
 |---|---|---|
 | 🗺️ Fusion Map | `components/v2/FusionMapScreen.js` | The main screen. Floor plan, beacon placement, locating, navigation, trail, obstacle editor, test-walk recorder. |
 | 🚶 PDR | `components/v2/PdrTrackerScreen.js` | PDR-only canvas, heading zero, step-length calibration walk |
-| 📏 Raw | `components/v2/RawDistanceScreen.js` + `BeaconSetupCard.js` | **Choose B1 / B2** (devices in range, Swap, scan only B1 & B2 or all), raw RSSI → formula distance, Measured Power and n per beacon set live, both Kalman filters toggleable. (The Signal Lab tab was removed; its calibrations fed an older engine the map did not use.) |
+| 📏 Raw | `components/v2/RawDistanceScreen.js` + `BeaconSetupCard.js` + `Calibrate1mCard.js` | **Choose B1 / B2**; **1 m calibration**: phone 1 m from the beacon, 15 s of raw RSSI (first 1.5 s skipped), 20% trimmed mean → Measured Power for that beacon; shows what the current MP reads at 1 m (the check) and saves the new MP (warns under 20 packets or spread over ±5 dB); (devices in range, Swap, scan only B1 & B2 or all), raw RSSI → formula distance, Measured Power and n per beacon set live, both Kalman filters toggleable. (The Signal Lab tab was removed; its calibrations fed an older engine the map did not use.) |
 | ⚙️ Settings | `components/AppSettingsScreen.js` | **Mobility card:** Walking / Wheelchair; in wheelchair mode, rolling detection on/off, sensitivity, rolling speed, push length and a calibration. **PDR card:** Weinberg K, ZUPT, peak threshold, min bounce, min cadence. **Toggles:** Step Engine (NEW / CLASSIC), Map Matching (ON / OFF), Shake Filter (classic engine only). |
 
 The app shells are `App.android.js` and `App.ios.js`, which are nearly identical. They own the sensor subscriptions, `addStep()` and the tab bar, and pass `pdrStepCallbackRef` and `headingRef` to the Fusion Map.

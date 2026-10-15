@@ -18,6 +18,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { View, Text, TextInput, Pressable, ScrollView, StyleSheet, Alert } from "react-native";
 import { v2Scanner } from "../../services/v2BeaconScannerService.js";
 import BeaconSetupCard from "./BeaconSetupCard.js";
+import Calibrate1mCard from "./Calibrate1mCard.js";
 // The calculation itself lives in SimpleRanging.js, shared with the Fusion Map.
 import {
   simpleRanging, SIMPLE_DEFAULTS as DEFAULTS, SMOOTH_PRESETS, DIST_SMOOTH_PRESETS, rawDistanceM, kalmanStep,
@@ -189,6 +190,9 @@ function RawDistanceScreen() {
 
       {/* ── Which beacons are B1 / B2 ── */}
       <BeaconSetupCard />
+
+      {/* ── Measured Power: measure / check at 1 m ── */}
+      <Calibrate1mCard />
 
       {/* ── Kalman filter ── */}
       <View style={styles.card}>

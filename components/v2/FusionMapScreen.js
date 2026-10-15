@@ -79,7 +79,7 @@ const FLOORPLAN_IMAGE = require("../../assets/floorplans/office-72x72.png");
 // because an OTA update is only APPLIED on the next cold start after it
 // downloads, so "I published the fix and it still fails" is very often the
 // old bundle still running - this makes that visible instead of a guess.
-const ENGINE_TAG = "motion-v15-card";
+const ENGINE_TAG = "motion-v16-cal1m";
 
 // How the phone is carried (services/CarryDetector.js). Pocket / ear /
 // swinging: heading from the gyro alone, step length from the step rate.
