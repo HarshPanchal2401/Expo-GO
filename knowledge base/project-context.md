@@ -259,8 +259,30 @@ Results come from a physics-based gait simulator plus the real floor-plan grid:
 
 **Not built yet** (designed or discussed only; the user wants confirmation before code changes):
 - **Auto path-loss (n) engine:** n adapts using the PDR-known true distance, and the initial position takes n into account.
-- **Grid-search locating:** score every walkable cell instead of intersecting circles.
 - **Pocket walking-direction offset learning.**
+
+**Tried and reverted (do not re-add without asking):**
+- **motion-v17-gridfix (16 Oct 2026):** a localization upgrade made of four parts:
+  - **Grid start solver:** scored every walkable cell instead of intersecting the two circles.
+  - **Per-beacon trust:** an uncertainty and a weight per beacon; a beacon silent for 4 s was left out.
+  - **RSSI spike guard:** a single deep dip was skipped.
+  - **Particle-filter recovery:** redrew a share of the particles after a wrong start.
+
+  On a synthetic benchmark it looked better (sum of p95 errors 676 → 255 ft). **On the real phone the start position was worse**, so everything was reverted to `motion-v16-cal1m`. The synthetic radio model did not match the office. Lesson: do not judge an accuracy change by simulation alone; use a recorded real walk. The v17 code is not in the repo.
+
+**Ideas to improve accuracy with machine learning** (not built; all need real data recorded in the office first, trained on a PC, then run in the app as plain JavaScript, with no native library):
+
+| Where | What it would learn | Data needed |
+|---|---|---|
+| Start position (`InitialPositionSolver`) | **Fingerprinting:** RSSI of B1 and B2 recorded at 20–40 known spots (about 15 s each); a small model maps an RSSI pattern to a spot | RSSI at known spots |
+| Distance (`SimpleRanging`) | MP / n per beacon and per area, instead of one value for the office | The same spot recordings |
+| Beacon blocked or not | A classifier on the signal pattern; a blocked beacon gets less trust | Walks with "wall in between" marked |
+| Step length (`StepLengthModel`) | Step length from the motion pattern, instead of Weinberg | Walks over a known distance |
+| Carry mode (`CarryDetector`) | A classifier replacing the hand-written rules | Labelled motion in each carry mode |
+| Tuning (offline on the PC) | Replay recorded walks with different settings and keep the best numbers; app logic unchanged | Recorded walks with truth taps |
+
+- **Order:** (1) log raw RSSI per packet in the test recorder, (2) record fingerprint spots and a few walks, (3) test on the PC against the old engine, (4) change the app only if it wins on the real recordings.
+- A **third beacon** would help more than any model: with two beacons a mirror spot and large errors far from the beacons remain.
 
 ---
 
