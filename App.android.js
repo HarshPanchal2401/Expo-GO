@@ -17,6 +17,7 @@ import AppSettingsScreen from "./components/AppSettingsScreen.js";
 import RawDistanceScreen from "./components/v2/RawDistanceScreen.js";
 import FusionMapScreen from "./components/v2/FusionMapScreen.js";
 import PdrTrackerScreen from "./components/v2/PdrTrackerScreen.js";
+import CellularPositioningScreen from "./components/v2/CellularPositioningScreen.js"; // [cellular-test] experiment, remove with the tab
 import ErrorBoundary from "./components/ErrorBoundary.js";
 import { getAppSettings, subscribeAppSettings } from "./services/appSettingsStorage.js";
 import { v2Scanner } from "./services/v2BeaconScannerService.js";
@@ -914,6 +915,16 @@ export default function AppAndroid() {
           </Text>
         </Pressable>
 
+        {/* [cellular-test] experimental tab, isolated from the engines */}
+        <Pressable
+          style={[styles.tabBtn, activeTab === "cellular" && styles.tabBtnActive]}
+          onPress={() => setActiveTab("cellular")}
+        >
+          <Text style={[styles.tabBtnText, activeTab === "cellular" && styles.tabBtnTextActive]}>
+            📶 Cell
+          </Text>
+        </Pressable>
+
         <Pressable
           style={[styles.tabBtn, activeTab === "settings" && styles.tabBtnActive]}
           onPress={() => setActiveTab("settings")}
@@ -963,6 +974,8 @@ export default function AppAndroid() {
           />
         ) : activeTab === "raw" ? (
           <RawDistanceScreen />
+        ) : activeTab === "cellular" ? (
+          <CellularPositioningScreen />
         ) : (
           <AppSettingsScreen />
         )}
