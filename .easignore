@@ -1,0 +1,25 @@
+# Used by EAS Build INSTEAD of .gitignore: same list, but the floor plan image is
+# included in the cloud build (the app needs it). It is still not committed to Git.
+# Dependencies
+node_modules/
+package-lock.json
+
+# Expo
+.expo/
+dist/
+web-build/
+
+# Native builds
+android/
+ios/
+
+# Environment and logs
+.env*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS Files
+.DS_Store
+Thumbs.db
+
