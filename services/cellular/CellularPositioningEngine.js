@@ -37,6 +37,9 @@ export const ENGINE_CONFIG = {
   HISTORY_MAX: 100,
 };
 
+export const ESTIMATE_NOTE =
+  "Approximate position from cell data only. It is cell-level (hundreds of metres to a few km), not room-level; the circle is the accuracy.";
+
 export const NO_ESTIMATE_NOTE =
   "No phone position: OpenCelliD gives where a tower is, not where the phone is. " +
   "One tower cannot fix a position, and a cell's range is a coverage estimate, not a distance to you.";
@@ -44,9 +47,11 @@ export const NO_ESTIMATE_NOTE =
 const HISTORY_KEY = "@cellular_history_v1";
 
 export class CellularPositioningEngine {
-  constructor({ native, service, storage = null, requestPermission = null, now = () => Date.now(), config = {} } = {}) {
+  constructor({ native, service, locator = null, towerFallback = false, storage = null, requestPermission = null, now = () => Date.now(), config = {} } = {}) {
     this.native = native;
     this.service = service;
+    this.locator = locator; // optional GeolocateService: phone position from the cells
+    this.towerFallback = towerFallback; // no locator answer: use the serving tower as a rough position
     this.storage = storage;
     this.requestPermission = requestPermission;
     this.now = now;
@@ -158,6 +163,23 @@ export class CellularPositioningEngine {
     });
   }
 
+  // ── phone position ────────────────────────────────────────────────────────
+  /**
+   * The phone's position on the world map, or null. Cell-level only (hundreds
+   * of metres to km). { lat, lon, uncertaintyM, source: "beacondb" | "tower", cellsUsed }
+   */
+  async _estimate(info, towers) {
+    if (!info?.ok) return null;
+    if (this.locator) {
+      const r = await this.locator.locate(info.cells);
+      this.status.lastLocate = r;
+      if (r.status === "found") return { lat: r.lat, lon: r.lon, uncertaintyM: r.accuracyM, source: "beacondb", cellsUsed: r.cellsUsed };
+    }
+    const t = towers.find((x) => x.serving) || towers[0];
+    if (this.towerFallback && t) return { lat: t.tower.lat, lon: t.tower.lon, uncertaintyM: t.tower.rangeM, source: "tower", cellsUsed: 1 };
+    return null;
+  }
+
   // ── lookupCell ────────────────────────────────────────────────────────────
   lookupCell(cell, opts) {
     return this.service.lookup(cell, opts);
@@ -199,6 +221,8 @@ export class CellularPositioningEngine {
       result = { ...base, status, lookup, neighbourLookups, towers };
       if (lookup.status === "found" || lookup.status === "not-found") this.lastLookedKey = lookup.key;
     }
+    result.phoneEstimate = await this._estimate(info, result.towers);
+    if (result.phoneEstimate) result.note = ESTIMATE_NOTE;
     this._record(result);
     this._set({
       state: this.monitoring ? "monitoring" : "idle",
@@ -239,6 +263,9 @@ export class CellularPositioningEngine {
             phoneEstimate: null, note: NO_ESTIMATE_NOTE,
             status: lookup.status === "found" ? "tower-found" : lookup.status === "not-found" ? "tower-not-found" : "lookup-error",
           };
+          result.phoneEstimate = await this._estimate(info, result.towers);
+          if (!this.monitoring || gen !== this.generation) return;
+          if (result.phoneEstimate) result.note = ESTIMATE_NOTE;
           this._record(result);
           this._set({ lastResult: result, lastLookupAt: lookup.status === "error" ? this.status.lastLookupAt : this.now() });
         }
@@ -301,6 +328,7 @@ export class CellularPositioningEngine {
       cache: r.lookup ? r.lookup.cache : null,
       latencyMs: r.lookup ? r.lookup.latencyMs : null,
       error: r.lookup?.error?.code ?? null,
+      phone: r.phoneEstimate ? { lat: r.phoneEstimate.lat, lon: r.phoneEstimate.lon, accuracyM: r.phoneEstimate.uncertaintyM, source: r.phoneEstimate.source } : null,
       tower: r.towers[0] ? { lat: r.towers[0].tower.lat, lon: r.towers[0].tower.lon, rangeM: r.towers[0].tower.rangeM } : null,
     };
     this.history = [entry, ...this.history].slice(0, this.cfg.HISTORY_MAX);

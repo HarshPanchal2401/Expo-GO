@@ -15,6 +15,7 @@ import { cellularEngine, openCelliD, requestCellularPermission } from "../../ser
 import { maskId } from "../../services/cellular/CellularTypes.js";
 import { formatLatLon, formatMeters, geoUri } from "../../services/cellular/CellularLocationUtils.js";
 import CellularTowerMap from "./CellularTowerMap.js";
+import CellularWorldMap from "./CellularWorldMap.js";
 
 const C = {
   bg: "#0d1117", card: "#161b22", border: "#30363d", text: "#e6edf3", sub: "#8b949e",
@@ -114,7 +115,7 @@ export default function CellularPositioningScreen() {
     <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
       <Text style={styles.title}>📶 Cellular Test <Text style={styles.exp}>experimental</Text></Text>
       <Text style={styles.small}>
-        Reads the cell tower your phone is connected to and asks OpenCelliD where that tower is. A tower is not your position, and this test does not change the Fusion Map.
+        Reads the cells your phone hears and estimates the phone position on a world map (cell-level, not room-level). This test does not change the Fusion Map.
       </Text>
 
       {/* A. Status */}
@@ -212,11 +213,27 @@ export default function CellularPositioningScreen() {
             </Pressable>
           </>
         )}
-        <Text style={[styles.label, { marginTop: 8 }]}>Phone position: none</Text>
-        <Text style={styles.small}>
-          {result?.note || "OpenCelliD gives where a tower is, not where the phone is. One tower cannot fix a position."}
-        </Text>
-        {towers.length > 0 ? <CellularTowerMap towers={towers} phone={result?.phoneEstimate || null} /> : null}
+        {result?.phoneEstimate ? (
+          <>
+            <Text style={[styles.label, { marginTop: 8, color: C.ok }]}>Phone position (approx.)</Text>
+            <Row label="Latitude, longitude" value={formatLatLon(result.phoneEstimate)} />
+            <Row label="Accuracy" value={result.phoneEstimate.uncertaintyM ? `± ${formatMeters(result.phoneEstimate.uncertaintyM)}` : "not given"} />
+            <Row label="Source" value={result.phoneEstimate.source === "beacondb" ? `BeaconDB (${result.phoneEstimate.cellsUsed} cell${result.phoneEstimate.cellsUsed === 1 ? "" : "s"})` : "Serving tower location"} />
+            <Text style={styles.small}>{result.note}</Text>
+            <CellularWorldMap phone={result.phoneEstimate} towers={towers} />
+            <Pressable style={styles.btnSecondary} onPress={() => Linking.openURL(geoUri(result.phoneEstimate, "Estimated phone position"))}>
+              <Text style={styles.btnSecondaryTxt}>Open position in Maps</Text>
+            </Pressable>
+          </>
+        ) : (
+          <>
+            <Text style={[styles.label, { marginTop: 8 }]}>Phone position: none</Text>
+            <Text style={styles.small}>
+              {result?.note || "Tap Find Location. The position comes from the cells your phone hears (needs internet)."}
+            </Text>
+            {towers.length > 0 ? <CellularTowerMap towers={towers} phone={null} /> : null}
+          </>
+        )}
       </View>
 
       {/* Proxy */}
@@ -263,7 +280,7 @@ export default function CellularPositioningScreen() {
             </View>
           );
         })}
-        <Text style={[styles.small, { marginTop: 8 }]}>Tower data: OpenCelliD (CC BY-SA 4.0), opencellid.org. Ground-truth positions are noted separately; no error is calculated because no phone position is estimated.</Text>
+        <Text style={[styles.small, { marginTop: 8 }]}>Tower data: OpenCelliD (CC BY-SA 4.0); phone position: BeaconDB; map: OpenStreetMap.</Text>
       </View>
     </ScrollView>
   );

@@ -4,13 +4,18 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { PermissionsAndroid, Platform } from "react-native";
 import { CellularNative } from "./CellularNative.js";
 import { OpenCelliDService } from "./OpenCelliDService.js";
+import { GeolocateService } from "./GeolocateService.js";
 import { CellularPositioningEngine } from "./CellularPositioningEngine.js";
 
 export const openCelliD = new OpenCelliDService({ fetchImpl: (...a) => fetch(...a), storage: AsyncStorage });
 
+export const geolocate = new GeolocateService({ fetchImpl: (...a) => fetch(...a) });
+
 export const cellularEngine = new CellularPositioningEngine({
   native: CellularNative,
   service: openCelliD,
+  locator: geolocate,
+  towerFallback: true,
   storage: AsyncStorage,
 });
 

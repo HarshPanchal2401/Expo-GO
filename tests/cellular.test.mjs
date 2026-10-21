@@ -9,6 +9,7 @@ import { normalizeCell, cellKey, lookupParams, maskId, toInt } from "../services
 import { OpenCelliDService, validProxyUrl, parseTower } from "../services/cellular/OpenCelliDService.js";
 import { CellularPositioningEngine } from "../services/cellular/CellularPositioningEngine.js";
 import { haversineM, layoutPlot, geoUri } from "../services/cellular/CellularLocationUtils.js";
+import { GeolocateService } from "../services/cellular/GeolocateService.js";
 import worker, { validate } from "../cellular-proxy/worker.mjs";
 
 const LTE = { radio: "LTE", registered: true, mcc: "404", mnc: "10", areaCode: 1234, cellId: "56789", pci: 12, signalDbm: -95, ageMs: 200, supported: true };
@@ -188,7 +189,7 @@ test("engine: reports a missing native module, no telephony and no permission", 
   assert.equal((await d.eng.getCellInfo()).reason, "native-error");
 });
 
-test("engine: findLocation gives a tower, never a phone position", async () => {
+test("engine: without a locator, findLocation gives a tower and no phone position", async () => {
   const { eng, svc } = makeEngine(fakeNative(RAW([LTE, { ...LTE, registered: false, cellId: "777", pci: 3 }])));
   await svc.setProxy("https://p.example.dev");
   const r = await eng.findLocation({ label: "Outdoors" });
@@ -358,4 +359,41 @@ test("worker: limits requests per client", async () => {
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+// ── phone position on the world map (BeaconDB) ──────────────────────────────
+test("geolocate: sends the cells and returns a phone position with accuracy", async () => {
+  let sent = null;
+  const g = new GeolocateService({ fetchImpl: async (u, o) => { sent = { u, body: JSON.parse(o.body) }; return jsonRes({ location: { lat: 23.0225, lng: 72.5714 }, accuracy: 850 }); } });
+  const r = await g.locate([normalizeCell(LTE, 1), normalizeCell({ ...LTE, registered: false, cellId: "777" }, 1)]);
+  assert.deepEqual([r.status, r.lat, r.lon, r.accuracyM, r.cellsUsed], ["found", 23.0225, 72.5714, 850, 2]);
+  assert.equal(sent.body.considerIp, false);
+  assert.deepEqual(sent.body.cellTowers[0], { radioType: "lte", mobileCountryCode: 404, mobileNetworkCode: 10, locationAreaCode: 1234, cellId: 56789, signalStrength: -95 });
+  assert.equal((await g.locate([normalizeCell(LTE, 1), normalizeCell({ ...LTE, registered: false, cellId: "777" }, 1)])).cache, "hit");
+});
+
+test("geolocate: not found, network error and no usable cell are separate answers", async () => {
+  const cell = normalizeCell(LTE, 1);
+  assert.equal((await new GeolocateService({ fetchImpl: async () => jsonRes({ error: {} }, 404) }).locate([cell])).status, "not-found");
+  assert.equal((await new GeolocateService({ fetchImpl: async () => { throw new Error("x"); } }).locate([cell])).error.code, "network");
+  assert.equal((await new GeolocateService({ fetchImpl: async () => jsonRes({}) }).locate([normalizeCell({ ...LTE, cellId: null }, 1)])).status, "no-cells");
+});
+
+test("engine: with a locator the phone position is set, even when OpenCelliD has no tower", async () => {
+  const locator = new GeolocateService({ fetchImpl: async () => jsonRes({ location: { lat: 23.02, lng: 72.57 }, accuracy: 600 }) });
+  const svc = makeService(async () => jsonRes({ ok: true, found: false }));
+  await svc.setProxy("https://p.example.dev");
+  const eng = new CellularPositioningEngine({ native: fakeNative(RAW([LTE])), service: svc, locator, storage: memStorage() });
+  const r = await eng.findLocation();
+  assert.equal(r.status, "tower-not-found");
+  assert.deepEqual([r.phoneEstimate.source, r.phoneEstimate.lat, r.phoneEstimate.uncertaintyM], ["beacondb", 23.02, 600]);
+});
+
+test("engine: locator fails -> serving tower is the rough fallback position", async () => {
+  const locator = new GeolocateService({ fetchImpl: async () => jsonRes({}, 404) });
+  const { svc } = makeEngine(fakeNative(RAW([LTE])));
+  await svc.setProxy("https://p.example.dev");
+  const eng = new CellularPositioningEngine({ native: fakeNative(RAW([LTE])), service: svc, locator, towerFallback: true, storage: memStorage() });
+  const r = await eng.findLocation();
+  assert.equal(r.phoneEstimate.source, "tower");
 });
