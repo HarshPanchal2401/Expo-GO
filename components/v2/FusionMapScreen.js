@@ -58,6 +58,7 @@ import Svg, {
 } from "react-native-svg";
 import { fusionEngine } from "../../services/FusionEngine.js";
 import { v2Scanner } from "../../services/v2BeaconScannerService.js";
+import { loadStartSpots, saveStartSpot, removeStartSpot, MAX_NAME } from "../../services/StartSpots.js";
 import { checkRangeGeometry } from "../../services/BeaconRangingCalibration.js";
 import { metresToFeet, feetToMetres } from "../../services/PdrEngine.js";
 import { savePath, getSavedPaths, deleteSavedPath } from "../../PathStorage.js";
@@ -1230,6 +1231,20 @@ function FusionMapScreen({
   const [locatedAt, setLocatedAt] = useState(0);
   // Start point tapped on the map in "picking", awaiting Start Here.
   const [pendingStart, setPendingStart] = useState(null);
+  // Named start spots (Entrance, Desk 4 ...) saved on the phone.
+  const [startSpots, setStartSpots] = useState([]);
+  const [spotName, setSpotName] = useState("");
+  useEffect(() => { loadStartSpots().then((l) => setStartSpots([...l])); }, []);
+  const pickSpot = (spot) => {
+    const w = floorplanGrid.nearest({ x: spot.x, y: spot.y });
+    setPendingStart(w ? { x: w.x, y: w.y } : { x: spot.x, y: spot.y });
+  };
+  const handleSaveSpot = async () => {
+    if (!pendingStart || !spotName.trim()) return;
+    setStartSpots([...(await saveStartSpot(spotName, pendingStart.x, pendingStart.y))]);
+    setSpotName("");
+  };
+  const handleDeleteSpot = async (id) => setStartSpots([...(await removeStartSpot(id))]);
   // "choosing": the beacons fit two spots; which one the user says they are at.
   const [startChoice, setStartChoice] = useState(null);
   const startChoiceRef = useRef(null);
@@ -2663,6 +2678,45 @@ function FusionMapScreen({
         return null;
       })()}
 
+      {/* Named start spots: one tap picks an exact, known start */}
+      {!placementMode && navPhase === "picking" && (
+        <View style={styles.spotBox}>
+          <Text style={styles.hintText}>Saved start spots: tap one, then press Start Here. Or tap the map, name it and save it.</Text>
+          <View style={styles.spotWrap}>
+            {startSpots.length === 0 && <Text style={styles.hintText}>None saved yet.</Text>}
+            {startSpots.map((sp) => (
+              <TouchableOpacity
+                key={sp.id}
+                style={[styles.spotChip, pendingStart && Math.hypot(pendingStart.x - sp.x, pendingStart.y - sp.y) < 1.5 && styles.spotChipOn]}
+                onPress={() => pickSpot(sp)}
+                onLongPress={() => Alert.alert("Delete spot", `Delete "${sp.name}"?`, [
+                  { text: "Cancel", style: "cancel" },
+                  { text: "Delete", style: "destructive", onPress: () => handleDeleteSpot(sp.id) },
+                ])}
+              >
+                <Text style={styles.spotChipText}>📍 {sp.name}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+          {pendingStart && (
+            <View style={{ flexDirection: "row", marginTop: 8 }}>
+              <TextInput
+                style={[styles.textInput, { flex: 1, fontSize: 14, paddingVertical: 8 }]}
+                value={spotName}
+                onChangeText={setSpotName}
+                placeholder="Name this spot (e.g. Entrance)"
+                placeholderTextColor={C.textMuted}
+                maxLength={MAX_NAME}
+              />
+              <TouchableOpacity style={[styles.secondaryBtn, { marginLeft: 8, paddingVertical: 8 }, !spotName.trim() && { opacity: 0.45 }]} disabled={!spotName.trim()} onPress={handleSaveSpot}>
+                <Text style={styles.secondaryBtnText}>Save</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+          <Text style={styles.hintText}>Long-press a spot to delete it.</Text>
+        </View>
+      )}
+
       {/* Controls */}
       <View style={styles.btnRow}>
         {placementMode ? (
@@ -3168,6 +3222,11 @@ const styles = StyleSheet.create({
   },
   secondaryBtnText: { color: C.textSecondary, fontWeight: "600", fontSize: 14 },
   btnRow: { flexDirection: "row", marginBottom: 10 },
+  spotBox: { backgroundColor: C.surface, borderRadius: 10, borderWidth: 1, borderColor: C.border, padding: 10, marginBottom: 10 },
+  spotWrap: { flexDirection: "row", flexWrap: "wrap" },
+  spotChip: { backgroundColor: C.surfaceAlt, borderRadius: 16, borderWidth: 1, borderColor: C.border, paddingHorizontal: 12, paddingVertical: 7, marginRight: 8, marginBottom: 8 },
+  spotChipOn: { borderColor: C.accent, backgroundColor: "#12263f" },
+  spotChipText: { color: C.textPrimary, fontSize: 13, fontWeight: "600" },
   mapCanvasWrapper: {
     alignSelf: "center", marginBottom: 14, borderRadius: 14, overflow: "hidden",
     backgroundColor: C.bg, borderWidth: 1, borderColor: C.border,
