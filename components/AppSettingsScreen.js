@@ -336,27 +336,20 @@ function MobilityCard({ settings, updateParam, onSaved }) {
     );
   };
 
+  // Walking needs no options here; the mode itself is switched on the PDR tab / Fusion Map.
+  if (!wheelchair) return null;
+
   return (
     <View style={s.card}>
       <View style={s.cardHeader}>
         <View style={{ flex: 1 }}>
-          <Text style={s.cardTitle}>♿ Mobility</Text>
+          <Text style={s.cardTitle}>♿ Wheelchair</Text>
           <Text style={s.cardDesc}>
-            Walking counts steps. A wheelchair makes no steps, so in Wheelchair mode movement comes from the wheels'
-            vibration (rolling) and from the Push button on the Fusion Map. Direction comes from the gyro in both.
+            Wheelchair mode is on. Switch between Walking and Wheelchair on the PDR tab or the Fusion Map. A wheelchair makes
+            no steps, so movement comes from the wheels' vibration (rolling) and from the Push button on the Fusion Map.
+            Direction comes from the gyro.
           </Text>
         </View>
-      </View>
-
-      <View style={s.unitGroup}>
-        {[{ key: "walking", label: "🚶 Walking" }, { key: "wheelchair", label: "♿ Wheelchair" }].map((m) => {
-          const on = (settings.mobilityMode || "walking") === m.key;
-          return (
-            <Pressable key={m.key} onPress={() => updateParam("mobilityMode", m.key)} style={[s.unitBtn, on && s.unitBtnActive]}>
-              <Text style={[s.unitBtnText, on && s.unitBtnTextActive]}>{m.label}</Text>
-            </Pressable>
-          );
-        })}
       </View>
 
       {wheelchair && (
@@ -427,7 +420,7 @@ function MobilityCard({ settings, updateParam, onSaved }) {
               tap Push once for each push you make (sets the push length). Enter the distance and press Finish.
             </Text>
             {!savedWheelchair ? (
-              <Text style={[s.inputHint, { color: "#b45309" }]}>Save Wheelchair mode first (Save & Apply above).</Text>
+              <Text style={[s.inputHint, { color: "#b45309" }]}>Switch to Wheelchair on the PDR tab or Fusion Map first.</Text>
             ) : !cal ? (
               <Pressable onPress={startCal} style={[s.unitBtn, s.unitBtnActive]}>
                 <Text style={[s.unitBtnText, s.unitBtnTextActive]}>▶ Start Calibration</Text>

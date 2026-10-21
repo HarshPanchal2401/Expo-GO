@@ -58,6 +58,7 @@ import Svg, {
 } from "react-native-svg";
 import { fusionEngine } from "../../services/FusionEngine.js";
 import { v2Scanner } from "../../services/v2BeaconScannerService.js";
+import MobilityModeSwitch from "./MobilityModeSwitch.js";
 import { loadStartSpots, saveStartSpot, removeStartSpot, MAX_NAME } from "../../services/StartSpots.js";
 import { checkRangeGeometry } from "../../services/BeaconRangingCalibration.js";
 import { metresToFeet, feetToMetres } from "../../services/PdrEngine.js";
@@ -2184,6 +2185,11 @@ function FusionMapScreen({
       contentContainerStyle={styles.scrollContent}
       scrollEnabled={!mapGestureActive}
     >
+      {/* Walking / Wheelchair (only while idle: switching restarts the movement engines) */}
+      {!placementMode && (
+        <MobilityModeSwitch disabled={navPhase !== "idle"} hint="Stop navigation to switch mode." />
+      )}
+
       {/* Header */}
       <View style={styles.runHeader}>
         <View style={{ flex: 1 }}>

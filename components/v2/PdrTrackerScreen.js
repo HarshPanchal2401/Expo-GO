@@ -24,6 +24,7 @@ import {
   TextInput,
 } from "react-native";
 import { stepLengthModel } from "../../services/StepLengthModel.js";
+import MobilityModeSwitch from "./MobilityModeSwitch.js";
 import Svg, {
   Polyline,
   Circle,
@@ -263,6 +264,9 @@ export default function PdrTrackerScreen({
           </Text>
         </View>
       </View>
+
+      {/* ── Walking / Wheelchair ── */}
+      <MobilityModeSwitch disabled={running} hint="Stop tracking to switch mode." />
 
       {/* ── Sensor Status Bar ── */}
       <View style={styles.card}>
