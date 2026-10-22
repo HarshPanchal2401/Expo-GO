@@ -185,5 +185,11 @@ K  = P Hᵀ / (H P Hᵀ + R) ;   x += K·(t − H·x) ;   P = (I − K H) P
    - While two candidates are shown, tapping near one settles it (`chooseHypothesisNear`).
 6. **Save Path** stores the trail in feet (`source: "fusionMap"`), and the route stays drawn on the map.
 
+## 7a. Near-beacon guard (Fusion Map)
+
+**Near-beacon guard** (particle filter): `dS' = max(3 ft, dS)`, `e = max(3 ft, expected)`, `σ = √(σ_ln² + (2.5 ft / e)²)`.
+
+**Start spot facing:** `setZero(facing)` sets the zero so the current heading equals `facing` (DeviceMotion: zero = raw + facing; magnetometer: zero = raw − facing).
+
 ## 8. Loop closure (PDR tab)
 "Close loop" assumes you ended where you started. It spreads the end-point error back along the path in proportion to each point's position along it.

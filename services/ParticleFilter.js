@@ -55,6 +55,15 @@ export const PF_CONFIG = {
   BLE_LN_SIGMA_MIN: 0.22,
   NLOS_LONG_SIGMA_FACTOR: 1.8,
   OUTLIER_EPS: 0.05,
+  // Near a beacon (ft). Closer than NEAR_RANGE_FT the receiver saturates and
+  // the beacon's height, its marker's placement and the body dominate, so
+  // "closer than this" is all a range says: both the range and the expected
+  // range are raised to it. RANGE_ABS_SIGMA_FT is an error in feet added to the
+  // log-distance error, so a range of a few feet no longer pins the particles
+  // to a sharp ring around the beacon (which pulled the track toward it while
+  // walking past). Both 0 = off (the old behaviour).
+  NEAR_RANGE_FT: 3,
+  RANGE_ABS_SIGMA_FT: 2.5,
   // Resampling and roughening.
   RESAMPLE_ESS_FRAC: 0.5,
   ROUGHEN_FT: 0.25,
@@ -99,6 +108,7 @@ export class ParticleFilter {
     this.grid = null;
     this.p = [];
     this.lastBleAt = 0;
+    this.bleWeight = 1; // 1 = full beacon influence; lower = beacons correct more slowly
     // Recent moves {t, len, h} (feet, deg), for scoring lagged ranges.
     this.moves = [];
     this._rand = Math.random;
@@ -131,7 +141,7 @@ export class ParticleFilter {
     this.grid = grid || null;
   }
 
-  /** (x, y, beaconNum) -> expected measured / straight-line range (>= 1; walls). */
+  /** (x, y, beaconNum, straightLineFt) -> expected measured / straight-line range (walls). */
   setRangeFactor(fn) {
     this.rangeFactor = typeof fn === "function" ? fn : null;
   }
@@ -231,6 +241,9 @@ export class ParticleFilter {
       moved.push({ nx, ny, ok });
     }
     const kill = allW > 0 && okW / allW >= cfg.MIN_SURVIVOR_FRAC;
+    // What the map did with this move (shown in a recorded test): all moved, blocked ones killed, or everyone blocked and held.
+    const okFrac = allW > 0 ? okW / allW : 0;
+    this.lastStep = { okFrac, action: okFrac >= 0.999 ? "moved" : kill ? "killed-blocked" : "held-all-blocked" };
     this.p.forEach((q, i) => {
       const m = moved[i];
       if (m.ok) { q.x = m.nx; q.y = m.ny; }
@@ -275,11 +288,11 @@ export class ParticleFilter {
       if (!b || !Number.isFinite(d) || d <= 0) continue;
       const sig = Math.max(cfg.BLE_LN_SIGMA_MIN, Number.isFinite(s) && s > 0 ? s / d : 0.3);
       const lag = Math.min(cfg.BLE_MAX_LAG_MS, Math.max(0, Number(lagMs?.[num]) || 0));
-      meas.push({ num, b, lnD: Math.log(Math.max(0.3, d)), sig, back: lag > 0 ? this._movedSince(now - lag) : null });
+      meas.push({ num, b, lnD: Math.log(Math.max(0.3, cfg.NEAR_RANGE_FT || 0, d)), sig, back: lag > 0 ? this._movedSince(now - lag) : null });
     }
     if (!meas.length) return false;
     this.lastBleAt = now;
-    const temper = walking ? cfg.BLE_TEMPER_WALKING : cfg.BLE_TEMPER_STILL;
+    const temper = (walking ? cfg.BLE_TEMPER_WALKING : cfg.BLE_TEMPER_STILL) * this.bleWeight;
     const floor = Math.log(cfg.OUTLIER_EPS);
     for (const q of this.p) {
       if (q.lw === -Infinity) continue;
@@ -294,9 +307,12 @@ export class ParticleFilter {
           py -= q.s * (cb * m.back.sy - sb * m.back.sx);
         }
         const geo = Math.max(0.5, Math.hypot(px - m.b.x, py - m.b.y));
-        const f = this.rangeFactor ? this.rangeFactor(px, py, m.num) : 1;
-        const r = m.lnD - Math.log(geo * (Number.isFinite(f) && f > 0 ? f : 1));
-        const sd = r > 0 ? m.sig * cfg.NLOS_LONG_SIGMA_FACTOR : m.sig;
+        const f = this.rangeFactor ? this.rangeFactor(px, py, m.num, geo) : 1;
+        const expect = Math.max(cfg.NEAR_RANGE_FT || 0, geo * (Number.isFinite(f) && f > 0 ? f : 1));
+        const r = m.lnD - Math.log(expect);
+        const sdLn = r > 0 ? m.sig * cfg.NLOS_LONG_SIGMA_FACTOR : m.sig;
+        const abs = cfg.RANGE_ABS_SIGMA_FT > 0 ? cfg.RANGE_ABS_SIGMA_FT / expect : 0;
+        const sd = abs ? Math.sqrt(sdLn * sdLn + abs * abs) : sdLn;
         // Gaussian with a floor: a gross outlier costs a bounded amount.
         ll += Math.max(-(r * r) / (2 * sd * sd), floor);
       }

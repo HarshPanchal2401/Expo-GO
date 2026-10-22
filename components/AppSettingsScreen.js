@@ -196,6 +196,21 @@ export default function AppSettingsScreen() {
           </Text>
         </Pressable>
 
+        <Pressable
+          onPress={() => updateParam("nearBeaconGuard", settings.nearBeaconGuard === false)}
+          style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: 10 }}
+        >
+          <View style={{ flex: 1, paddingRight: 12 }}>
+            <Text style={{ color: "#1e293b", fontSize: 13, fontWeight: "700" }}>Near-Beacon Guard</Text>
+            <Text style={{ color: "#64748b", fontSize: 11, marginTop: 2 }}>
+              ON: within a few feet of a beacon its distance only says "close", so walking past a beacon no longer pulls the track toward it. OFF: the previous behaviour.
+            </Text>
+          </View>
+          <Text style={{ fontWeight: "800", fontSize: 13, color: settings.nearBeaconGuard !== false ? "#3fb950" : "#f85149" }}>
+            {settings.nearBeaconGuard !== false ? "ON" : "OFF"}
+          </Text>
+        </Pressable>
+
         {/* Shake filter (StepGate): CLASSIC step engine only */}
         <Pressable
           onPress={() => updateParam("stepShakeFilter", settings.stepShakeFilter === false)}
@@ -372,7 +387,7 @@ function MobilityCard({ settings, updateParam, onSaved }) {
           </Pressable>
 
           <Pressable
-            onPress={() => updateParam("wheelchairScale", settings.wheelchairScale === false)}
+            onPress={() => updateParam("wheelchairScale", settings.wheelchairScale !== true)}
             style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: 10 }}
           >
             <View style={{ flex: 1, paddingRight: 12 }}>
@@ -381,8 +396,8 @@ function MobilityCard({ settings, updateParam, onSaved }) {
                 ON: weak vibration moves you slower and strong vibration faster (a calibration roll sets the reference). OFF: one fixed speed.
               </Text>
             </View>
-            <Text style={{ fontWeight: "800", fontSize: 13, color: settings.wheelchairScale !== false ? "#3fb950" : "#f85149" }}>
-              {settings.wheelchairScale !== false ? "ON" : "OFF"}
+            <Text style={{ fontWeight: "800", fontSize: 13, color: settings.wheelchairScale === true ? "#3fb950" : "#f85149" }}>
+              {settings.wheelchairScale === true ? "ON" : "OFF"}
             </Text>
           </Pressable>
 

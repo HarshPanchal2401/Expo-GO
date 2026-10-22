@@ -190,6 +190,9 @@ export const FUSION_CONFIG = {
   // of the walk — the map could only show the last few seconds rather than the
   // route taken. Sampling by real distance keeps the whole path.
   MIN_TRAIL_MOVE_FT: 1.0,
+  // The drawn trail is built from steps only. A beacon correction moves it only this
+  // fraction of the gap per step, so it follows slowly and a fix never bends it.
+  TRAIL_FOLLOW_PER_STEP: 0.2,
 
   // Trail capacity in points. With distance-based sampling this is a route
   // length budget: MAX_TRAIL_POINTS × MIN_TRAIL_MOVE_FT ≈ 300 ft of path.
@@ -280,6 +283,30 @@ export class FusionEngine {
     const wc = mode === "wheelchair";
     this._pf.cfg.SCALE_SD0 = wc ? 0.2 : PF_CONFIG.SCALE_SD0;
     this._pf.cfg.STEP_LEN_NOISE = wc ? 0.12 : PF_CONFIG.STEP_LEN_NOISE;
+  }
+
+  /**
+   * Near-beacon guard (Settings): on = ranges within a few feet of a beacon
+   * only say "close", and short ranges carry an error in feet as well, so the
+   * track is no longer pulled toward a beacon it passes (see ParticleFilter
+   * NEAR_RANGE_FT / RANGE_ABS_SIGMA_FT). Off = the previous behaviour.
+   */
+  setNearBeaconGuard(on) {
+    this._pf.cfg.NEAR_RANGE_FT = on ? PF_CONFIG.NEAR_RANGE_FT : 0;
+    this._pf.cfg.RANGE_ABS_SIGMA_FT = on ? PF_CONFIG.RANGE_ABS_SIGMA_FT : 0;
+  }
+
+  /** How the map handled the last move: { okFrac, action } (diagnostics for a recorded test). */
+  getLastStepInfo() {
+    return this._pfActive ? this._pf.lastStep || null : null;
+  }
+
+  /**
+   * How strongly beacons correct the position (0..1). 1 while the start is being found,
+   * low once navigating, so steps carry the track and beacons only pull it back slowly.
+   */
+  setBleWeight(w) {
+    this._pf.bleWeight = Math.min(1, Math.max(0, Number.isFinite(w) ? w : 1));
   }
 
   setParticleFilterEnabled(on) {
@@ -652,7 +679,7 @@ export class FusionEngine {
       let p = start;
       let res = null;
       for (let i = 0; i < 4; i++) {
-        const f = this._rangeCorrector(p.x, p.y) || {};
+        const f = this._rangeCorrector(p.x, p.y, params.d1, params.d2) || {};
         const f1 = Number.isFinite(f.f1) ? f.f1 : 1;
         const f2 = Number.isFinite(f.f2) ? f.f2 : 1;
         res = solveInitialPosition({ ...params, d1: params.d1 * f1, d2: params.d2 * f2, priorPosition: p });
@@ -764,7 +791,7 @@ export class FusionEngine {
       this._pf.step(len, headingDeg, opts.headingJumpSdDeg || 0, Number.isFinite(opts.t) ? opts.t : Date.now());
       this._pfSync();
       pdrEngine.applyStep(len, headingDeg);
-      this._pushTrail(this._x, this._y);
+      this._trailStep(len, headingDeg);
       return;
     }
     const rad = (headingDeg * Math.PI) / 180;
@@ -803,8 +830,8 @@ export class FusionEngine {
     // Update PDR engine for confidence tracking
     pdrEngine.applyStep(len, headingDeg);
 
-    // Append to trail
-    this._pushTrail(this._x, this._y);
+    // Append to trail (from the step, not from the corrected position)
+    this._trailStep(len, headingDeg);
   }
 
   // --------------------------------------------------------------------------
@@ -1372,6 +1399,20 @@ export class FusionEngine {
     return moved;
   }
 
+  /** One step of the drawn trail: the previous point plus the step, pulled slowly toward the corrected position. */
+  _trailStep(len, headingDeg) {
+    const last = this._trail[this._trail.length - 1];
+    if (!last) { this._pushTrail(this._x, this._y); return; }
+    const r = (headingDeg * Math.PI) / 180;
+    let nx = last.x + len * Math.sin(r), ny = last.y + len * Math.cos(r);
+    const k = this._cfg.TRAIL_FOLLOW_PER_STEP;
+    nx += k * (this._x - nx);
+    ny += k * (this._y - ny);
+    this._trail.push({ x: Number(nx.toFixed(2)), y: Number(ny.toFixed(2)) });
+    this._trailTip = false;
+    if (this._trail.length > this._maxTrailLength) this._trail.shift();
+  }
+
   _pushTrail(x, y) {
     // Sample by real distance travelled, not per event. The threshold sits
     // above the residual BLE jitter, so correction noise no longer consumes
@@ -1400,10 +1441,12 @@ export class FusionEngine {
    *   - after walking, one "standing here" tip after the last step moves.
    */
   _trailFollow(x, y, walking) {
-    if (walking || !this._trail.length) {
+    if (!this._trail.length) {
       this._pushTrail(x, y);
       return;
     }
+    // Walking or standing after steps: corrections never draw track. The trail grows from steps (_trailStep).
+    if (this._lastStepAt !== null) return;
     const p = { x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) };
     if (this._lastStepAt === null) {
       this._trail[this._trail.length - 1] = p;

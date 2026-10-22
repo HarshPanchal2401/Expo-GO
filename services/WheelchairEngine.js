@@ -37,6 +37,11 @@ export const WHEELCHAIR_CONFIG = {
   // average with this time constant (stopping, spinning).
   WINDOW_S: 1.0,
   SHORT_TAU_S: 0.3,
+  // Faster average used only to see that the vibration has stopped. The 0.3 s one kept
+  // reading "rolling" for about a second after the chair stopped, adding ~0.7 m to every stop.
+  STOP_TAU_S: 0.1,
+  // What is left of that lag is taken off the distance when a roll ends (s of full speed).
+  STOP_TAIL_S: 0.15,
   // Vibration (g RMS) that starts rolling, by Sensitivity. Rolling stops once
   // it drops below EXIT_FRAC of that.
   // Raised from 0.035 / 0.02 / 0.012: tremor and small bumps at 0.02-0.03 g
@@ -47,7 +52,7 @@ export const WHEELCHAIR_CONFIG = {
   // A longer stop time lets the chair cross a smooth patch of floor without
   // the roll ending (and needing ENTER_S again to restart).
   ENTER_S: 0.8, // short, so the dot starts sooner (the start level stays raised against small vibration)
-  EXIT_S: 2.0,
+  EXIT_S: 3.0, // was 2.0
   // Speed follows the vibration: counted speed = set speed x sqrt(level / reference),
   // limited to FACTOR_MIN..FACTOR_MAX. The reference is the level measured in a
   // calibration roll (Settings), or REF_OVER_START x the start level before one.
@@ -71,7 +76,7 @@ export const WHEELCHAIR_CONFIG = {
   // which is what the position filters expect.
   SEGMENT_M: 0.7,
   // A leftover shorter than this when rolling stops is dropped.
-  MIN_SEGMENT_M: 0.3,
+  MIN_SEGMENT_M: 0.15,
   // A push longer than this is handed over in equal parts.
   MAX_SEGMENT_M: 1.0,
   // Speed / push length limits (m/s, m).
@@ -103,7 +108,9 @@ export class WheelchairEngine {
     this.cfg = { ...WHEELCHAIR_CONFIG, ...config };
     this.onMove = null;        // ({t, lengthM, headingDeg, source: "roll"|"push"})
     this.platform = "android";
-    this.settings = { speedMps: 0.8, pushM: 1.0, sensitivity: "medium", auto: true, scale: true, refRmsG: null };
+    // scale: false = distance is rolling time x the set speed. Scaling it by the vibration made the same
+    // real speed count as 35% to 148% depending on how rough the floor was (the buzz is the floor, not the speed).
+    this.settings = { speedMps: 0.8, pushM: 1.0, sensitivity: "medium", auto: true, scale: false, refRmsG: null };
     this.gravity = new GravityTracker();
     this.reset();
   }
@@ -126,6 +133,7 @@ export class WheelchairEngine {
     this.pending = 0;          // distance rolled, not yet handed over (m)
     this.heldS = 0;            // rolling time held while the vibration dipped (s)
     this.eShort = 0;           // fast vibration energy (g²)
+    this.eStop = 0;            // faster vibration energy, for seeing a stop (g²)
     this.yawShort = 0;         // fast turn rate (deg/s)
     this.segmentStartT = null;
     this.rollStartT = null;    // when the current roll began (ms), for START_RAMP_S
@@ -205,6 +213,7 @@ export class WheelchairEngine {
     // not a whole window later.
     const ks = Math.min(1, dt / cfg.SHORT_TAU_S);
     this.eShort += ks * (e - this.eShort);
+    this.eStop += Math.min(1, dt / cfg.STOP_TAU_S) * (e - this.eStop);
     this.yawShort += ks * (yaw - this.yawShort);
 
     const s = { t, e, rt, yaw };
@@ -255,7 +264,7 @@ export class WheelchairEngine {
     // distance is HELD, not counted: if the vibration comes back it was only
     // a smooth patch of floor and the held distance is added; if it stays
     // away for EXIT_S the chair had stopped and it is dropped.
-    const vibrating = Math.sqrt(this.eShort) >= this.startRmsG * cfg.EXIT_FRAC && !handled;
+    const vibrating = Math.sqrt(this.eStop) >= this.startRmsG * cfg.EXIT_FRAC && !handled;
     if (vibrating) {
       if (this.belowSince !== null) {
         this.belowSince = null;
@@ -306,6 +315,8 @@ export class WheelchairEngine {
   _stopRolling(t) {
     // The time held since the vibration dropped was not rolling: it is
     // dropped. What was rolled before it is handed over.
+    // The stop was seen about STOP_TAIL_S late: that distance was not rolled.
+    this.pending = Math.max(0, this.pending - this.settings.speedMps * this.cfg.STOP_TAIL_S);
     if (this.pending >= this.cfg.MIN_SEGMENT_M) this._emit(t, this.pending, "roll");
     this.pending = 0;
     this.heldS = 0;
