@@ -59,7 +59,6 @@ import Svg, {
 import { fusionEngine } from "../../services/FusionEngine.js";
 import { v2Scanner } from "../../services/v2BeaconScannerService.js";
 import MobilityModeSwitch from "./MobilityModeSwitch.js";
-import { useGlide } from "./useGlide.js";
 import { loadStartSpots, saveStartSpot, removeStartSpot, MAX_NAME } from "../../services/StartSpots.js";
 import { checkRangeGeometry } from "../../services/BeaconRangingCalibration.js";
 import { metresToFeet, feetToMetres } from "../../services/PdrEngine.js";
@@ -418,26 +417,6 @@ function BeaconMarker({
 // Read from headingRef only when the map redrew, it lagged up to a second
 // behind a turn made standing still (nothing else redraws the map then) and
 // then jumped.
-// The user's dot, drawn gliding toward the real position (display only). Moves in
-// floor-plan feet, so it stays on the map while the view is panned or zoomed.
-function FusionDot({ x, y, toScreen, inv, opacity, headingRef, headingDeg }) {
-  const g = useGlide(x, y, { tauMs: 260, snap: 12 });
-  const p = toScreen(g.x, g.y);
-  return (
-    <>
-      <Circle cx={p.cx} cy={p.cy} r={(USER_DOT_RADIUS + 4) * inv} fill={C.userDot} fillOpacity={opacity * 0.25} />
-      <Circle cx={p.cx} cy={p.cy} r={USER_DOT_RADIUS * inv} fill={C.userDot} fillOpacity={opacity} />
-      <Circle cx={p.cx} cy={p.cy} r={(USER_DOT_RADIUS - 3) * inv} fill="#fff" fillOpacity={opacity * 0.65} />
-      {/* Heading indicator: short needle pointing the way the user is facing */}
-      <HeadingNeedle
-        headingRef={headingRef} fallbackDeg={headingDeg}
-        cx={p.cx} cy={p.cy} lenPx={(USER_DOT_RADIUS + 10) * inv}
-        strokeWidth={2.5 * inv} opacity={opacity}
-      />
-    </>
-  );
-}
-
 function HeadingNeedle({ headingRef, fallbackDeg, cx, cy, lenPx, strokeWidth, opacity }) {
   const [deg, setDeg] = useState(() => {
     const h = headingRef?.current;
@@ -1039,10 +1018,17 @@ function OfficeMapCanvas({
 
         {/* ── Fused user position — opacity reflects confidence, never overstates certainty ── */}
         {!placementMode && !searching && (
-          <FusionDot
-            x={x} y={y} toScreen={toScreen} inv={inv} opacity={quality.dotOpacity}
-            headingRef={headingRef} headingDeg={headingDeg}
-          />
+          <>
+            <Circle cx={userPx.cx} cy={userPx.cy} r={(USER_DOT_RADIUS + 4) * inv} fill={C.userDot} fillOpacity={quality.dotOpacity * 0.25} />
+            <Circle cx={userPx.cx} cy={userPx.cy} r={USER_DOT_RADIUS * inv} fill={C.userDot} fillOpacity={quality.dotOpacity} />
+            <Circle cx={userPx.cx} cy={userPx.cy} r={(USER_DOT_RADIUS - 3) * inv} fill="#fff" fillOpacity={quality.dotOpacity * 0.65} />
+            {/* Heading indicator — short needle pointing the way the user is facing */}
+            <HeadingNeedle
+              headingRef={headingRef} fallbackDeg={headingDeg}
+              cx={userPx.cx} cy={userPx.cy} lenPx={(USER_DOT_RADIUS + 10) * inv}
+              strokeWidth={2.5 * inv} opacity={quality.dotOpacity}
+            />
+          </>
         )}
         {/* ── Start point the user tapped (not yet confirmed) ── */}
         {pendingPoint && (() => {
