@@ -89,6 +89,7 @@ The runtime version follows the app version (`1.0.0`). An OTA update is download
 | `BleScannerService.js` | Only four helpers are used: BLE manager, permissions, Bluetooth on/off, iBeacon/Eddystone payload decoding. |
 | `appSettingsStorage.js` | Settings cache plus subscribers. |
 | `RttRangingService.js` | A simulated round-trip-time ranging experiment. **Nothing imports it.** |
+| `StartSpots.js` | Named start spots on the Fusion Map (saved on the phone). |
 | `PathStorage.js` (root) | Saved paths, with an in-memory fallback. |
 
 `backup/`, `scratch/` and `dist/` are not part of the app. `web-simulator/` is empty.

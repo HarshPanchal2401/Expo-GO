@@ -37,10 +37,10 @@ An **indoor navigation app** for one office. It shows the user's live position o
 
 | Tab | File | Purpose |
 |---|---|---|
-| 🗺️ Fusion Map | `components/v2/FusionMapScreen.js` | The main screen. Floor plan, beacon placement, locating, navigation, trail, obstacle editor, test-walk recorder. |
-| 🚶 PDR | `components/v2/PdrTrackerScreen.js` | PDR-only canvas, heading zero, step-length calibration walk |
+| 🗺️ Fusion Map | `components/v2/FusionMapScreen.js` | The main screen. Floor plan, beacon placement, locating, navigation, trail, obstacle editor, test-walk recorder. **Walking / Wheelchair switch** at the top (idle only). **Saved start spots** while picking a start. |
+| 🚶 PDR | `components/v2/PdrTrackerScreen.js` | PDR-only canvas, heading zero, step-length calibration walk, **Walking / Wheelchair switch** (locked while tracking) |
 | 📏 Raw | `components/v2/RawDistanceScreen.js` + `BeaconSetupCard.js` + `Calibrate1mCard.js` | **Choose B1 / B2**; **1 m calibration**: phone 1 m from the beacon, 15 s of raw RSSI (first 1.5 s skipped), 20% trimmed mean → Measured Power for that beacon; shows what the current MP reads at 1 m (the check) and saves the new MP (warns under 20 packets or spread over ±5 dB); (devices in range, Swap, scan only B1 & B2 or all), raw RSSI → formula distance, Measured Power and n per beacon set live, both Kalman filters toggleable. (The Signal Lab tab was removed; its calibrations fed an older engine the map did not use.) |
-| ⚙️ Settings | `components/AppSettingsScreen.js` | **Mobility card:** Walking / Wheelchair; in wheelchair mode, rolling detection on/off, sensitivity, rolling speed, push length and a calibration. **PDR card:** Weinberg K, ZUPT, peak threshold, min bounce, min cadence. **Toggles:** Step Engine (NEW / CLASSIC), Map Matching (ON / OFF), Shake Filter (classic engine only). |
+| ⚙️ Settings | `components/AppSettingsScreen.js` | **Wheelchair card** (shown only in wheelchair mode; the mode itself is switched on the PDR tab or Fusion Map): rolling detection on/off, sensitivity, rolling speed, push length and a calibration. **PDR card:** Weinberg K, ZUPT, peak threshold, min bounce, min cadence. **Toggles:** Step Engine (NEW / CLASSIC), Map Matching (ON / OFF), Shake Filter (classic engine only). |
 
 The app shells are `App.android.js` and `App.ios.js`, which are nearly identical. They own the sensor subscriptions, `addStep()` and the tab bar, and pass `pdrStepCallbackRef` and `headingRef` to the Fusion Map.
 
@@ -140,7 +140,7 @@ A **transition** (the phone being repositioned) is flagged when the average tilt
 - **Zero:** the heading is relative to a calibrated zero, set with "Zero Heading" and stored in `@pdr_heading_zero_deg`.
 
 ### 6.5 Wheelchair mode (`services/WheelchairEngine.js`)
-Settings → Mobility = Wheelchair. Both step detectors are switched off; the engine hands over **0.7 m moves** through the same `addStep()` path:
+Wheelchair mode (switch on the PDR tab or Fusion Map, saved at once). Both step detectors are switched off; the engine hands over **0.7 m moves** through the same `addStep()` path:
 - **Rolling:** RMS of the high-passed (~2.7 Hz) gravity-free acceleration. Starts after 0.8 s at or above the start level (Sensitivity low / medium / high = 0.035 / 0.02 / 0.012 g). Stops after 1 s below 60% of it; the time while it was low is dropped. Moves at `wheelchairSpeedMps` (default 0.8), building up from 0 over the first 1.0 s of each roll (`START_RAMP_S`; calibration counts the same way).
 - Not rolling while the phone is handled (tilt rotation > 45°/s); no distance while spinning (turn rate > 70°/s).
 - **Push button** (Fusion Map, and in the Settings calibration): one push = `wheelchairPushM` (default 1.0 m), split into parts ≤ 1 m.
@@ -215,6 +215,8 @@ Settings → Mobility = Wheelchair. Both step detectors are switched off; the en
 | `services/StepLengthModel.js` | Weinberg + cadence model, calibration |
 | `services/StepGate.js` | Shake gate for the classic engine only |
 | `services/WheelchairEngine.js` | Wheelchair rolling detection, Push button, calibration |
+| `services/StartSpots.js` | Named start spots (max 12, saved on the phone, in feet) |
+| `components/v2/MobilityModeSwitch.js` | Walking / Wheelchair switch used on the PDR tab and Fusion Map; saves `mobilityMode` |
 | `services/SimpleRanging.js` | RSSI → distance chain with the two Kalman filters |
 | `services/v2BeaconScannerService.js` | BLE scan hub, beacon slots, anchors |
 | `services/FusionEngine.js` | Locating, EKF, particle-filter integration, snapping |
@@ -261,7 +263,10 @@ Results come from a physics-based gait simulator plus the real floor-plan grid:
 - **Auto path-loss (n) engine:** n adapts using the PDR-known true distance, and the initial position takes n into account.
 - **Pocket walking-direction offset learning.**
 
-**Tried and reverted (do not re-add without asking):**
+**Tried and removed (do not re-add without asking):**
+- **Cellular tab (Oct 2026):** cell tower IDs → OpenCelliD / BeaconDB → position on a world map. A tower covers hundreds of metres to km, so it cannot place a phone in the 72 × 72 ft office. Removed with its native module and proxy.
+- **BLE RTT test and custom RSSI equation card (Oct 2026):** a Bluetooth read takes milliseconds (1 ms = 150 km as c × RTT / 2), so it gives no distance. A fitted close-range equation was also tried and removed. Real timing needs Wi-Fi RTT, UWB or Channel Sounding hardware.
+
 - **motion-v17-gridfix (16 Oct 2026):** a localization upgrade made of four parts:
   - **Grid start solver:** scored every walkable cell instead of intersecting the two circles.
   - **Per-beacon trust:** an uncertainty and a weight per beacon; a beacon silent for 4 s was left out.

@@ -117,7 +117,7 @@ It also notices when the phone is being **moved** from one position to another, 
 
 ### 3e. Wheelchair mode (instead of steps)
 
-A wheelchair user makes no steps, so Stage 3b finds nothing. With **Mobility = Wheelchair** in Settings, `services/WheelchairEngine.js` replaces the step detector:
+A wheelchair user makes no steps, so Stage 3b finds nothing. With **Wheelchair** mode on (switch on the PDR tab or Fusion Map), `services/WheelchairEngine.js` replaces the step detector:
 
 - **Rolling:** the wheels make the phone buzz. While that vibration lasts, the user moves forward at their wheelchair speed, handed over as 0.7 m moves. Picking up or using the phone and spinning on the spot add no distance.
 - **Push button:** each tap of **♿ Push** on the Fusion Map moves the user one push length. This is what works on carpet, where the wheels barely vibrate.
@@ -180,7 +180,7 @@ The Fusion Map begins in the **`idle`** phase. When the user starts, it moves to
 stateDiagram-v2
     [*] --> idle
     idle --> locating: Find My Position
-    idle --> picking: Set My Start on the Map
+    idle --> picking: Set My Start on the Map (tap the map or a saved start spot)
     locating --> navigating: one spot on the green
     locating --> choosing: two spots on the green
     locating --> navigating: user starts moving (both spots kept)
