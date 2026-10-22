@@ -96,6 +96,11 @@ export class WheelchairEngine {
     this.reset();
   }
 
+  /** Forget headings measured before a new heading zero (they are in the old reference). */
+  clearHeadings() {
+    this.headings = [];
+  }
+
   reset() {
     this.gravity.reset();
     this.hp = null;            // high-pass state {x, y, z}

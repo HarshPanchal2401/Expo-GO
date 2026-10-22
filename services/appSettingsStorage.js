@@ -110,6 +110,10 @@ function normalizeSettings(raw) {
   return s;
 }
 
+// Changes made through saveAppSettings before the first load from storage finished.
+let firstLoadDone = false;
+let savedBeforeLoad = {};
+
 /**
  * Returns currently active settings synchronously
  */
@@ -122,19 +126,26 @@ export function getAppSettings() {
  */
 export async function loadAppSettings() {
   if (!AsyncStorage || typeof AsyncStorage.getItem !== "function") {
+    firstLoadDone = true;
     return cachedSettings;
   }
   try {
     const raw = await AsyncStorage.getItem(STORAGE_KEY);
+    // Changes saved while this read was running win over what was stored.
+    const early = firstLoadDone ? {} : savedBeforeLoad;
+    firstLoadDone = true;
+    savedBeforeLoad = {};
     if (!raw) {
-      cachedSettings = normalizeSettings(DEFAULT_APP_SETTINGS);
+      cachedSettings = normalizeSettings({ ...DEFAULT_APP_SETTINGS, ...early });
+      if (Object.keys(early).length) notifyListeners();
       return cachedSettings;
     }
     const parsed = JSON.parse(raw);
-    cachedSettings = normalizeSettings(parsed);
+    cachedSettings = normalizeSettings({ ...parsed, ...early });
     notifyListeners();
     return cachedSettings;
   } catch (e) {
+    firstLoadDone = true;
     console.warn("[AppSettingsStorage] Error loading settings:", e);
     return cachedSettings;
   }
@@ -144,6 +155,7 @@ export async function loadAppSettings() {
  * Merges updates, saves to AsyncStorage, and updates active memory cache
  */
 export async function saveAppSettings(updates) {
+  if (!firstLoadDone) savedBeforeLoad = { ...savedBeforeLoad, ...updates };
   cachedSettings = normalizeSettings({ ...cachedSettings, ...updates });
   notifyListeners();
 

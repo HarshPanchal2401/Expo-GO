@@ -233,6 +233,8 @@ export default function AppIOS() {
       if (prevMode !== undefined && prevMode !== s?.mobilityMode) {
         wheelchairEngine.reset();
         motionEngineRef.current?.reset();
+        // reset() restarts the carry version at 0: forget the old one so the first step is not read as a repositioned phone.
+        carryVersionRef.current = null;
       }
     };
     applyWheelchair(appSettingsRef.current);
@@ -242,6 +244,14 @@ export default function AppIOS() {
       setAppSettings(newSettings);
       applyWheelchair(newSettings, prevMode);
     });
+    // The stored settings may have finished loading between the first render and this subscription: catch up.
+    const loaded = getAppSettings();
+    if (loaded !== appSettingsRef.current) {
+      const prevMode = appSettingsRef.current?.mobilityMode;
+      appSettingsRef.current = loaded;
+      setAppSettings(loaded);
+      applyWheelchair(loaded, prevMode);
+    }
     return () => unsub();
   }, []);
 
@@ -698,6 +708,9 @@ export default function AppIOS() {
       console.warn("Heading zero save failed:", err)
     );
     headingFilter.reset(0);
+    // Headings buffered before the zero are in the old reference.
+    motionEngineRef.current?.clearHeadings?.();
+    wheelchairEngine.clearHeadings();
     headingRef.current = 0;
     setHeading(0);
     setStatus("Heading zero calibrated (Forward = 0°)");

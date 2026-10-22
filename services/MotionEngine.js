@@ -193,6 +193,11 @@ export class MotionEngine {
     this.reset();
   }
 
+  /** Forget headings measured before a new heading zero (they are in the old reference). */
+  clearHeadings() {
+    this.headings = [];
+  }
+
   reset() {
     this.gravity.reset();
     this.carry.reset();

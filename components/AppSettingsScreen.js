@@ -150,7 +150,7 @@ export default function AppSettingsScreen() {
         </View>
       )}
 
-      <MobilityCard settings={settings} updateParam={updateParam} onSaved={(cfg) => setSettings(cfg)} />
+      <MobilityCard settings={settings} updateParam={updateParam} onSaved={(patch) => setSettings((prev) => ({ ...prev, ...patch }))} />
 
       {/* ──────────────────────────────────────────────────────────────────── */}
       {/* SECTION 3: PDR STEP DETECTOR & WEINBERG STRIDE                       */}
@@ -326,8 +326,8 @@ function MobilityCard({ settings, updateParam, onSaved }) {
       return;
     }
     const patch = res.pushM !== undefined ? { wheelchairPushM: res.pushM } : { wheelchairSpeedMps: res.speedMps };
-    const cfg = await saveAppSettings(patch);
-    onSaved?.(cfg);
+    await saveAppSettings(patch);
+    onSaved?.(patch);
     Alert.alert(
       "Wheelchair calibrated",
       res.pushM !== undefined
