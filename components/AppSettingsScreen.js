@@ -229,10 +229,10 @@ export default function AppSettingsScreen() {
           hint="Variance gate to detect standing still; lower = more sensitive"
           unit="g²"
           value={settings.zuptVariance}
-          step={0.001}
-          min={0.001}
-          max={0.04}
-          decimals={3}
+          step={0.0001}
+          min={0.0005}
+          max={0.0015}
+          decimals={4}
           onChange={(val) => updateParam("zuptVariance", val)}
         />
 
@@ -241,10 +241,10 @@ export default function AppSettingsScreen() {
           hint="Foot-strike acceleration peak (lowered for handheld walking)"
           unit="g"
           value={settings.peakThreshold}
-          step={0.01}
-          min={0.04}
-          max={0.4}
-          decimals={2}
+          step={0.005}
+          min={0.02}
+          max={0.05}
+          decimals={3}
           onChange={(val) => updateParam("peakThreshold", val)}
         />
 
@@ -253,10 +253,10 @@ export default function AppSettingsScreen() {
           hint="Minimum (Peak - Valley) difference to confirm valid step"
           unit="g"
           value={settings.bounceDiffMin}
-          step={0.02}
-          min={0.06}
-          max={0.5}
-          decimals={2}
+          step={0.005}
+          min={0.03}
+          max={0.07}
+          decimals={3}
           onChange={(val) => updateParam("bounceDiffMin", val)}
         />
 

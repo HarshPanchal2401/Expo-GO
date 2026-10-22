@@ -81,7 +81,7 @@ const FLOORPLAN_IMAGE = require("../../assets/floorplans/office-72x72.png");
 // because an OTA update is only APPLIED on the next cold start after it
 // downloads, so "I published the fix and it still fails" is very often the
 // old bundle still running - this makes that visible instead of a guess.
-const ENGINE_TAG = "motion-v16-cal1m";
+const ENGINE_TAG = "motion-v16-cal1m-steplen";
 
 // How the phone is carried (services/CarryDetector.js). Pocket / ear /
 // swinging: heading from the gyro alone, step length from the step rate.
@@ -1242,7 +1242,9 @@ function FusionMapScreen({
   };
   const handleSaveSpot = async () => {
     if (!pendingStart || !spotName.trim()) return;
-    setStartSpots([...(await saveStartSpot(spotName, pendingStart.x, pendingStart.y))]);
+    const res = await saveStartSpot(spotName, pendingStart.x, pendingStart.y);
+    setStartSpots([...res.list]);
+    if (!res.ok) { Alert.alert("Spot not saved", res.reason); return; }
     setSpotName("");
   };
   const handleDeleteSpot = async (id) => setStartSpots([...(await removeStartSpot(id))]);

@@ -58,9 +58,9 @@ export const PDR_CONFIG = {
   // Time in milliseconds over which confidence decays from 1.0 to MIN_CONFIDENCE.
   CONFIDENCE_DECAY_DURATION_MS: 20000,
 
-  // Human step length clamp in feet (~0.45 - 1.05 m).
-  MIN_STEP_LENGTH_FT: 1.48,
-  MAX_STEP_LENGTH_FT: 3.44,
+  // Step length clamp in feet (0.30 - 1.20 m): matches StepLengthModel and the wheelchair push.
+  MIN_STEP_LENGTH_FT: 0.98,
+  MAX_STEP_LENGTH_FT: 3.94,
   DEFAULT_STEP_LENGTH_FT: 2.3,
 };
 

@@ -744,7 +744,9 @@ export class FusionEngine {
    *   steps released together after walking was confirmed keep their own time
    */
   predict(stepLengthFt, headingDeg, opts = {}) {
-    const len = Math.max(1.48, Math.min(3.44, stepLengthFt || 2.3));
+    // 0.30 m (shortest wheelchair push) to 1.20 m (StepLengthModel's longest step), in feet.
+    // A tighter range cut long strides and raised short moves, so this map and the PDR tab disagreed.
+    const len = Math.max(0.98, Math.min(3.94, stepLengthFt || 2.3));
     // A step IS the motion signal the correction step needs. Recording it here
     // means the stationary gate needs no separate sensor or external wiring.
     this._lastStepAt = Date.now();
