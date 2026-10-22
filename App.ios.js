@@ -61,7 +61,7 @@ const alphaDeg = (a) => (Math.abs(a) <= Math.PI * 2.2 ? (a * 180) / Math.PI : a)
 const WEINBERG_K = 0.74;
 
 export default function AppIOS() {
-  const [running, setRunning] = useState(true);
+  const [running, setRunning] = useState(false); // tracking starts only when the user presses Start
   const [available, setAvailable] = useState("checking...");
   const [steps, setSteps] = useState(0);
   const [totalDistance, setTotalDistance] = useState(0);
@@ -72,7 +72,7 @@ export default function AppIOS() {
   const [headingZero, setHeadingZero] = useState(null);
   const [position, setPosition] = useState({ x: 0, y: 0 });
   const [path, setPath] = useState([{ x: 0, y: 0 }]);
-  const [status, setStatus] = useState("Tracking active (iOS V2)");
+  const [status, setStatus] = useState("Tracking paused. Press Start");
   const [rawHeading, setRawHeading] = useState(0);
 
   const [magneticField, setMagneticField] = useState({ x: 0, y: 0, z: 0, total: 0 });
@@ -102,7 +102,7 @@ export default function AppIOS() {
   // PDR step callback ref — Fusion Map attaches its prediction hook here
   const pdrStepCallbackRef = useRef(null);
 
-  const runningRef = useRef(true);
+  const runningRef = useRef(false);
   const headingRef = useRef(0);
   // 0 by default = uncalibrated heading reads as raw sensor azimuth. This is
   // ONLY ever changed by the explicit setZero() action below — nothing else

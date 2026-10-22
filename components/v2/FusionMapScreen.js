@@ -499,6 +499,8 @@ function OfficeMapCanvas({
   onAnimateView,
   onGestureActive,
   navPhase = "idle",
+  // The walk that just ended (frozen at Stop): stays drawn until the next navigation starts.
+  lastTrail = null,
   savedRoutesOnMap = [],
   // Tap-to-choose: when on, a tap (not a drag) on the plan reports the tapped
   // floor-plan point in feet through onMapTap.
@@ -927,6 +929,14 @@ function OfficeMapCanvas({
             strokeOpacity={0.85} strokeLinecap="round" strokeLinejoin="round"
           />
         )}
+        {/* The last walk, kept after Stop until the next navigation begins. */}
+        {navPhase !== "navigating" && lastTrail && lastTrail.length > 1 && (
+          <Polyline
+            points={lastTrail.map((pt) => { const { cx, cy } = toScreen(pt.x, pt.y); return `${cx.toFixed(1)},${cy.toFixed(1)}`; }).join(" ")}
+            fill="none" stroke={C.trail} strokeWidth={3 * inv}
+            strokeOpacity={0.6} strokeLinecap="round" strokeLinejoin="round"
+          />
+        )}
 
         {/* ── The other possible position ──────────────────────────────────
             Two range circles meet at two points and ranges alone cannot say
@@ -1187,12 +1197,16 @@ function FusionMapScreen({
   // Saved routes currently drawn on the map. A just-saved route is added
   // automatically so the walk stays visible after Stop clears the live trail.
   const [shownRouteIds, setShownRouteIds] = useState(() => new Set());
+  // The last walk, frozen when navigation stops, drawn until the next navigation starts.
+  const [lastTrail, setLastTrail] = useState(null);
   const [locProgress, setLocProgress] = useState(null);
   // Read from inside sensor callbacks, which would otherwise capture a stale
   // value from the render they were created in.
   const headingCalibratedRef = useRef(headingCalibrated);
   headingCalibratedRef.current = headingCalibrated;
   const isRunning = navPhase !== "idle";
+  // A new navigation starts a new walk: the previous one is no longer drawn.
+  useEffect(() => { if (navPhase === "navigating") setLastTrail(null); }, [navPhase]);
   const [placementMode, setPlacementMode] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [configLoaded, setConfigLoaded] = useState(false);
@@ -2067,6 +2081,10 @@ function FusionMapScreen({
   };
 
   const handleStop = () => {
+    if (navPhase === "navigating") {
+      const t = fusionEngine.getState().trail;
+      if (t && t.length > 1) setLastTrail(t.map((p) => ({ x: p.x, y: p.y })));
+    }
     pickStartChoice(null);
     settlingRef.current = false;
     setSettling(false);
@@ -2081,6 +2099,10 @@ function FusionMapScreen({
 
   /** Throws away the current fix and locates again from scratch. */
   const handleReLocate = () => {
+    if (navPhase === "navigating") {
+      const t = fusionEngine.getState().trail;
+      if (t && t.length > 1) setLastTrail(t.map((p) => ({ x: p.x, y: p.y })));
+    }
     pickStartChoice(null);
     settlingRef.current = false;
     setSettling(false);
@@ -2487,6 +2509,7 @@ function FusionMapScreen({
         onAnimateView={animateView}
         onGestureActive={setMapGestureActive}
         navPhase={navPhase}
+        lastTrail={lastTrail}
         obstacles={obstacleMap.items}
         pickMode={
           Boolean(obstacleEdit) ||
