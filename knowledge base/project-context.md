@@ -141,10 +141,10 @@ A **transition** (the phone being repositioned) is flagged when the average tilt
 
 ### 6.5 Wheelchair mode (`services/WheelchairEngine.js`)
 Wheelchair mode (switch on the PDR tab or Fusion Map, saved at once). Both step detectors are switched off; the engine hands over **0.7 m moves** through the same `addStep()` path:
-- **Rolling:** RMS of the high-passed (~2.7 Hz) gravity-free acceleration. Starts after 0.8 s at or above the start level (Sensitivity low / medium / high = 0.035 / 0.02 / 0.012 g). Stops after 1 s below 60% of it; the time while it was low is dropped. Moves at `wheelchairSpeedMps` (default 0.8), building up from 0 over the first 1.0 s of each roll (`START_RAMP_S`; calibration counts the same way).
-- Not rolling while the phone is handled (tilt rotation > 45°/s); no distance while spinning (turn rate > 70°/s).
+- **Rolling:** RMS of the high-passed (~2.7 Hz) gravity-free acceleration. Starts after 1.2 s at or above the start level (Sensitivity low / medium / high = 0.05 / 0.03 / 0.018 g). Stops after 2 s below 50% of it; the time while it was low is dropped. **Speed follows vibration:** counted speed = `wheelchairSpeedMps` × √(level ÷ reference), limited to 0.5×–1.5×. The reference is the level measured in the calibration roll (`wheelchairRefRmsG`), or 3× the start level before one. Settings → "Speed Follows Vibration" OFF gives one fixed speed again.
+- Not rolling while the phone is handled (tilt rotation > 90°/s); no distance while spinning on the spot (turn rate > 150°/s), so ordinary turns still move you.
 - **Push button** (Fusion Map, and in the Settings calibration): one push = `wheelchairPushM` (default 1.0 m), split into parts ≤ 1 m.
-- **Calibration:** roll a measured distance → speed from the rolling time; or tap Push per push → push length.
+- **Calibration:** roll a measured distance → speed from the rolling time **and the vibration level it happened at**; or tap Push per push → push length.
 - Map matching widens its distance doubt (`FusionEngine.setMobility`: scale σ 0.2, per-move noise 12%).
 - The PDR tab shows the live vibration level; a recorded test walk logs it once a second as `note` rows.
 - **Untuned on a real wheelchair.** On carpet the vibration is too small: use the Push button.

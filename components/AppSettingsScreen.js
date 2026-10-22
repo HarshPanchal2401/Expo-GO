@@ -325,7 +325,9 @@ function MobilityCard({ settings, updateParam, onSaved }) {
       Alert.alert("Calibration not saved", res.reason);
       return;
     }
-    const patch = res.pushM !== undefined ? { wheelchairPushM: res.pushM } : { wheelchairSpeedMps: res.speedMps };
+    const patch = res.pushM !== undefined
+      ? { wheelchairPushM: res.pushM }
+      : { wheelchairSpeedMps: res.speedMps, ...(res.refRmsG ? { wheelchairRefRmsG: res.refRmsG } : {}) };
     await saveAppSettings(patch);
     onSaved?.(patch);
     Alert.alert(
@@ -366,6 +368,21 @@ function MobilityCard({ settings, updateParam, onSaved }) {
             </View>
             <Text style={{ fontWeight: "800", fontSize: 13, color: settings.wheelchairAuto !== false ? "#3fb950" : "#f85149" }}>
               {settings.wheelchairAuto !== false ? "ON" : "OFF"}
+            </Text>
+          </Pressable>
+
+          <Pressable
+            onPress={() => updateParam("wheelchairScale", settings.wheelchairScale === false)}
+            style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: 10 }}
+          >
+            <View style={{ flex: 1, paddingRight: 12 }}>
+              <Text style={{ color: "#1e293b", fontSize: 13, fontWeight: "700" }}>Speed Follows Vibration</Text>
+              <Text style={{ color: "#64748b", fontSize: 11, marginTop: 2 }}>
+                ON: weak vibration moves you slower and strong vibration faster (a calibration roll sets the reference). OFF: one fixed speed.
+              </Text>
+            </View>
+            <Text style={{ fontWeight: "800", fontSize: 13, color: settings.wheelchairScale !== false ? "#3fb950" : "#f85149" }}>
+              {settings.wheelchairScale !== false ? "ON" : "OFF"}
             </Text>
           </Pressable>
 

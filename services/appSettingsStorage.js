@@ -47,6 +47,8 @@ export const DEFAULT_APP_SETTINGS = {
   maxCadenceMs: 1800,              // Slowest allowable step cadence (~0.55 steps/sec)
 
   // ─── Mobility (services/WheelchairEngine.js) ─────────────────────────────
+  wheelchairScale: true,           // wheelchair: counted speed follows the vibration level
+  wheelchairRefRmsG: null,         // wheelchair: vibration level at the set speed (set by a calibration roll)
   mobilityMode: "walking",         // "walking" (steps) | "wheelchair" (rolling + Push button)
   wheelchairAuto: true,            // detect rolling from the wheels' vibration
   wheelchairSpeedMps: 0.8,         // speed while rolling (m/s); calibrate in Settings

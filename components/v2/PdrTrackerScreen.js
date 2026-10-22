@@ -25,6 +25,7 @@ import {
 } from "react-native";
 import { stepLengthModel } from "../../services/StepLengthModel.js";
 import MobilityModeSwitch from "./MobilityModeSwitch.js";
+import { useGlide } from "./useGlide.js";
 import Svg, {
   Polyline,
   Circle,
@@ -610,6 +611,30 @@ function pathGeometry(points, previousPath, canvasWidth, canvasHeight, pad) {
   return { scale, originCanvas, curCanvas, polylineStr, prevPolylineStr };
 }
 
+// The current position marker and heading arrow, gliding toward the real point
+// (display only). A jump larger than 60 px (the canvas re-scaling) is shown at once.
+function PdrDot({ cx, cy, heading }) {
+  const g = useGlide(cx, cy, { tauMs: 260, snap: 60 });
+  const arrowLen = 22;
+  const rad = (heading * Math.PI) / 180;
+  const tipX = g.x + arrowLen * Math.sin(rad);
+  const tipY = g.y - arrowLen * Math.cos(rad);
+  const wingAngle = Math.PI / 6;
+  const wingLen = 10;
+  const wing1X = tipX - wingLen * Math.sin(rad - wingAngle);
+  const wing1Y = tipY + wingLen * Math.cos(rad - wingAngle);
+  const wing2X = tipX - wingLen * Math.sin(rad + wingAngle);
+  const wing2Y = tipY + wingLen * Math.cos(rad + wingAngle);
+  return (
+    <>
+      <Circle cx={g.x} cy={g.y} r={7} fill="#3fb950" />
+      <Circle cx={g.x} cy={g.y} r={12} fill="none" stroke="#3fb950" strokeWidth={1.5} opacity={0.6} />
+      <Line x1={g.x} y1={g.y} x2={tipX} y2={tipY} stroke="#58a6ff" strokeWidth={2.5} strokeLinecap="round" />
+      <Polygon points={`${tipX},${tipY} ${wing1X},${wing1Y} ${wing2X},${wing2Y}`} fill="#58a6ff" />
+    </>
+  );
+}
+
 // Memoised, with the path geometry computed only when a step adds a point:
 // the heading arrow redraws 10x a second, and rebuilding the whole path on
 // each of those kept the JS thread busy enough on a long walk to delay the
@@ -622,19 +647,6 @@ const PathCanvas = React.memo(function PathCanvas({ points, heading, previousPat
     () => pathGeometry(points, previousPath, canvasWidth, canvasHeight, pad),
     [points, previousPath, canvasWidth]
   );
-
-  // Arrow calculations for heading
-  const arrowLen = 22;
-  const rad = (heading * Math.PI) / 180;
-  const tipX = curCanvas.x + arrowLen * Math.sin(rad);
-  const tipY = curCanvas.y - arrowLen * Math.cos(rad);
-
-  const wingAngle = Math.PI / 6;
-  const wingLen = 10;
-  const wing1X = tipX - wingLen * Math.sin(rad - wingAngle);
-  const wing1Y = tipY + wingLen * Math.cos(rad - wingAngle);
-  const wing2X = tipX - wingLen * Math.sin(rad + wingAngle);
-  const wing2Y = tipY + wingLen * Math.cos(rad + wingAngle);
 
   return (
     <View style={styles.canvasContainer}>
@@ -736,24 +748,8 @@ const PathCanvas = React.memo(function PathCanvas({ points, heading, previousPat
           (0,0)
         </SvgText>
 
-        {/* Current Position Marker */}
-        <Circle cx={curCanvas.x} cy={curCanvas.y} r={7} fill="#3fb950" />
-        <Circle cx={curCanvas.x} cy={curCanvas.y} r={12} fill="none" stroke="#3fb950" strokeWidth={1.5} opacity={0.6} />
-
-        {/* Direction Orientation Arrow */}
-        <Line
-          x1={curCanvas.x}
-          y1={curCanvas.y}
-          x2={tipX}
-          y2={tipY}
-          stroke="#58a6ff"
-          strokeWidth={2.5}
-          strokeLinecap="round"
-        />
-        <Polygon
-          points={`${tipX},${tipY} ${wing1X},${wing1Y} ${wing2X},${wing2Y}`}
-          fill="#58a6ff"
-        />
+        {/* Current position marker and direction arrow (gliding) */}
+        <PdrDot cx={curCanvas.x} cy={curCanvas.y} heading={heading} />
       </Svg>
     </View>
   );

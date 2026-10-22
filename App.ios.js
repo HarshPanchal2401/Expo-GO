@@ -228,6 +228,8 @@ export default function AppIOS() {
         pushM: s?.wheelchairPushM,
         sensitivity: s?.wheelchairSensitivity,
         auto: s?.wheelchairAuto !== false,
+        scale: s?.wheelchairScale !== false,
+        refRmsG: s?.wheelchairRefRmsG ?? null,
       });
       // Switching mode: start each engine clean, nothing carried over.
       if (prevMode !== undefined && prevMode !== s?.mobilityMode) {

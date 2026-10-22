@@ -536,6 +536,16 @@ export class FusionEngine {
   }
 
   /**
+   * Starts the drawn trail again from the current position. Used when the
+   * position has settled after a beacon fix, so movement made while the app was
+   * still finding the position is not part of the path shown.
+   */
+  restartTrail() {
+    this._trail = [{ x: Number(this._x.toFixed(2)), y: Number(this._y.toFixed(2)) }];
+    this._trailTip = false;
+  }
+
+  /**
    * Commits the fix immediately from whatever has been collected so far.
    * Used when the user starts walking mid-locate: from that moment new ranges
    * describe a moving position, so waiting longer would only make the fix
