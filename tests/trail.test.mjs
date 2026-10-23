@@ -47,9 +47,9 @@ test("a lower beacon weight moves the position less per fix", () => {
 import { floorplanGrid } from "../services/WalkableGrid.js";
 
 test("the drawn path never crosses gray: every point and every line is on the walkable area", () => {
-  floorplanGrid.setRoom(70, 72);
+  floorplanGrid.setRoom(70, 70);
   const e = new FusionEngine();
-  e.setRoomSize(70, 72);
+  e.setRoomSize(70, 70);
   e.setWalkableGrid(floorplanGrid);
   e.setBleAnchors({ x: 15, y: 66 }, { x: 60, y: 10 });
   e.setManualPosition(30, 40); // open area
@@ -76,10 +76,10 @@ test("the drawn path never crosses gray: every point and every line is on the wa
 
 test("when every possible position walks into a wall, the dot moves along it instead of freezing", async () => {
   const { ParticleFilter } = await import("../services/ParticleFilter.js");
-  floorplanGrid.setRoom(70, 72);
+  floorplanGrid.setRoom(70, 70);
   const run = () => {
     const e = new FusionEngine();
-    e.setRoomSize(70, 72); e.setWalkableGrid(floorplanGrid);
+    e.setRoomSize(70, 70); e.setWalkableGrid(floorplanGrid);
     e.setBleAnchors({ x: 15, y: 66 }, { x: 60, y: 10 });
     e.setManualPosition(12.5, 8); e.beginNavigation();
     let stuck = 0, prev = e.getState();

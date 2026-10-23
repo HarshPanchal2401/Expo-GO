@@ -175,7 +175,7 @@ idle ──Find My Position──▶ locating ──fix committed──▶ navig
 | `@v2_fusion_anchors_ft` | Beacon positions on the map `{b1:{x,y}, b2:{x,y}}` in feet | `v2BeaconScannerService.js` |
 | `@v2_beacon_calib_<MAC>` | Per-beacon path-loss calibration (points, n, Tx, optional far-segment slope) | `AdaptiveBeaconEngine.js` |
 
-The floor-plan image `assets/floorplans/office-70x72.png` is **gitignored**. It must exist on the machine that runs `eas update`, or the bundle fails.
+The floor-plan image `assets/floorplans/office-70x70.png` is **gitignored**. It must exist on the machine that runs `eas update`, or the bundle fails.
 
 ---
 

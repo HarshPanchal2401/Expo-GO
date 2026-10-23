@@ -1,7 +1,7 @@
 // ============================================================================
 // FusionMapScreen.js — Live PDR + BLE Fusion Navigation on the Real Office Map
 //
-// Renders the actual office floor plan (assets/floorplans/office-70x72.png, 70 x 72 ft)
+// Renders the actual office floor plan (assets/floorplans/office-70x70.png, 70 x 70 ft)
 // as the map background, with a live fused position tracked by FusionEngine
 // (async EKF: PDR predicts every step, BLE corrects on every beacon packet).
 //
@@ -76,7 +76,7 @@ import { getAppSettings, subscribeAppSettings } from "../../services/appSettings
 // Everything the obstacle editor can draw: RF obstacles + no-walk areas.
 const EDIT_TYPES = [...OBSTACLE_TYPES, ...AREA_TYPES];
 
-const FLOORPLAN_IMAGE = require("../../assets/floorplans/office-70x72.png");
+const FLOORPLAN_IMAGE = require("../../assets/floorplans/office-70x70.png");
 
 // Bump with every change to the locating/ranging behaviour. Shown on screen
 // because an OTA update is only APPLIED on the next cold start after it
@@ -115,7 +115,7 @@ const MAP_PADDING = 20; // canvas margin (px)
 const MAP_SIZE = SCREEN_W - 32; // canvas width (px) — height follows room aspect ratio
 const CANVAS_SIZE = MAP_SIZE - MAP_PADDING * 2; // drawable area (px, square axis unit)
 
-// The office drawing's real size (FloorplanMigration.js moves older 72 x 72 saves onto it).
+// The office drawing's real size (FloorplanMigration.js moves saves from earlier drawings onto it).
 const DEFAULT_ROOM_W_FT = FLOORPLAN_W_FT;
 // "Where are you?": a tap this close to spot A or B picks it (ft).
 const CHOICE_TAP_FT = 10;
@@ -304,7 +304,7 @@ function snapToGrid(ft, step = GRID_MINOR_FT) {
 /**
  * Scale + offset to fit a roomW×roomH (feet) rectangle into a boxW×boxH (px)
  * bounding box, preserving aspect ratio with a small margin. Works for square
- * rooms and non-square ones (today's 70×72 ft office).
+ * rooms (today's 70×70 ft office) and non-square ones.
  */
 function computeTransform(roomW, roomH, boxW, boxH) {
   const scaleX = boxW / roomW;
@@ -1361,7 +1361,7 @@ function FusionMapScreen({
   // ── Load saved floor-plan size + beacon anchors (feet) on mount ──
   useEffect(() => {
     (async () => {
-      // Saved positions from the old 72 x 72 ft drawing are moved onto the 70 x 72 ft one first.
+      // Saved positions from earlier drawings are moved onto the current one first.
       await ensureFloorplanMigrated();
       const [size, anchors] = await Promise.all([
         v2Scanner.getPlaceSize(),

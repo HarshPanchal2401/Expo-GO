@@ -33,7 +33,7 @@ export function loadStartSpots() {
   if (!loadPromise) {
     loadPromise = (async () => {
       let list = [];
-      // Spots saved on the old 72 x 72 ft drawing are moved onto the 70 x 72 ft one first.
+      // Spots saved on an earlier drawing are moved onto the current one first.
       await ensureFloorplanMigrated();
       try {
         const raw = AsyncStorage ? await AsyncStorage.getItem(KEY) : null;
