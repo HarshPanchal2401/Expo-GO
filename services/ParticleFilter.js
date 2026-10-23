@@ -99,6 +99,7 @@ export class ParticleFilter {
     this.grid = null;
     this.p = [];
     this.lastBleAt = 0;
+    this.bleWeight = 1; // 1 = full beacon influence; lower = beacons correct more slowly
     // Recent moves {t, len, h} (feet, deg), for scoring lagged ranges.
     this.moves = [];
     this._rand = Math.random;
@@ -154,6 +155,23 @@ export class ParticleFilter {
     for (const a of m.areas) if (inRect(x, y, a)) return false;
     for (const c of m.circles) if (Math.hypot(x - c.x, y - c.y) < c.r) return false;
     return true;
+  }
+
+  /**
+   * The part of a blocked move (dx, dy) that runs along the wall: the longer of its
+   * x and y parts that can be walked (the office walls are along the axes), else the
+   * longest fraction of it. null if nothing fits.
+   */
+  _slide(x, y, dx, dy) {
+    const opts = Math.abs(dx) >= Math.abs(dy) ? [[dx, 0], [0, dy]] : [[0, dy], [dx, 0]];
+    for (const [sx, sy] of opts) {
+      if (Math.hypot(sx, sy) < 0.2) continue;
+      if (this.canMove(x, y, x + sx, y + sy)) return { x: x + sx, y: y + sy };
+    }
+    for (const f of [0.66, 0.33]) {
+      if (this.canMove(x, y, x + f * dx, y + f * dy)) return { x: x + f * dx, y: y + f * dy };
+    }
+    return null;
   }
 
   /** Can someone walk straight from (x0,y0) to (x1,y1)? */
@@ -235,7 +253,14 @@ export class ParticleFilter {
       const m = moved[i];
       if (m.ok) { q.x = m.nx; q.y = m.ny; }
       else if (kill) q.lw = -Infinity; // walked through a wall: impossible
-      // else: everyone is blocked (heading far off) - hold position instead.
+      else {
+        // Everyone is blocked: the heading is off by more than the map can absorb,
+        // and holding every position froze the dot while the user kept walking.
+        // Move along the wall instead (the part of the step that fits), so the dot
+        // follows the corridor; map matching takes over again once moves fit.
+        const s = this._slide(q.x, q.y, m.nx - q.x, m.ny - q.y);
+        if (s) { q.x = s.x; q.y = s.y; }
+      }
     });
     this._normalise();
     this._maybeResample();
@@ -279,7 +304,7 @@ export class ParticleFilter {
     }
     if (!meas.length) return false;
     this.lastBleAt = now;
-    const temper = walking ? cfg.BLE_TEMPER_WALKING : cfg.BLE_TEMPER_STILL;
+    const temper = (walking ? cfg.BLE_TEMPER_WALKING : cfg.BLE_TEMPER_STILL) * this.bleWeight;
     const floor = Math.log(cfg.OUTLIER_EPS);
     for (const q of this.p) {
       if (q.lw === -Infinity) continue;

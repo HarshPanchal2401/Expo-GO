@@ -46,12 +46,12 @@ export class WalkableGrid {
     const bytes = decodeBase64(data.bits);
     this.cells = new Uint8Array(this.cols * this.rows);
     for (let i = 0; i < this.cells.length; i++) this.cells[i] = (bytes[i >> 3] >> (i & 7)) & 1;
-    this.setRoom(72, 72);
+    this.setRoom(70, 72); // the office drawing (office-70x72.png)
     this._nearestCache = new Map();
   }
 
   setRoom(widthFt, heightFt) {
-    this.w = widthFt > 0 ? widthFt : 72;
+    this.w = widthFt > 0 ? widthFt : 70;
     this.h = heightFt > 0 ? heightFt : 72;
     this.cw = this.w / this.cols;
     this.ch = this.h / this.rows;
@@ -80,6 +80,94 @@ export class WalkableGrid {
       if (!this.isWalkable(x0 + f * (x1 - x0), y0 + f * (y1 - y0))) return false;
     }
     return true;
+  }
+
+  /**
+   * A route on the green from a to b (both on it): the points after a, ending at b,
+   * each straight piece on the green. Breadth-first over the cells (8 neighbours),
+   * then shortened to the corners that are needed. null if b cannot be reached within
+   * maxCells explored cells.
+   */
+  route(a, b, maxCells = 6000) {
+    const ca = this._cell(a.x, a.y), cb = this._cell(b.x, b.y);
+    if (ca < 0 || cb < 0 || !this.cells[ca] || !this.cells[cb]) return null;
+    if (ca === cb) return [{ x: b.x, y: b.y }];
+    const prev = new Map([[ca, -1]]);
+    const queue = [ca];
+    for (let qi = 0; qi < queue.length && queue.length <= maxCells; qi++) {
+      const i = queue[qi];
+      if (i === cb) break;
+      const r = Math.floor(i / this.cols), c = i % this.cols;
+      for (let dr = -1; dr <= 1; dr++) {
+        for (let dc = -1; dc <= 1; dc++) {
+          if (!dr && !dc) continue;
+          const rr = r + dr, cc = c + dc;
+          if (rr < 0 || cc < 0 || rr >= this.rows || cc >= this.cols) continue;
+          const j = rr * this.cols + cc;
+          if (!this.cells[j] || prev.has(j)) continue;
+          // No cutting a diagonal past a blocked corner.
+          if (dr && dc && (!this.cells[r * this.cols + cc] || !this.cells[rr * this.cols + c])) continue;
+          prev.set(j, i);
+          queue.push(j);
+        }
+      }
+    }
+    if (!prev.has(cb)) return null;
+    const cellsPath = [];
+    for (let i = cb; i !== -1; i = prev.get(i)) cellsPath.push(i);
+    cellsPath.reverse();
+    const pts = cellsPath.map((i) => ({ x: ((i % this.cols) + 0.5) * this.cw, y: (Math.floor(i / this.cols) + 0.5) * this.ch }));
+    pts[0] = { x: a.x, y: a.y };
+    pts[pts.length - 1] = { x: b.x, y: b.y };
+    // Keep only the corners: from each kept point, jump to the farthest one in plain sight.
+    const out = [];
+    let k = 0;
+    while (k < pts.length - 1) {
+      let j = pts.length - 1;
+      while (j > k + 1 && !this.segmentWalkable(pts[k].x, pts[k].y, pts[j].x, pts[j].y)) j--;
+      out.push(pts[j]);
+      k = j;
+    }
+    return out;
+  }
+
+  /**
+   * A point near p that is at least clearFt inside the green (away from walls and
+   * gray), searching within maxFt of p. Where nothing that clear exists (a narrow
+   * gap), the clearest spot found. For a start position moved onto the floor, so it
+   * lands in the corridor, not on its wall line. null if nothing walkable is near.
+   */
+  inside(p, clearFt = 1.5, maxFt = 3) {
+    const x = p?.x, y = p?.y;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    const cell = Math.min(this.cw, this.ch);
+    const reach = Math.ceil(maxFt / cell);
+    const clearReach = Math.ceil(clearFt / cell) + 1;
+    const c0 = Math.floor(x / this.cw), r0 = Math.floor(y / this.ch);
+    const blockedAt = (r, c) => r < 0 || c < 0 || r >= this.rows || c >= this.cols || !this.cells[r * this.cols + c];
+    let best = null;
+    for (let dr = -reach; dr <= reach; dr++) {
+      for (let dc = -reach; dc <= reach; dc++) {
+        const r = r0 + dr, c = c0 + dc;
+        if (blockedAt(r, c)) continue;
+        const cx = (c + 0.5) * this.cw, cy = (r + 0.5) * this.ch;
+        const dist = Math.hypot(cx - x, cy - y);
+        if (dist > maxFt) continue;
+        // Clearance: distance to the nearest blocked cell (capped).
+        let clear = clearFt;
+        for (let er = -clearReach; er <= clearReach; er++) {
+          for (let ec = -clearReach; ec <= clearReach; ec++) {
+            if (!blockedAt(r + er, c + ec)) continue;
+            const d = Math.hypot(ec * this.cw, er * this.ch) - cell / 2;
+            if (d < clear) clear = Math.max(0, d);
+          }
+        }
+        // Clear enough beats clearer; among those, the nearest to p.
+        const score = Math.min(clear, clearFt) * 1000 - dist;
+        if (!best || score > best.score) best = { x: cx, y: cy, score };
+      }
+    }
+    return best ? { x: best.x, y: best.y } : null;
   }
 
   /**

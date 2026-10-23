@@ -7,6 +7,8 @@
 // beacons or on the signal at that moment.
 // ============================================================================
                                                                                                                
+import { ensureFloorplanMigrated } from "./FloorplanMigration.js";
+
 let AsyncStorage = null;
 try {
   const mod = require("@react-native-async-storage/async-storage");
@@ -31,6 +33,8 @@ export function loadStartSpots() {
   if (!loadPromise) {
     loadPromise = (async () => {
       let list = [];
+      // Spots saved on the old 72 x 72 ft drawing are moved onto the 70 x 72 ft one first.
+      await ensureFloorplanMigrated();
       try {
         const raw = AsyncStorage ? await AsyncStorage.getItem(KEY) : null;
         const parsed = JSON.parse(raw || "[]");

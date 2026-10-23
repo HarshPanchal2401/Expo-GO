@@ -1,7 +1,7 @@
 // ============================================================================
 // FusionMapScreen.js — Live PDR + BLE Fusion Navigation on the Real Office Map
 //
-// Renders the actual office floor plan (assets/floorplans/office-72x72.png)
+// Renders the actual office floor plan (assets/floorplans/office-70x72.png, 70 x 72 ft)
 // as the map background, with a live fused position tracked by FusionEngine
 // (async EKF: PDR predicts every step, BLE corrects on every beacon packet).
 //
@@ -59,6 +59,7 @@ import Svg, {
 import { fusionEngine } from "../../services/FusionEngine.js";
 import { v2Scanner } from "../../services/v2BeaconScannerService.js";
 import MobilityModeSwitch from "./MobilityModeSwitch.js";
+import { ensureFloorplanMigrated, FLOORPLAN_W_FT, FLOORPLAN_H_FT } from "../../services/FloorplanMigration.js";
 import { loadStartSpots, saveStartSpot, removeStartSpot, MAX_NAME } from "../../services/StartSpots.js";
 import { checkRangeGeometry } from "../../services/BeaconRangingCalibration.js";
 import { metresToFeet, feetToMetres } from "../../services/PdrEngine.js";
@@ -75,13 +76,13 @@ import { getAppSettings, subscribeAppSettings } from "../../services/appSettings
 // Everything the obstacle editor can draw: RF obstacles + no-walk areas.
 const EDIT_TYPES = [...OBSTACLE_TYPES, ...AREA_TYPES];
 
-const FLOORPLAN_IMAGE = require("../../assets/floorplans/office-72x72.png");
+const FLOORPLAN_IMAGE = require("../../assets/floorplans/office-70x72.png");
 
 // Bump with every change to the locating/ranging behaviour. Shown on screen
 // because an OTA update is only APPLIED on the next cold start after it
 // downloads, so "I published the fix and it still fails" is very often the
 // old bundle still running - this makes that visible instead of a guess.
-const ENGINE_TAG = "motion-v16-cal1m-steplen";
+const ENGINE_TAG = "motion-v18-start-slide";
 
 // How the phone is carried (services/CarryDetector.js). Pocket / ear /
 // swinging: heading from the gyro alone, step length from the step rate.
@@ -114,10 +115,11 @@ const MAP_PADDING = 20; // canvas margin (px)
 const MAP_SIZE = SCREEN_W - 32; // canvas width (px) — height follows room aspect ratio
 const CANVAS_SIZE = MAP_SIZE - MAP_PADDING * 2; // drawable area (px, square axis unit)
 
-const DEFAULT_ROOM_W_FT = 72;
+// The office drawing's real size (FloorplanMigration.js moves older 72 x 72 saves onto it).
+const DEFAULT_ROOM_W_FT = FLOORPLAN_W_FT;
 // "Where are you?": a tap this close to spot A or B picks it (ft).
 const CHOICE_TAP_FT = 10;
-const DEFAULT_ROOM_H_FT = 72;
+const DEFAULT_ROOM_H_FT = FLOORPLAN_H_FT;
 const GRID_MINOR_FT = 2;   // matches the floor plan's own printed grid
 const GRID_MAJOR_FT = 10;  // heavier labeled lines every 10 ft
 const BEACON_RADIUS_PX = 15;
@@ -185,6 +187,8 @@ const SPOT_WINDOW_MS = 6000;
 // searching animation instead of a jumping dot: shown once the position has
 // stayed within SETTLE_STEADY_FT for SETTLE_WINDOW_MS (and at least
 // SETTLE_MIN_MS after the fix), at the first step, or after SETTLE_MAX_MS.
+// Once the start is found, steps carry the track and beacons only correct it very slowly (1 = full influence).
+const NAV_BLE_WEIGHT = 0.15;
 const SETTLE_MIN_MS = 3000;
 const SETTLE_WINDOW_MS = 3000;
 const SETTLE_STEADY_FT = 3;
@@ -300,7 +304,7 @@ function snapToGrid(ft, step = GRID_MINOR_FT) {
 /**
  * Scale + offset to fit a roomW×roomH (feet) rectangle into a boxW×boxH (px)
  * bounding box, preserving aspect ratio with a small margin. Works for square
- * rooms (today's 72×72 ft office) and non-square ones (a future floor plan).
+ * rooms and non-square ones (today's 70×72 ft office).
  */
 function computeTransform(roomW, roomH, boxW, boxH) {
   const scaleX = boxW / roomW;
@@ -1281,6 +1285,8 @@ function FusionMapScreen({
     settlingRef.current = false;
     setSettling(false);
     setLocatedAt(Date.now());
+    // Start settled: from here steps carry the track, beacons only nudge it.
+    fusionEngine.setBleWeight(NAV_BLE_WEIGHT);
     setFusionState({ ...fusionEngine.getState() });
   };
   // Spot calibration: { stage: "pick" | "measuring" | "done", point, startedAt, result }
@@ -1344,6 +1350,8 @@ function FusionMapScreen({
   // ── Load saved floor-plan size + beacon anchors (feet) on mount ──
   useEffect(() => {
     (async () => {
+      // Saved positions from the old 72 x 72 ft drawing are moved onto the 70 x 72 ft one first.
+      await ensureFloorplanMigrated();
       const [size, anchors] = await Promise.all([
         v2Scanner.getPlaceSize(),
         v2Scanner.getBeaconAnchors(),
@@ -1573,7 +1581,9 @@ function FusionMapScreen({
 
   // ── Obstacles: load once; push geometry to the calibration and locating ───
   useEffect(() => {
-    obstacleMap.load().then(() => setObstacleVer((v) => v + 1));
+    ensureFloorplanMigrated()
+      .then(() => obstacleMap.load())
+      .then(() => setObstacleVer((v) => v + 1));
   }, []);
   const beaconIdKey = `${bleStats.b1?.id || ""}|${bleStats.b2?.id || ""}`;
   useEffect(() => {
@@ -1878,11 +1888,15 @@ function FusionMapScreen({
     // A beacon fix is still being corrected for a while: hold the dot back
     // until it settles. A spot the user chose, or a start while already
     // walking, shows at once.
-    const settle = !skipChoice && fix?.status !== "manual";
+    // Next to a beacon the fix is already the best there is: the other beacon's
+    // (far, unreliable) range must not move it during a settling phase.
+    const settle = !skipChoice && fix?.status !== "manual" && !fix?.nearBeacon;
     choiceDuringNavRef.current = false;
     settleRef.current = { start: Date.now(), hist: [] };
     settlingRef.current = settle;
     setSettling(settle);
+    // Beacons settle a beacon fix at full strength; a chosen start, or one made while walking, nudges only.
+    fusionEngine.setBleWeight(settle ? 1 : NAV_BLE_WEIGHT);
     setLocatedAt(settle ? 0 : Date.now());
     return true;
   };
@@ -1916,6 +1930,7 @@ function FusionMapScreen({
   /** Commits the fix and starts drawing the walked path from it. */
   const handleStartNavigation = () => {
     fusionEngine.beginNavigation();
+    fusionEngine.setBleWeight(NAV_BLE_WEIGHT);
     setFusionState({ ...fusionEngine.getState() });
     setNavPhase("navigating");
   };
@@ -2081,6 +2096,7 @@ function FusionMapScreen({
   };
 
   const handleStop = () => {
+    fusionEngine.setBleWeight(1);
     if (navPhase === "navigating") {
       const t = fusionEngine.getState().trail;
       if (t && t.length > 1) setLastTrail(t.map((p) => ({ x: p.x, y: p.y })));
@@ -2099,6 +2115,7 @@ function FusionMapScreen({
 
   /** Throws away the current fix and locates again from scratch. */
   const handleReLocate = () => {
+    fusionEngine.setBleWeight(1);
     if (navPhase === "navigating") {
       const t = fusionEngine.getState().trail;
       if (t && t.length > 1) setLastTrail(t.map((p) => ({ x: p.x, y: p.y })));

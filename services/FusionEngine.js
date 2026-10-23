@@ -190,6 +190,9 @@ export const FUSION_CONFIG = {
   // of the walk — the map could only show the last few seconds rather than the
   // route taken. Sampling by real distance keeps the whole path.
   MIN_TRAIL_MOVE_FT: 1.0,
+  // The drawn trail is built from steps only. A beacon correction moves it only this
+  // fraction of the gap per step, so it follows slowly and a fix never bends it.
+  TRAIL_FOLLOW_PER_STEP: 0.2,
 
   // Trail capacity in points. With distance-based sampling this is a route
   // length budget: MAX_TRAIL_POINTS × MIN_TRAIL_MOVE_FT ≈ 300 ft of path.
@@ -280,6 +283,14 @@ export class FusionEngine {
     const wc = mode === "wheelchair";
     this._pf.cfg.SCALE_SD0 = wc ? 0.2 : PF_CONFIG.SCALE_SD0;
     this._pf.cfg.STEP_LEN_NOISE = wc ? 0.12 : PF_CONFIG.STEP_LEN_NOISE;
+  }
+
+  /**
+   * How strongly beacons correct the position (0..1). 1 while the start is being found,
+   * low once navigating, so steps carry the track and beacons only pull it back slowly.
+   */
+  setBleWeight(w) {
+    this._pf.bleWeight = Math.min(1, Math.max(0, Number.isFinite(w) ? w : 1));
   }
 
   setParticleFilterEnabled(on) {
@@ -635,7 +646,11 @@ export class FusionEngine {
    * point and the beacons are different on the two sides of the baseline.
    */
   _solveWithObstacles(params0) {
-    const params = { ...params0, snap: this._grid ? (p) => this._grid.nearest(p) : null };
+    const params = {
+      ...params0,
+      snap: this._grid ? (p) => this._grid.nearest(p) : null,
+      inside: this._grid ? (p) => this._grid.inside(p) : null,
+    };
     const first = solveInitialPosition(params);
     if (!this._rangeCorrector || !first.position) return first;
     const refine = (start) => {
@@ -754,7 +769,7 @@ export class FusionEngine {
       this._pf.step(len, headingDeg, opts.headingJumpSdDeg || 0, Number.isFinite(opts.t) ? opts.t : Date.now());
       this._pfSync();
       pdrEngine.applyStep(len, headingDeg);
-      this._pushTrail(this._x, this._y);
+      this._trailStep(len, headingDeg);
       return;
     }
     const rad = (headingDeg * Math.PI) / 180;
@@ -793,8 +808,8 @@ export class FusionEngine {
     // Update PDR engine for confidence tracking
     pdrEngine.applyStep(len, headingDeg);
 
-    // Append to trail
-    this._pushTrail(this._x, this._y);
+    // Append to trail (from the step, not from the corrected position)
+    this._trailStep(len, headingDeg);
   }
 
   // --------------------------------------------------------------------------
@@ -1362,6 +1377,54 @@ export class FusionEngine {
     return moved;
   }
 
+  /** One step of the drawn trail: the previous point plus the step, pulled slowly toward the corrected position. */
+  _trailStep(len, headingDeg) {
+    const last = this._trail[this._trail.length - 1];
+    if (!last) { this._pushTrail(this._x, this._y); return; }
+    const r = (headingDeg * Math.PI) / 180;
+    let nx = last.x + len * Math.sin(r), ny = last.y + len * Math.cos(r);
+    const k = this._cfg.TRAIL_FOLLOW_PER_STEP;
+    nx += k * (this._x - nx);
+    ny += k * (this._y - ny);
+    // The drawn path stays on the walkable (green) area: neither a point nor a line
+    // between two points may cross gray. Where the step alone would, the path goes to
+    // the dot (always on green) instead, with a bend on the green if needed.
+    for (const p of this._trailOnFloor(last, { x: nx, y: ny })) {
+      this._trail.push({ x: Number(p.x.toFixed(2)), y: Number(p.y.toFixed(2)) });
+    }
+    this._trailTip = false;
+    while (this._trail.length > this._maxTrailLength) this._trail.shift();
+  }
+
+  /** Points (after `from`) that reach `to`, or the dot, without leaving the green. */
+  _trailOnFloor(from, to) {
+    const g = this._grid;
+    if (!g) return [to];
+    const clear = (a, b) => g.segmentWalkable(a.x, a.y, b.x, b.y);
+    if (g.isWalkable(to.x, to.y) && clear(from, to)) return [to];
+    const dot = { x: this._x, y: this._y };
+    const snapped = this._snap(to);
+    for (const t of [snapped, dot]) {
+      if (!g.isWalkable(t.x, t.y)) continue;
+      if (clear(from, t)) return [t];
+    }
+    // Around a corner: the route on the green, to where the step points, else to the dot.
+    if (g.isWalkable(from.x, from.y)) {
+      // A step is a few feet: a long way round to where it points means it did not go there.
+      if (g.isWalkable(snapped.x, snapped.y)) {
+        const r = g.route(from, snapped, 2500);
+        if (r && r.length <= 3) return r;
+      }
+      // The dot is always reachable on the green (the map only moves it along the floor).
+      if (g.isWalkable(dot.x, dot.y)) {
+        const r = g.route(from, dot, 8000);
+        if (r) return r;
+      }
+    }
+    // Not reachable: leave the path where it is rather than draw across gray.
+    return [];
+  }
+
   _pushTrail(x, y) {
     // Sample by real distance travelled, not per event. The threshold sits
     // above the residual BLE jitter, so correction noise no longer consumes
@@ -1390,10 +1453,12 @@ export class FusionEngine {
    *   - after walking, one "standing here" tip after the last step moves.
    */
   _trailFollow(x, y, walking) {
-    if (walking || !this._trail.length) {
+    if (!this._trail.length) {
       this._pushTrail(x, y);
       return;
     }
+    // After the first step corrections never draw track: the trail grows from steps (_trailStep).
+    if (this._lastStepAt !== null) return;
     const p = { x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) };
     if (this._lastStepAt === null) {
       this._trail[this._trail.length - 1] = p;

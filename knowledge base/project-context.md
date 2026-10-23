@@ -15,7 +15,7 @@ An **indoor navigation app** for one office. It shows the user's live position o
 
 | Item | Value |
 |---|---|
-| Floor plan | Office, **72 × 72 ft** (`assets/floorplans/office-72x72.png`, 424×362 px, stretched over the room) |
+| Floor plan | Office, **70 × 72 ft** (`assets/floorplans/office-70x72.png`, 1116×1017 px cropped to the outer walls, stretched over the room). Older 72 × 72 saves (room size, beacon positions, start spots, obstacles) are moved onto it once by `services/FloorplanMigration.js` (x × 70/72). |
 | Coordinates | Feet, origin bottom-left, **y up**. Heading 0° = map up (+Y), 90° = right (+X), clockwise-positive. A step moves `x += L·sin θ`, `y += L·cos θ`. |
 | Beacons | B1 and B2, placed on the map by the user (anchor positions are stored) |
 | Environment | Many walls, pillars, glass cabins and furniture. BLE signals are heavily affected by these obstacles (NLOS). |
@@ -190,7 +190,7 @@ Wheelchair mode (switch on the PDR tab or Fusion Map, saved at once). Both step 
 - Built from the **green pixels** of the floor-plan image by `scripts/build_walkable_grid.py`.
 - A pixel counts as green when G ≥ 180, G − R ≥ 15 and G − B ≥ 15. A cell is green when at least half its pixels are.
 - **Gray is cabins and furniture, so it is not walkable.**
-- The grid is 144×144 cells (0.5 ft each), stored as base64 bits. 7,259 of 20,736 cells (35%) are walkable.
+- The grid is 140×144 cells (0.5 ft each), stored as base64 bits. 6,956 of 20,160 cells (35%) are walkable.
 - If the floor-plan image changes, re-run `python scripts/build_walkable_grid.py [preview.png]`.
 
 ### Obstacles (`services/ObstacleMap.js`)

@@ -94,6 +94,17 @@ export const STEP_MODEL_CONFIG = {
   // front: Weinberg length / cadence length, averaged over that many steps.
   CADENCE_RATIO_MIN_STEPS: 8,
   CADENCE_RATIO_RATE: 0.05,
+  // The ratio is learned only at an ordinary pace. Weinberg (bounce^0.25) grows far
+  // less with speed than a stride really does, so learning it during fast walking
+  // would pull the cadence model down to the same under-read.
+  CADENCE_LEARN_MIN_HZ: 1.4,
+  CADENCE_LEARN_MAX_HZ: 2.0,
+  // Held in front: share of the cadence model in the length. 0.4 at an ordinary pace,
+  // rising to 0.8 at CADENCE_BLEND_FAST_HZ and above, where Weinberg reads short.
+  CADENCE_BLEND_BASE: 0.4,
+  CADENCE_BLEND_FAST: 0.8,
+  CADENCE_BLEND_FROM_HZ: 1.7,
+  CADENCE_BLEND_FAST_HZ: 2.4,
 };
 
 /**
@@ -170,7 +181,18 @@ export class StepLengthModel {
     const carry = info.carry || "unknown";
     if (carry === "texting" || carry === "unknown" || f === null) {
       const est = this.estimate(bounceG, null);
-      if (carry === "texting" && f !== null) this._learnCadenceRatio(est.rawLengthM / this.cadenceLength(f));
+      if (carry === "texting" && f !== null) {
+        const c = this.cfg;
+        if (f >= c.CADENCE_LEARN_MIN_HZ && f <= c.CADENCE_LEARN_MAX_HZ) this._learnCadenceRatio(est.rawLengthM / this.cadenceLength(f));
+        // Walking faster: blend in the step-rate length, which follows speed better than the bounce does.
+        if (this.cadenceRatioSteps >= c.CADENCE_RATIO_MIN_STEPS && this.cadenceRatio) {
+          const u = Math.min(1, Math.max(0, (f - c.CADENCE_BLEND_FROM_HZ) / (c.CADENCE_BLEND_FAST_HZ - c.CADENCE_BLEND_FROM_HZ)));
+          const w = c.CADENCE_BLEND_BASE + (c.CADENCE_BLEND_FAST - c.CADENCE_BLEND_BASE) * u;
+          const cad = this.cadenceLength(f) * this.cadenceRatio * this.effectiveScale();
+          const lengthM = Math.min(c.MAX_STEP_LENGTH_M, Math.max(c.MIN_STEP_LENGTH_M, (1 - w) * est.lengthM + w * cad));
+          return { ...est, lengthM, lengthFt: lengthM * M_TO_FT, model: "weinberg+cadence" };
+        }
+      }
       return { ...est, model: "weinberg" };
     }
     const ratio = this.cadenceRatioSteps >= this.cfg.CADENCE_RATIO_MIN_STEPS && this.cadenceRatio

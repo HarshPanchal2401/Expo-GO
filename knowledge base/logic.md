@@ -118,9 +118,13 @@ Tx1m = RSSI_near                                        (exact fit when n isn't 
 along = (L² + r1² − r2²) / 2L          perp = √(r1² − along²)
 candidates = base ± perp · n̂           (mirror images across the beacon line)
 ```
-- If the circles don't meet, both ranges are scaled until they touch. An adjustment over 8 ft points to bad calibration.
+- If the circles don't meet, the ranges are changed until they touch, each in proportion to its error variance (σ = range ÷ confidence, at least 3 ft). The farther beacon changes most, so the closer one is trusted. An adjustment over 8 ft points to bad calibration.
 - A baseline under 3 ft can't give a direction, so the result is a proximity fix at the midpoint.
-- **Choosing a candidate:** a candidate is ruled out if it lies outside the floor plan (with a 4 ft margin). If both are inside and more than 4 ft apart, the result is **ambiguous** and both are kept.
+- **Each crossing point is classified** against the walkable area: `on` (≤ 1 ft), `close` (≤ 4 ft, range noise), `wall` (≤ 10 ft into a wall, desk or cabin: the user is beside it), `off` (farther, or outside the room). `close` and `wall` points are moved to the nearest walkable point.
+- **Priority order:**
+  1. **Next to a beacon** (closer than 6.6 ft, about 2 m): one answer by that beacon, never A/B. The better-classified point, or the spot between both if they are equal.
+  2. **Points less than 6 ft apart** (including circles that did not meet): one answer, the spot between them.
+  3. **Floor plan:** no possible point → the nearer one (poor quality). One possible point → that one. Two possible points that land within 6 ft of each other once moved → one answer between them. Otherwise **ambiguous**: both are offered (A/B), the better-classified first. A point beside a wall is a real option.
 - **Uncertainty:** `σ = 4 ft × GDOP`, with `GDOP = √2 / |sin θ|` (capped at 12). θ is the angle between the two beacons as seen from the user.
 
 ### 5.2 Timed accumulation (`RangeFixAccumulator`)

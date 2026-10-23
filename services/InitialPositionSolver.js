@@ -66,7 +66,30 @@ export const SOLVER_CONFIG = {
   // If the two candidates are closer together than this, they are not
   // meaningfully different positions — the user is close to the beacon line —
   // so they collapse into a single answer rather than an ambiguous pair.
-  MIN_CANDIDATE_SEPARATION_FT: 4.0,
+  // (6 ft: with about 4 ft of range error, two spots closer than that cannot be told apart,
+  // so asking "A or B?" would be a guess.)
+  MIN_CANDIDATE_SEPARATION_FT: 6.0,
+
+  // When the two circles do not meet, the ranges are adjusted to make them touch. Range
+  // error grows with distance (the signal-to-distance curve is multiplicative), so the
+  // FARTHER beacon is adjusted more and the CLOSER one is trusted: each adjustment is
+  // proportional to its range's variance. This floor (ft) keeps a beacon at a few feet,
+  // where the receiver saturates, from being treated as exact.
+  MIN_RANGE_SIGMA_FT: 3.0,
+
+  // PRIORITY 1 - a beacon this close (ft, about 2 m) decides the start: the user is
+  // standing by it. A close range is the most reliable one there is (its error grows
+  // with distance), so the answer is one spot next to that beacon, never an A/B question.
+  NEAR_BEACON_FT: 6.6,
+  // Next to a beacon, a far range that needed more than this (ft) to meet the near one
+  // disagrees with it; its direction is then not used and the user is placed at the
+  // closest clear walkable spot to the near beacon.
+  NEAR_BEACON_DISAGREE_FT: 4.0,
+
+  // A crossing point inside a wall, desk or cabin (off the walkable area) by up to this
+  // much (ft) means the user is standing next to it: it is moved to the nearest walkable
+  // point and kept as a real option. Farther off than this it is impossible.
+  NEAR_PLAN_FT: 10.0,
 
   // Assumed 1-sigma range error, used to size the reported uncertainty.
   // Matches what the BLE engine actually delivers indoors after filtering.
@@ -102,7 +125,7 @@ export const SOLVER_CONFIG = {
  *   ux: number, uy: number, nx: number, ny: number
  * }}
  */
-export function intersectRangeCircles(a1, r1, a2, r2, config = SOLVER_CONFIG) {
+export function intersectRangeCircles(a1, r1, a2, r2, config = SOLVER_CONFIG, sigmas = null) {
   const bx = a2.x - a1.x;
   const by = a2.y - a1.y;
   const L = Math.hypot(bx, by);
@@ -126,24 +149,34 @@ export function intersectRangeCircles(a1, r1, a2, r2, config = SOLVER_CONFIG) {
   let adjusted = false;
   let adjustmentFt = 0;
 
+  // Weight of each range in the adjustment: its error variance. Error grows with the
+  // range, so the farther beacon takes most of the change and the closer one is trusted.
+  const floor = config.MIN_RANGE_SIGMA_FT ?? 3;
+  const s1 = Math.max(floor, Number.isFinite(sigmas?.s1) ? sigmas.s1 : r1);
+  const s2 = Math.max(floor, Number.isFinite(sigmas?.s2) ? sigmas.s2 : r2);
+  const w1 = (s1 * s1) / (s1 * s1 + s2 * s2);
+  const w2 = 1 - w1;
+
   if (R1 + R2 < L) {
-    // Both ranges too short to reach each other: grow both until they touch.
-    const k = L / (R1 + R2);
-    adjustmentFt = L - (R1 + R2);
-    R1 *= k;
-    R2 *= k;
+    // Both ranges too short to reach each other: grow them until they touch,
+    // the less certain (farther) one by more.
+    const gap = L - (R1 + R2);
+    adjustmentFt = gap;
+    R1 += gap * w1;
+    R2 += gap * w2;
     adjusted = true;
   } else if (Math.abs(R1 - R2) > L) {
     // One circle entirely contains the other: pull the larger in / push the
-    // smaller out until the difference equals the baseline (internal tangency).
+    // smaller out until the difference equals the baseline (internal tangency),
+    // the less certain one moving more.
     const excess = Math.abs(R1 - R2) - L;
     adjustmentFt = excess;
     if (R1 > R2) {
-      R1 -= excess / 2;
-      R2 += excess / 2;
+      R1 -= excess * w1;
+      R2 += excess * w2;
     } else {
-      R2 -= excess / 2;
-      R1 += excess / 2;
+      R2 -= excess * w2;
+      R1 += excess * w1;
     }
     adjusted = true;
   }
@@ -242,6 +275,9 @@ export function solveInitialPosition({
   // Optional floor-plan walkable area: p -> { x, y, distFt } = nearest point
   // on it (distFt 0 when p is already on it). See WalkableGrid.nearest().
   snap = null,
+  // Optional: p -> a point at least a little inside the walkable area (not on its edge).
+  // See WalkableGrid.inside(). Used for points that had to be moved onto the floor.
+  inside = null,
   config = SOLVER_CONFIG,
 }) {
   // A candidate this close to the walkable area counts as on it (range noise
@@ -255,7 +291,13 @@ export function solveInitialPosition({
   const onPlan = (c) => (snap ? snap(c) : null);
   const placed = (c) => {
     const s = onPlan(c);
-    return s ? { x: s.x, y: s.y } : { x: c.x, y: c.y };
+    if (!s) return { x: c.x, y: c.y };
+    // Moved onto the floor: not onto its very edge (a wall line), a little inside it.
+    if (s.distFt > 0 && inside) {
+      const q = inside(s);
+      if (q) return { x: q.x, y: q.y };
+    }
+    return { x: s.x, y: s.y };
   };
   const fail = (status, reason) => ({
     status, reason, position: null, alternate: null, candidates: [],
@@ -271,7 +313,9 @@ export function solveInitialPosition({
     return fail("low-confidence", "waiting-for-a-clean-reading-from-both-beacons");
   }
 
-  const geo = intersectRangeCircles(anchor1, d1, anchor2, d2, config);
+  // Less confident readings are less certain: scale each beacon's error by its confidence.
+  const sg = (d, c) => d / Math.max(0.3, Math.min(1, Number.isFinite(c) ? c : 1));
+  const geo = intersectRangeCircles(anchor1, d1, anchor2, d2, config, { s1: sg(d1, conf1), s2: sg(d2, conf2) });
 
   if (!geo.ok) {
     // Beacons mounted together cannot triangulate at all. Rather than invent a
@@ -295,126 +339,147 @@ export function solveInitialPosition({
     return fail("invalid", geo.reason);
   }
 
+  // ── Classify each crossing point against the floor plan ──
+  //   on    - on the walkable area (within the plan's resolution)
+  //   close - within SNAP_TOLERANCE_FT: ordinary range noise, moved onto it
+  //   wall  - in a wall / desk / cabin, within NEAR_PLAN_FT: the user is beside it
+  //   off   - farther, or outside the room: not a place the user can be
+  const TIER = { on: 0, close: 1, wall: 2, off: 3 };
+  const nearPlanFt = config.NEAR_PLAN_FT ?? 10;
   const candidates = geo.candidates.map((c) => {
     const s = onPlan(c);
     // No walkable point found nearby at all = very far off the plan.
     const offPlanFt = !snap ? 0 : s ? s.distFt : Infinity;
-    return {
-      ...c,
-      walkable: isWalkable(c, room, config) && offPlanFt <= SNAP_TOLERANCE_FT,
-      offPlanFt,
-    };
+    const inRoom = isWalkable(c, room, config);
+    const tier = !inRoom ? "off"
+      : offPlanFt <= ON_PLAN_FT ? "on"
+      : offPlanFt <= SNAP_TOLERANCE_FT ? "close"
+      : offPlanFt <= nearPlanFt ? "wall"
+      : "off";
+    return { ...c, walkable: tier === "on" || tier === "close", tier, offPlanFt };
   });
   const separation = 2 * geo.perpFt;
-  const walkableOnes = candidates.filter((c) => c.walkable);
+  const minSep = config.MIN_CANDIDATE_SEPARATION_FT;
 
   const qualityOf = (p) => {
     const u = positionUncertaintyFt(p, anchor1, anchor2, config);
     return u < 8 ? "good" : u < 16 ? "fair" : "poor";
   };
+  // Better tier first, then nearer the walkable area.
+  const byPriority = (a, b) => TIER[a.tier] - TIER[b.tier] || a.offPlanFt - b.offPlanFt;
+  const one = (p, reason, uncertaintyFt, quality = null) => ({
+    status: "ok",
+    reason,
+    position: p,
+    alternate: null,
+    candidates,
+    uncertaintyFt: Number(uncertaintyFt.toFixed(2)),
+    separationFt: Number(separation.toFixed(2)),
+    adjusted: geo.adjusted,
+    adjustmentFt: geo.adjustmentFt,
+    geometryQuality: quality || qualityOf(p),
+  });
+  const midpoint = (a, b) => placed({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+  const plausible = candidates.filter((c) => c.tier !== "off");
 
-  // The candidates coincide (user effectively on the beacon line) — one answer.
-  if (separation < config.MIN_CANDIDATE_SEPARATION_FT) {
-    const p = candidates[0];
-    return {
-      status: "ok",
-      position: placed(p),
-      alternate: null,
-      candidates,
-      uncertaintyFt: positionUncertaintyFt(p, anchor1, anchor2, config),
-      separationFt: Number(separation.toFixed(2)),
-      adjusted: geo.adjusted,
-      adjustmentFt: geo.adjustmentFt,
-      geometryQuality: qualityOf(p),
-    };
+  // ── PRIORITY 1: right next to a beacon ─────────────────────────────────────
+  // The weighted crossing already keeps the close beacon's range (it is the most
+  // certain), so both points are about that far from it. Pick the better-placed one;
+  // if both are equally good they lie on either side of the beacon line within a few
+  // feet of each other, and the spot between them (next to the beacon) is the answer.
+  const nearFt = config.NEAR_BEACON_FT ?? 6.6;
+  const dNear = Math.min(d1, d2);
+  if (dNear <= nearFt) {
+    const beacon = d1 <= d2 ? anchor1 : anchor2;
+    const which = d1 <= d2 ? 1 : 2;
+    // The doubt is the close range (plus how far the spot had to be moved), NOT the
+    // two-beacon geometry: on the line through both beacons that reads up to 48 ft and
+    // would spread the map's starting cloud over half the office.
+    const unc = (p) => Math.max(dNear, config.MIN_RANGE_SIGMA_FT ?? 3, Math.hypot(p.x - beacon.x, p.y - beacon.y));
+    const near = (p, why) => ({ ...one(p, `next-to-beacon-${which}${why}`, unc(p), "fair"), nearBeacon: which });
+    // The far range had to be stretched or shrunk a lot to meet the close one: it is
+    // wrong (blocked, reflected), so its direction says nothing. The user is by the
+    // close beacon: the nearest clear spot on the floor to it.
+    const disagree = geo.adjusted && (geo.adjustmentFt || 0) > (config.NEAR_BEACON_DISAGREE_FT ?? 4);
+    if (disagree || !plausible.length) return near(placed(beacon), disagree ? "-far-range-disagrees" : "");
+    const sorted = [...plausible].sort(byPriority);
+    const p = sorted.length === 2 && sorted[0].tier === sorted[1].tier
+      ? midpoint(sorted[0], sorted[1])
+      : placed(sorted[0]);
+    return near(p, "");
   }
 
-  // The normal, and best, case: the floor plan rules one candidate out.
-  if (walkableOnes.length === 1) {
-    const p = walkableOnes[0];
-    return {
-      status: "ok",
-      reason: "resolved-by-floor-plan",
-      position: placed(p),
-      alternate: null,
-      candidates,
-      uncertaintyFt: positionUncertaintyFt(p, anchor1, anchor2, config),
-      separationFt: Number(separation.toFixed(2)),
-      adjusted: geo.adjusted,
-      adjustmentFt: geo.adjustmentFt,
-      geometryQuality: qualityOf(p),
+  // ── PRIORITY 2: the two crossing points cannot be told apart ───────────────
+  // Includes ranges that did not meet (adjusted to touch: one point). One answer:
+  // the point between the two, weighted by both ranges.
+  if (separation < minSep) {
+    const p = {
+      x: (candidates[0].x + candidates[1].x) / 2,
+      y: (candidates[0].y + candidates[1].y) / 2,
     };
+    return one(
+      placed(p),
+      geo.adjusted ? "ranges-did-not-meet-weighted-to-the-closer-beacon" : "candidates-too-close-to-tell-apart",
+      // The wider of the geometry's error and how far the ranges had to be adjusted.
+      Math.max(positionUncertaintyFt(p, anchor1, anchor2, config), (geo.adjustmentFt || 0) * 0.5),
+    );
   }
 
-  // Neither candidate is on the floor plan: the ranges disagree with the map.
-  if (walkableOnes.length === 0) {
+  // ── PRIORITY 3: the floor plan ─────────────────────────────────────────────
+  // Neither point is a place the user can be: the nearer one, as a rough answer.
+  if (!plausible.length) {
     const best = candidates
       .map((c) => ({ c, d: snap ? c.offPlanFt : outsideDistance(c, room) }))
       .sort((a, b) => a.d - b.d)[0].c;
-    return {
-      status: "ok",
-      reason: "no-candidate-inside-floor-plan-using-closest",
-      position: placed(best),
-      alternate: null,
-      candidates,
-      uncertaintyFt: Math.max(
-        positionUncertaintyFt(best, anchor1, anchor2, config),
-        config.RANGE_SIGMA_FT * 2
-      ),
-      separationFt: Number(separation.toFixed(2)),
-      adjusted: geo.adjusted,
-      adjustmentFt: geo.adjustmentFt,
-      geometryQuality: "poor",
-    };
+    return one(
+      placed(best),
+      "no-candidate-inside-floor-plan-using-closest",
+      Math.max(positionUncertaintyFt(best, anchor1, anchor2, config), config.RANGE_SIGMA_FT * 2),
+      "poor",
+    );
   }
 
-  // Both are near the walkable area, but only one is on it: that one.
-  // Neither on it: the nearer one, if clearly nearer.
-  if (snap) {
-    const onIt = candidates.filter((c) => c.walkable && c.offPlanFt <= ON_PLAN_FT);
-    const byOff = [...candidates].sort((a, b) => a.offPlanFt - b.offPlanFt);
-    const pick = onIt.length === 1 ? onIt[0]
-      : onIt.length === 0 && byOff[1].offPlanFt - byOff[0].offPlanFt >= ON_PLAN_FT ? byOff[0]
-      : null;
-    if (pick) {
-      return {
-        status: "ok",
-        reason: "resolved-by-floor-plan",
-        position: placed(pick),
-        alternate: null,
-        candidates,
-        uncertaintyFt: positionUncertaintyFt(pick, anchor1, anchor2, config),
-        separationFt: Number(separation.toFixed(2)),
-        adjusted: geo.adjusted,
-        adjustmentFt: geo.adjustmentFt,
-        geometryQuality: qualityOf(pick),
-      };
-    }
+  // Only one point is possible: that one (moved onto the walkable area if it was
+  // in a wall - the user is standing beside it).
+  if (plausible.length === 1) {
+    const p = plausible[0];
+    return one(
+      placed(p),
+      p.tier === "wall" ? "beside-a-wall-moved-onto-the-floor" : "resolved-by-floor-plan",
+      positionUncertaintyFt(p, anchor1, anchor2, config) + (p.tier === "wall" ? p.offPlanFt / 2 : 0),
+    );
   }
 
-  // Both candidates are legitimately inside the room. Ranges cannot separate
-  // them — that is geometry, not a shortcoming of the filter — so both are
-  // returned and FusionEngine carries them until movement decides. A prior
-  // position (e.g. resuming tracking) is a legitimate tiebreak for which one to
-  // show meanwhile; it does NOT discard the other.
-  let primary = candidates[0];
-  let secondary = candidates[1];
-  if (priorPosition && Number.isFinite(priorPosition.x)) {
-    const dA = Math.hypot(candidates[0].x - priorPosition.x, candidates[0].y - priorPosition.y);
-    const dB = Math.hypot(candidates[1].x - priorPosition.x, candidates[1].y - priorPosition.y);
-    if (dB < dA) { primary = candidates[1]; secondary = candidates[0]; }
+  // Both are possible. Where each one really ends up once moved onto the walkable
+  // area: if that is the same spot, it is one answer.
+  const [first, second] = [...plausible].sort((a, b) => {
+    const t = byPriority(a, b);
+    if (t !== 0 || !priorPosition || !Number.isFinite(priorPosition.x)) return t;
+    // Same tier: a prior position (e.g. resuming tracking) decides which to show first.
+    return Math.hypot(a.x - priorPosition.x, a.y - priorPosition.y) - Math.hypot(b.x - priorPosition.x, b.y - priorPosition.y);
+  });
+  const pA = placed(first);
+  const pB = placed(second);
+  if (Math.hypot(pA.x - pB.x, pA.y - pB.y) < minSep) {
+    const p = midpoint(pA, pB);
+    return one(p, "both-points-meet-on-the-floor", positionUncertaintyFt(p, anchor1, anchor2, config));
   }
 
+  // Two different places the user could be (including one beside a wall): ranges
+  // cannot separate them, so both are offered - the better-placed one first - and
+  // FusionEngine carries both until the user picks one or walking decides.
   return {
     status: "ambiguous",
-    reason: "two-valid-positions-walk-a-few-steps-to-resolve",
-    position: placed(primary),
-    alternate: placed(secondary),
+    reason: second.tier === "wall" || first.tier === "wall"
+      ? "two-possible-positions-one-beside-a-wall"
+      : "two-valid-positions-walk-a-few-steps-to-resolve",
+    position: pA,
+    alternate: pB,
     candidates,
-    uncertaintyFt: positionUncertaintyFt(primary, anchor1, anchor2, config),
+    uncertaintyFt: positionUncertaintyFt(first, anchor1, anchor2, config),
     separationFt: Number(separation.toFixed(2)),
     adjusted: geo.adjusted,
-    geometryQuality: qualityOf(primary),
+    geometryQuality: qualityOf(first),
   };
 }
 

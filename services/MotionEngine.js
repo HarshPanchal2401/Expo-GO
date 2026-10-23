@@ -86,6 +86,11 @@ export const MOTION_CONFIG = {
   // Walking only starts with at least this many evenly spaced peaks in the
   // window (a phone being picked up makes one or two).
   START_MIN_PEAKS: 3,
+  // ...or only this many when the rhythm is already very clear (autocorrelation at
+  // least START_FAST_CORR): the dot then starts moving about half a second sooner,
+  // and a weak or irregular start still needs START_MIN_PEAKS.
+  START_FAST_MIN_PEAKS: 2,
+  START_FAST_CORR: 0.65,
   START_GAP_TOLERANCE: 0.35,
   // A peak must be at least this fraction of the recent steps' bounce
   // (slowing down / standing after a walk makes small bumps).
@@ -223,6 +228,16 @@ export class MotionEngine {
     this.peakSpreadG = null;   // robust spread of the window (g), for peaks
     this.steps = 0;
     this.reason = "standing";
+    // Diagnostics for a recorded test walk (see takeDiag): samples dropped because
+    // they arrived with the same timestamp, and the longest gap between samples.
+    this.diag = { dropped: 0, maxGapMs: 0, samples: 0 };
+  }
+
+  /** Diagnostics since the last call, then cleared. */
+  takeDiag() {
+    const d = this.diag;
+    this.diag = { dropped: 0, maxGapMs: 0, samples: 0 };
+    return d;
   }
 
   /** Heading sample (deg, app convention). Call alongside every motion sample. */
@@ -243,7 +258,9 @@ export class MotionEngine {
     if (!a || !Number.isFinite(a.x) || !Number.isFinite(a.y) || !Number.isFinite(a.z)) return;
     const cfg = this.cfg;
     const dt = this.lastT === null ? 0.02 : Math.min(0.2, Math.max(0.005, (t - this.lastT) / 1000));
-    if (this.lastT !== null && t <= this.lastT) return;
+    if (this.lastT !== null && t <= this.lastT) { this.diag.dropped++; return; }
+    if (this.lastT !== null) this.diag.maxGapMs = Math.max(this.diag.maxGapMs, t - this.lastT);
+    this.diag.samples++;
     this.lastT = t;
 
     // 1. Gravity (the phone's own sensor fusion; see GravityTracker) and the
@@ -486,7 +503,8 @@ export class MotionEngine {
     const tol = cfg.START_GAP_TOLERANCE * period;
     const stepsIn = (gap) => (Math.abs(gap - period) <= tol ? 1 : Math.abs(gap - 2 * period) <= tol ? 2 : 0);
     const even = sel.slice(1).every((p, i) => stepsIn(p.t - sel[i].t) > 0);
-    if (sel.length < cfg.START_MIN_PEAKS || !even) {
+    const minPeaks = (this.stats?.corr ?? 0) >= cfg.START_FAST_CORR ? cfg.START_FAST_MIN_PEAKS : cfg.START_MIN_PEAKS;
+    if (sel.length < minPeaks || !even) {
       this.reason = "checking walking rhythm";
       return;
     }

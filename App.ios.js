@@ -144,6 +144,7 @@ export default function AppIOS() {
   const addStepRef = useRef(null);
   const motionEngineRef = useRef(null);
   const lastMotionStatusRef = useRef({ at: 0, text: "" });
+  const lastMotionDiagRef = useRef(0);
   const carryVersionRef = useRef(null);
   if (!motionEngineRef.current) {
     motionEngineRef.current = new MotionEngine({
@@ -472,6 +473,16 @@ export default function AppIOS() {
               setStatus(`♿ ${ws.reason} · vibration ${ws.rmsG.toFixed(3)} g (rolling from ${ws.thresholdG} g)`);
             }
           }
+        }
+        // Recorded test walk: the step engine's state once a second, to find why the dot
+        // stops while walking (no rhythm? shaking? sensor samples late or dropped?).
+        if (testRecorder.active && !isWheelchair() && !useClassicSteps() && tMotion - lastMotionDiagRef.current > 1000) {
+          lastMotionDiagRef.current = tMotion;
+          const d = me.takeDiag();
+          const s = me.stats || {};
+          testRecorder.add("note", {
+            text: `walk ${me.walking ? "WALKING" : "not"} reason=${me.reason} corr=${s.corr} std=${s.stdG} tilt=${s.tiltRotDps} rot=${s.rotDps} pending=${me.peaks.length} samples=${d.samples} dropped=${d.dropped} maxGap=${d.maxGapMs}ms carry=${me.getCarry().mode}`,
+          });
         }
         if (!isWheelchair() && !useClassicSteps() && activeTabRef.current === "pdr" && !me.walking &&
             tMotion - lastMotionStatusRef.current.at > 1000) {
