@@ -103,6 +103,11 @@ export default function AppAndroid() {
 
   // PDR step callback ref — Fusion Map attaches its prediction hook here
   const pdrStepCallbackRef = useRef(null);
+  // Shown-only steps before walking is confirmed (MotionEngine PREVIEW): the map moves
+  // the dot at once instead of waiting 1-2 s. { type: "step", count, headingDeg, lengthM } | { type: "cancel" }
+  const pdrPreviewRef = useRef(null);
+  // Length of the last walking step (m), for the preview.
+  const lastWalkStepLenRef = useRef(0.7);
 
   const runningRef = useRef(false);
   const headingRef = useRef(0);
@@ -152,6 +157,15 @@ export default function AppAndroid() {
   const lastMotionStatusRef = useRef({ at: 0, text: "" });
   const lastMotionDiagRef = useRef(0);
   const carryVersionRef = useRef(null);
+  /** Heading to the compass when walking starts (see HeadingFilter.alignToCompass). */
+  const alignHeadingToCompass = () => {
+    const d = headingFilter.alignToCompass();
+    if (d) {
+      motionEngineRef.current?.shiftHeadings(d);
+      headingRef.current = headingFilter.heading;
+    }
+    return d;
+  };
   if (!motionEngineRef.current) {
     motionEngineRef.current = new MotionEngine({
       platform: "android",
@@ -161,6 +175,22 @@ export default function AppAndroid() {
         stepLengthModel.cfg.WEINBERG_K = appSettingsRef.current?.weinbergK ?? WEINBERG_K;
         return stepLengthModel.estimateCarry(bounceG, info || {}).lengthM;
       },
+      onPreview: (pv) => {
+        if (useClassicSteps() || isWheelchair()) return;
+        // Walking starts: line the direction up with the compass at once (it drifts a
+        // little while standing), and the steps already buffered with it.
+        const d = pv.first ? alignHeadingToCompass() : 0;
+        pdrPreviewRef.current?.({
+          type: "step",
+          count: pv.count,
+          headingDeg: Number.isFinite(pv.headingDeg) ? pv.headingDeg + d : headingFilter.heading,
+          lengthM: lastWalkStepLenRef.current,
+        });
+      },
+      onWalkStart: () => {
+        if (!useClassicSteps() && !isWheelchair()) alignHeadingToCompass();
+      },
+      onPreviewCancel: () => pdrPreviewRef.current?.({ type: "cancel" }),
       onStep: (st) => {
         if (useClassicSteps() || isWheelchair()) return;
         if (!runningRef.current && !pdrStepCallbackRef.current) return;
@@ -169,6 +199,7 @@ export default function AppAndroid() {
         // was carried over, not measured - the map may widen its heading doubt.
         const headingReset = carryVersionRef.current !== null && st.carryVersion !== carryVersionRef.current;
         carryVersionRef.current = st.carryVersion;
+        if (Number.isFinite(st.lengthM) && st.lengthM > 0) lastWalkStepLenRef.current = st.lengthM;
         addStepRef.current?.(st.lengthM, st.bounceG, st.headingDeg, { carry: st.carry, headingReset, t: st.t });
         if (activeTabRef.current === "pdr") {
           setStatus(
@@ -953,6 +984,7 @@ export default function AppAndroid() {
         {activeTab === "fusionMap" ? (
           <FusionMapScreen
             pdrStepCallbackRef={pdrStepCallbackRef}
+            pdrPreviewRef={pdrPreviewRef}
             headingRef={headingRef}
             onZeroHeading={setZero}
             headingCalibrated={headingCalibrated}

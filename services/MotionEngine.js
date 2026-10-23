@@ -120,6 +120,22 @@ export const MOTION_CONFIG = {
   PEAK_HISTORY_S: 8,
   // Heading samples kept for per-stride heading (covers PEAK_HISTORY_S).
   HEADING_HISTORY_S: 10,
+
+  // PREVIEW. Confirming walking takes 1-2 s, so the dot used to sit still and then
+  // jump. Before it is confirmed, each bounce that looks like a step is reported at
+  // once (onPreview) for the map to SHOW, without counting it. Confirmed steps then
+  // replace the preview; a shake or bump cancels it (onPreviewCancel).
+  // The first preview move waits for this many bounces in step rhythm (one bump from
+  // picking the phone up must not move the dot)...
+  PREVIEW_MIN_PEAKS: 2,
+  // ...at most this many preview steps are shown before walking is confirmed...
+  PREVIEW_MAX_STEPS: 5,
+  // ...and a preview with no new bounce for this long (s) is withdrawn.
+  PREVIEW_TIMEOUT_S: 1.6,
+  // Preview only while the phone is held steady (tilting rate over the last half second,
+  // deg/s): stricter than walking itself, because a wrong preview makes the dot jump
+  // back. A swinging phone (pocket, hand) is not previewed; it moves once confirmed.
+  PREVIEW_MAX_TILT_DPS: 50,
 };
 
 const wrap180 = (d) => ((((d + 180) % 360) + 360) % 360) - 180;
@@ -191,11 +207,23 @@ export class MotionEngine {
   constructor(opts = {}, config = {}) {
     this.cfg = { ...MOTION_CONFIG, ...config };
     this.onStep = opts.onStep || null;
+    // Preview (see PREVIEW_*): onPreview({ t, count, headingDeg }) adds `count` shown-only
+    // steps; onPreviewCancel() withdraws them. Confirmed steps (onStep) replace them.
+    this.onPreview = opts.onPreview || null;
+    this.onPreviewCancel = opts.onPreviewCancel || null;
+    // onWalkStart(): walking was just confirmed without a preview (see _startWalking).
+    this.onWalkStart = opts.onWalkStart || null;
     this.stepLength = opts.stepLength || ((b) => 0.74 * Math.pow(Math.max(0, b), 0.25));
     this.platform = opts.platform || "android";
     this.gravity = new GravityTracker(this.cfg.GRAVITY_TAU_S);
     this.carry = new CarryDetector();
     this.reset();
+  }
+
+  /** Shift every buffered heading by d degrees (the heading was re-aligned to the compass). */
+  shiftHeadings(d) {
+    if (!Number.isFinite(d) || !d) return;
+    for (const h of this.headings) h.h = wrap180(h.h + d);
   }
 
   /** Forget headings measured before a new heading zero (they are in the old reference). */
@@ -231,6 +259,8 @@ export class MotionEngine {
     // Diagnostics for a recorded test walk (see takeDiag): samples dropped because
     // they arrived with the same timestamp, and the longest gap between samples.
     this.diag = { dropped: 0, maxGapMs: 0, samples: 0 };
+    this.previewSteps = 0;     // preview steps shown since walking stopped
+    this.previewLastT = null;  // time of the last previewed bounce
   }
 
   /** Diagnostics since the last call, then cleared. */
@@ -325,6 +355,52 @@ export class MotionEngine {
         this.reason = "stopped";
       }
     }
+
+    // A preview that is not followed by more bounces was not walking.
+    if (!this.walking && this.previewSteps && t - this.previewLastT > cfg.PREVIEW_TIMEOUT_S * 1000) this._cancelPreview();
+  }
+
+  _cancelPreview() {
+    if (!this.previewSteps) return;
+    this.previewSteps = 0;
+    this.previewLastT = null;
+    if (this.onPreviewCancel) this.onPreviewCancel();
+  }
+
+  /**
+   * A bounce before walking is confirmed: show it at once if it continues a step
+   * rhythm and the phone is not being shaken right now.
+   */
+  _maybePreview(p) {
+    const cfg = this.cfg;
+    if (!this.onPreview || this.previewSteps >= cfg.PREVIEW_MAX_STEPS) return;
+    // Shaking or handling right now (last half second): no preview.
+    const recentCut = p.t - cfg.RECENT_TILT_S * 1000;
+    let rt = 0, rot = 0, n = 0;
+    for (let i = this.win.length - 1; i >= 0 && this.win[i].t >= recentCut; i--) { rt += this.win[i].rt; rot += this.win[i].rot; n++; }
+    if (!n || rt / n > cfg.PREVIEW_MAX_TILT_DPS || rot / n > cfg.MAX_ROT_MEAN_DPS) return;
+    // The last bounces, evenly spaced at a walking pace.
+    const k = cfg.PREVIEW_MIN_PEAKS;
+    const pk = this.peaks;
+    if (pk.length < k) return;
+    const run = pk.slice(-k);
+    const gaps = run.slice(1).map((q, i) => (q.t - run[i].t) / 1000);
+    if (gaps.some((g) => g < cfg.MIN_PERIOD_S || g > cfg.MAX_PERIOD_S)) return;
+    if (gaps.length > 1 && Math.max(...gaps) - Math.min(...gaps) > cfg.START_GAP_TOLERANCE * Math.max(...gaps)) return;
+    // First preview: the bounces of the run that are as strong as walking (a weak bump
+    // before the first real step is not released as a step later either); then one per bounce.
+    const strongest = Math.max(...run.map((q) => q.bounce));
+    if (p.bounce < cfg.MIN_BOUNCE_FRAC * strongest) return;
+    const count = this.previewSteps === 0
+      ? Math.min(cfg.PREVIEW_MAX_STEPS, run.filter((q) => q.bounce >= cfg.MIN_BOUNCE_FRAC * strongest).length)
+      : 1;
+    const period = gaps.length ? gaps[gaps.length - 1] : 0.55;
+    let headingDeg = meanHeading(this.headings, p.t - period * 1000 * count, p.t);
+    if (headingDeg === null && this.headings.length) headingDeg = this.headings[this.headings.length - 1].h;
+    const first = this.previewSteps === 0;
+    this.previewSteps += count;
+    this.previewLastT = p.t;
+    this.onPreview({ t: p.t, count, first, headingDeg: headingDeg === null ? null : wrap180(headingDeg) });
   }
 
   _evaluate(t) {
@@ -475,6 +551,8 @@ export class MotionEngine {
       }
     }
     this.reason = this.walking ? "walking" : reason;
+    // Shaking or standing: what was previewed was not walking.
+    if (!this.walking && this.previewSteps && (reason === "standing" || reason.startsWith("shaking"))) this._cancelPreview();
   }
 
   _startWalking(t) {
@@ -510,6 +588,12 @@ export class MotionEngine {
     }
     this.walking = true;
     this.enterCount = 0;
+    // Walking starts (no preview was shown, e.g. phone in a pocket): a chance to
+    // re-align the heading before the steps are released with their headings.
+    if (!this.previewSteps && this.onWalkStart) this.onWalkStart();
+    // The confirmed steps released below replace whatever was previewed.
+    this.previewSteps = 0;
+    this.previewLastT = null;
     // Earlier steps of the same walk: going back from the first released
     // step, each older peak one (or two) periods before it and as strong as
     // the walking. An extra bump in between is skipped; a longer gap or a
@@ -573,6 +657,7 @@ export class MotionEngine {
       this.peaks.push({ t: p.t, bounce });
       const cut = p.t - this.cfg.PEAK_HISTORY_S * 1000;
       while (this.peaks.length && this.peaks[0].t < cut) this.peaks.shift();
+      this._maybePreview({ t: p.t, bounce });
     }
   }
 

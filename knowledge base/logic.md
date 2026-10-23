@@ -29,6 +29,11 @@ Accelerometer sampled every **30 ms**.
 
 **Pedometer fallback:** if the OS pedometer counts a step that the detector missed (none in the last 250 ms), `addStep(0.70 m)` is used.
 
+### 1.1 Walking start and preview (`MotionEngine.js`)
+- Walking is confirmed when the vertical bounce has a steady rhythm (autocorrelation ≥ 0.5 over 2.5 s) and 3 evenly spaced bounces, or 2 when the rhythm is very clear (≥ 0.65). The steps that confirmed it are then released with their own times.
+- **Preview:** before that, from the 2nd bounce in step rhythm, each bounce is sent as `onPreview` and the Fusion Map moves the dot ahead (on the green only), without counting it. Only while the phone is held steady (tilting < 50°/s); at most 5 steps. Confirmed steps replace the preview; standing, shaking or 1.6 s without a bounce withdraws it (`onPreviewCancel`). First movement: about 0.6–1.2 s after starting to walk instead of 1.2–2.5 s.
+- Wall unstick (`ParticleFilter._slide`): only when every particle's step is blocked, particles move along the wall instead of holding.
+
 ## 2. Step length (`StepLengthModel.js`)
 
 Weinberg model with the low-pass loss removed:
@@ -68,6 +73,8 @@ k   = dt / τ,   τ = 3 s        when the field is clean
 - **Turning:** no compass correction while `|dθ/dt| > 40°/s`, because orientation sensors lag during turns.
 - **Resync:** if `|err| > 30°` for 1.5 s while the field is clean (6 s when unknown), snap to the compass.
 - **Per-step heading:** the **circular mean** of θ over the stride, which cancels the phone's left-right sway.
+
+- **Walk-start alignment** (`alignToCompass`): when walking starts (first preview step, or confirmed walking without a preview), the heading is set to the compass at once using the compass−heading difference smoothed over 0.6 s. Only if the phone is held in front, the field is not disturbed, not turning, and the difference is 2–30°. The buffered stride headings are shifted by the same amount, so the first steps use it too.
 
 ## 4. BLE ranging (`AdaptiveBeaconEngine.js`)
 

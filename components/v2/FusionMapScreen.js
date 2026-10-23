@@ -82,7 +82,7 @@ const FLOORPLAN_IMAGE = require("../../assets/floorplans/office-70x72.png");
 // because an OTA update is only APPLIED on the next cold start after it
 // downloads, so "I published the fix and it still fails" is very often the
 // old bundle still running - this makes that visible instead of a guess.
-const ENGINE_TAG = "motion-v18-start-slide";
+const ENGINE_TAG = "motion-v20-align";
 
 // How the phone is carried (services/CarryDetector.js). Pocket / ear /
 // swinging: heading from the gyro alone, step length from the step rate.
@@ -1126,6 +1126,7 @@ function OfficeMapCanvas({
 
 function FusionMapScreen({
   pdrStepCallbackRef,
+  pdrPreviewRef = null,
   headingRef,
   onZeroHeading,
   headingCalibrated = false,
@@ -1276,6 +1277,16 @@ function FusionMapScreen({
   // Settling after a beacon fix (see SETTLE_*): the dot is not shown yet.
   const [settling, setSettling] = useState(false);
   const settlingRef = useRef(false);
+  // Preview: where the dot is SHOWN ahead of the position while walking is being
+  // confirmed (1-2 s). Feet. Never counted: confirmed steps replace it.
+  const [previewOffset, setPreviewOffset] = useState(null);
+  const previewRef = useRef({ dx: 0, dy: 0, timer: null });
+  const clearPreview = useCallback(() => {
+    const pv = previewRef.current;
+    if (pv.timer) clearTimeout(pv.timer);
+    previewRef.current = { dx: 0, dy: 0, timer: null };
+    setPreviewOffset(null);
+  }, []);
   settlingRef.current = settling;
   const settleRef = useRef({ start: 0, hist: [] });
   // "choosing" entered while settling: the filter already runs on both spots,
@@ -1724,6 +1735,8 @@ function FusionMapScreen({
         } else if (navPhase !== "navigating") {
           return;
         }
+        // Confirmed steps replace the preview.
+        if (previewRef.current.dx || previewRef.current.dy) clearPreview();
         // Walking: the position is shown from the first step on.
         if (settlingRef.current) revealPosition();
         const stepLengthFt = metresToFeet(stepLengthMeters);
@@ -1741,6 +1754,40 @@ function FusionMapScreen({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pdrStepCallbackRef, navPhase, placementMode]);
+
+  // ── Preview: move the dot at the first steps, before walking is confirmed ──
+  useEffect(() => {
+    if (!pdrPreviewRef) return undefined;
+    pdrPreviewRef.current = (ev) => {
+      if (ev?.type === "cancel") { clearPreview(); return; }
+      // Only while navigating with the dot shown.
+      if (ev?.type !== "step" || navPhase !== "navigating" || placementMode || settlingRef.current) return;
+      const st = fusionEngine.getState();
+      const pv = previewRef.current;
+      const from = { x: st.x + pv.dx, y: st.y + pv.dy };
+      const len = metresToFeet(ev.lengthM || 0.7) * (ev.count || 1);
+      const r = ((Number.isFinite(ev.headingDeg) ? ev.headingDeg : 0) * Math.PI) / 180;
+      // On the green only: as far along the step as the floor allows.
+      let to = null;
+      for (const f of [1, 0.75, 0.5, 0.25]) {
+        const p = { x: from.x + f * len * Math.sin(r), y: from.y + f * len * Math.cos(r) };
+        if (floorplanGrid.segmentWalkable(from.x, from.y, p.x, p.y)) { to = p; break; }
+      }
+      if (!to) return;
+      if (pv.timer) clearTimeout(pv.timer);
+      // Safety: a preview never stays more than a few seconds without confirmed steps.
+      const timer = setTimeout(clearPreview, 3000);
+      previewRef.current = { dx: to.x - st.x, dy: to.y - st.y, timer };
+      setPreviewOffset({ dx: to.x - st.x, dy: to.y - st.y });
+    };
+    return () => {
+      if (pdrPreviewRef.current) pdrPreviewRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pdrPreviewRef, navPhase, placementMode]);
+  // Leaving navigation (Stop, Re-locate) drops any preview.
+  useEffect(() => { if (navPhase !== "navigating") clearPreview(); }, [navPhase, clearPreview]);
+  useEffect(() => () => { if (previewRef.current.timer) clearTimeout(previewRef.current.timer); }, []);
 
   // ── Settling after a beacon fix (see SETTLE_*) ──
   useEffect(() => {
@@ -2484,7 +2531,7 @@ function FusionMapScreen({
       <OfficeMapCanvas
         roomW={roomW} roomH={roomH}
         anchor1={anchor1} anchor2={anchor2}
-        fusionState={fusionState}
+        fusionState={previewOffset ? { ...fusionState, x: fusionState.x + previewOffset.dx, y: fusionState.y + previewOffset.dy } : fusionState}
         d1Ft={d1Ft} d2Ft={d2Ft}
         b1Name={bleStats.b1?.name} b2Name={bleStats.b2?.name}
         headingDeg={headingRef?.current ?? 0}

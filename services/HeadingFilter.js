@@ -97,6 +97,18 @@ export const HEADING_CONFIG = {
   // not the phone moving to a new place: the turn the gyro measured meanwhile
   // is kept. (Dropping it froze the arrow, then left it pointing the old way.)
   SAME_POSITION_DEG: 20,
+  // WALK-START ALIGNMENT. Standing still, the gyro drifts a few degrees and the compass
+  // only pulls it back over ~3 s, so the first steps of a walk went slightly sideways.
+  // When walking starts, the heading is set to the compass at once - if the compass can
+  // be trusted right then (phone held in front, field clean, not turning).
+  // Smoothing of the compass-minus-heading difference (s): averages out the phone's
+  // sway so one swayed reading is not used.
+  ALIGN_SMOOTH_S: 0.6,
+  // Used only if fresh (s), and only for differences in this range (deg): smaller is
+  // noise; larger is handled by the resync above (it may be a disturbed compass).
+  ALIGN_MAX_AGE_S: 1.0,
+  ALIGN_MIN_DEG: 2,
+  ALIGN_MAX_DEG: 30,
 };
 
 const wrap180 = (d) => {
@@ -140,6 +152,8 @@ export class HeadingFilter {
     this._axis = null;          // phone-fixed axis whose direction is followed
     this._prevAz = null;
     this._prevW = null;
+    this._alignErr = null;      // smoothed compass - heading (deg), see alignToCompass()
+    this._alignErrT = null;     // when it was last updated (s)
   }
 
   get heading() { return Number(this._heading.toFixed(2)); }
@@ -268,6 +282,30 @@ export class HeadingFilter {
     this._lastAbsT = null;
     this._disagreeSince = null;
     this._clearStepWindow();
+  }
+
+  /**
+   * Walking just started: set the heading to the compass now, if it can be trusted
+   * (see ALIGN_*). Returns the change applied (deg, 0 if none), so buffered stride
+   * headings can be shifted by the same amount.
+   */
+  alignToCompass(nowS = Date.now() / 1000) {
+    const c = this.cfg;
+    if (!this._initialized || !this._hasGyro || !this.compassUsable) return 0;
+    if (this._magDisturbed === true || this._alignErr === null || this._alignErrT === null) return 0;
+    if (nowS - this._alignErrT > c.ALIGN_MAX_AGE_S) return 0;
+    if (Math.abs(this._yawRateDps) > c.TURN_RATE_GATE_DPS) return 0;
+    const d = this._alignErr;
+    if (Math.abs(d) < c.ALIGN_MIN_DEG || Math.abs(d) > c.ALIGN_MAX_DEG) return 0;
+    this._heading = wrap180(this._heading + d);
+    this._alignErr = 0;
+    // The stride window and the rewind history are in the old heading: shift them too.
+    const r = (d * Math.PI) / 180;
+    const s = this._stepSin, co = this._stepCos;
+    this._stepSin = s * Math.cos(r) + co * Math.sin(r);
+    this._stepCos = co * Math.cos(r) - s * Math.sin(r);
+    for (const p of this._history) p.h = wrap180(p.h + d);
+    return d;
   }
 
   /**
@@ -469,6 +507,17 @@ export class HeadingFilter {
     this._lastAbsT = now;
     if (!(dt > 0)) return;
     if (Math.abs(this._yawRateDps) > this.cfg.TURN_RATE_GATE_DPS) return;
+
+    // For alignToCompass(): the smoothed difference while the compass is usable here.
+    if (this._magDisturbed !== true) {
+      const ka = Math.min(1, dt / this.cfg.ALIGN_SMOOTH_S);
+      const fresh = this._alignErrT !== null && now - this._alignErrT <= this.cfg.ALIGN_MAX_AGE_S;
+      this._alignErr = fresh ? wrap180(this._alignErr + ka * wrap180(err - this._alignErr)) : err;
+      this._alignErrT = now;
+    } else {
+      this._alignErr = null;
+      this._alignErrT = null;
+    }
 
     const clean = this._magDisturbed === false;
     const disturbed = this._magDisturbed === true;
