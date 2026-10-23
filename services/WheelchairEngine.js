@@ -37,46 +37,29 @@ export const WHEELCHAIR_CONFIG = {
   // average with this time constant (stopping, spinning).
   WINDOW_S: 1.0,
   SHORT_TAU_S: 0.3,
-  // Faster average used only to see that the vibration has stopped. The 0.3 s one kept
-  // reading "rolling" for about a second after the chair stopped, adding ~0.7 m to every stop.
-  STOP_TAU_S: 0.1,
-  // What is left of that lag is taken off the distance when a roll ends (s of full speed).
-  STOP_TAIL_S: 0.15,
   // Vibration (g RMS) that starts rolling, by Sensitivity. Rolling stops once
   // it drops below EXIT_FRAC of that.
-  // Raised from 0.035 / 0.02 / 0.012: tremor and small bumps at 0.02-0.03 g
-  // were starting a full-speed roll with no rolling at all.
-  START_RMS_G: { low: 0.05, medium: 0.03, high: 0.018 },
-  EXIT_FRAC: 0.5,
+  START_RMS_G: { low: 0.035, medium: 0.02, high: 0.012 },
+  EXIT_FRAC: 0.6,
   // The vibration must last this long to start, and be gone this long to stop.
-  // A longer stop time lets the chair cross a smooth patch of floor without
-  // the roll ending (and needing ENTER_S again to restart).
-  ENTER_S: 0.8, // short, so the dot starts sooner (the start level stays raised against small vibration)
-  EXIT_S: 3.0, // was 2.0
-  // Speed follows the vibration: counted speed = set speed x sqrt(level / reference),
-  // limited to FACTOR_MIN..FACTOR_MAX. The reference is the level measured in a
-  // calibration roll (Settings), or REF_OVER_START x the start level before one.
-  // Small vibration then moves the dot slowly and strong vibration faster, instead
-  // of one fixed speed for any vibration above the threshold.
-  FACTOR_MIN: 0.5,
-  FACTOR_MAX: 1.5,
-  REF_OVER_START: 3,
+  ENTER_S: 0.8,
+  EXIT_S: 1.0,
   // A chair starts from rest: over this long from the start of a roll the
   // counted speed builds up from 0 to the set speed (half the distance of
   // full speed). Counting full speed from the first jolt made the first one
   // or two moves much bigger than the chair had really moved.
-  START_RAMP_S: 0.5,
+  START_RAMP_S: 1.0,
   // The phone being handled: tilting faster than this (deg/s, window mean)
   // is the hand moving the phone, not the wheels.
-  HANDLING_TILT_DPS: 90, // was 45: rocking over bumps and turning stopped the roll
+  HANDLING_TILT_DPS: 45,
   // Spinning the chair on the spot: turning faster than this (deg/s) adds no
   // forward distance.
-  SPIN_YAW_DPS: 150, // was 70: an ordinary turn while rolling must still move you
+  SPIN_YAW_DPS: 70,
   // Distance handed to the app per move while rolling (m). Matches a step,
   // which is what the position filters expect.
   SEGMENT_M: 0.7,
   // A leftover shorter than this when rolling stops is dropped.
-  MIN_SEGMENT_M: 0.15,
+  MIN_SEGMENT_M: 0.45,
   // A push longer than this is handed over in equal parts.
   MAX_SEGMENT_M: 1.0,
   // Speed / push length limits (m/s, m).
@@ -108,9 +91,7 @@ export class WheelchairEngine {
     this.cfg = { ...WHEELCHAIR_CONFIG, ...config };
     this.onMove = null;        // ({t, lengthM, headingDeg, source: "roll"|"push"})
     this.platform = "android";
-    // scale: false = distance is rolling time x the set speed. Scaling it by the vibration made the same
-    // real speed count as 35% to 148% depending on how rough the floor was (the buzz is the floor, not the speed).
-    this.settings = { speedMps: 0.8, pushM: 1.0, sensitivity: "medium", auto: true, scale: false, refRmsG: null };
+    this.settings = { speedMps: 0.8, pushM: 1.0, sensitivity: "medium", auto: true };
     this.gravity = new GravityTracker();
     this.reset();
   }
@@ -133,7 +114,6 @@ export class WheelchairEngine {
     this.pending = 0;          // distance rolled, not yet handed over (m)
     this.heldS = 0;            // rolling time held while the vibration dipped (s)
     this.eShort = 0;           // fast vibration energy (g²)
-    this.eStop = 0;            // faster vibration energy, for seeing a stop (g²)
     this.yawShort = 0;         // fast turn rate (deg/s)
     this.segmentStartT = null;
     this.rollStartT = null;    // when the current roll began (ms), for START_RAMP_S
@@ -150,25 +130,12 @@ export class WheelchairEngine {
     if (Number.isFinite(patch.pushM)) s.pushM = Math.min(cfg.MAX_PUSH_M, Math.max(cfg.MIN_PUSH_M, patch.pushM));
     if (cfg.START_RMS_G[patch.sensitivity]) s.sensitivity = patch.sensitivity;
     if (typeof patch.auto === "boolean") s.auto = patch.auto;
-    if (typeof patch.scale === "boolean") s.scale = patch.scale;
-    if (patch.refRmsG === null) s.refRmsG = null;
-    else if (Number.isFinite(patch.refRmsG)) s.refRmsG = Math.min(1, Math.max(0.01, patch.refRmsG));
     if (!s.auto && this.rolling) this._stopRolling(this.lastT ?? Date.now());
     this.settings = s;
   }
 
   get startRmsG() {
     return this.cfg.START_RMS_G[this.settings.sensitivity] || this.cfg.START_RMS_G.medium;
-  }
-
-  /** How much of the set speed the current vibration level means (FACTOR_MIN..FACTOR_MAX). */
-  _speedFactor() {
-    const cfg = this.cfg;
-    if (!this.settings.scale) return 1;
-    const ref = this.settings.refRmsG || this.startRmsG * cfg.REF_OVER_START;
-    const r = this.stats.rmsG / ref;
-    if (!(r > 0)) return cfg.FACTOR_MIN;
-    return Math.min(cfg.FACTOR_MAX, Math.max(cfg.FACTOR_MIN, Math.sqrt(r)));
   }
 
   /** Heading sample (deg, app convention). Call alongside every motion sample. */
@@ -213,7 +180,6 @@ export class WheelchairEngine {
     // not a whole window later.
     const ks = Math.min(1, dt / cfg.SHORT_TAU_S);
     this.eShort += ks * (e - this.eShort);
-    this.eStop += Math.min(1, dt / cfg.STOP_TAU_S) * (e - this.eStop);
     this.yawShort += ks * (yaw - this.yawShort);
 
     const s = { t, e, rt, yaw };
@@ -264,7 +230,7 @@ export class WheelchairEngine {
     // distance is HELD, not counted: if the vibration comes back it was only
     // a smooth patch of floor and the held distance is added; if it stays
     // away for EXIT_S the chair had stopped and it is dropped.
-    const vibrating = Math.sqrt(this.eStop) >= this.startRmsG * cfg.EXIT_FRAC && !handled;
+    const vibrating = Math.sqrt(this.eShort) >= this.startRmsG * cfg.EXIT_FRAC && !handled;
     if (vibrating) {
       if (this.belowSince !== null) {
         this.belowSince = null;
@@ -298,14 +264,9 @@ export class WheelchairEngine {
     // Calibration counts the same full-speed-equivalent time, so a
     // calibrated speed matches how distance is counted.
     const effS = this._rampedS(t, dtS);
-    const d = this.settings.speedMps * this._speedFactor() * effS;
+    const d = this.settings.speedMps * effS;
     this.pending += d;
-    if (this._cal) {
-      // Unscaled time and the vibration it happened at: the calibrated speed
-      // is the speed AT that average level (factor 1 there).
-      this._cal.rollS += effS;
-      this._cal.rmsSum += this.stats.rmsG * effS;
-    }
+    if (this._cal) this._cal.rollS += effS;
     while (this.pending >= this.cfg.SEGMENT_M) {
       this.pending -= this.cfg.SEGMENT_M;
       this._emit(t, this.cfg.SEGMENT_M, "roll");
@@ -315,8 +276,6 @@ export class WheelchairEngine {
   _stopRolling(t) {
     // The time held since the vibration dropped was not rolling: it is
     // dropped. What was rolled before it is handed over.
-    // The stop was seen about STOP_TAIL_S late: that distance was not rolled.
-    this.pending = Math.max(0, this.pending - this.settings.speedMps * this.cfg.STOP_TAIL_S);
     if (this.pending >= this.cfg.MIN_SEGMENT_M) this._emit(t, this.pending, "roll");
     this.pending = 0;
     this.heldS = 0;
@@ -347,7 +306,7 @@ export class WheelchairEngine {
   // ── Calibration: roll (or push) a measured distance ─────────────────────
 
   beginCalibration() {
-    this._cal = { rollS: 0, rmsSum: 0, pushes: 0, distanceM: 0, startedAt: Date.now() };
+    this._cal = { rollS: 0, pushes: 0, distanceM: 0, startedAt: Date.now() };
   }
 
   cancelCalibration() {
@@ -384,8 +343,7 @@ export class WheelchairEngine {
     if (speedMps < cfg.MIN_SPEED || speedMps > cfg.MAX_SPEED) {
       return { ok: false, reason: `${speedMps.toFixed(2)} m/s is outside ${cfg.MIN_SPEED}–${cfg.MAX_SPEED} m/s. Check the distance.` };
     }
-    const refRmsG = c.rmsSum > 0 ? Number((c.rmsSum / c.rollS).toFixed(4)) : null;
-    return { ok: true, speedMps: Number(speedMps.toFixed(2)), rollS: Number(c.rollS.toFixed(1)), refRmsG };
+    return { ok: true, speedMps: Number(speedMps.toFixed(2)), rollS: Number(c.rollS.toFixed(1)) };
   }
 
   getStatus() {
@@ -396,7 +354,6 @@ export class WheelchairEngine {
       thresholdG: this.startRmsG,
       tiltDps: Math.round(this.stats.tiltDps),
       yawDps: Math.round(this.stats.yawDps),
-      speedFactor: Number(this._speedFactor().toFixed(2)),
       ...this.settings,
     };
   }

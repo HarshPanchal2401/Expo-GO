@@ -47,16 +47,11 @@ export const DEFAULT_APP_SETTINGS = {
   maxCadenceMs: 1800,              // Slowest allowable step cadence (~0.55 steps/sec)
 
   // ─── Mobility (services/WheelchairEngine.js) ─────────────────────────────
-  wheelchairScale: false,          // wheelchair: counted speed follows the vibration level (off: the buzz is the floor, not the speed)
-  wheelchairRefRmsG: null,         // wheelchair: vibration level at the set speed (set by a calibration roll)
   mobilityMode: "walking",         // "walking" (steps) | "wheelchair" (rolling + Push button)
   wheelchairAuto: true,            // detect rolling from the wheels' vibration
   wheelchairSpeedMps: 0.8,         // speed while rolling (m/s); calibrate in Settings
   wheelchairPushM: 1.0,            // distance per tap of the Push button (m)
   wheelchairSensitivity: "medium", // "low" | "medium" | "high": vibration needed to count as rolling
-
-  // ─── Positioning on the Fusion Map ─────────────────────────────────────────
-  nearBeaconGuard: true,           // a beacon a few feet away does not pull the track toward it
 
   // ─── Room & Map Environment ───────────────────────────────────────────────
   roomWidthFt: 18,                 // Room width in feet (X axis)
@@ -110,13 +105,6 @@ function normalizeSettings(raw) {
       s.defaultPathLossN = s.pathLossN;
     }
     s.pathLossDefaultMigrated = true;
-  }
-
-  // One-time: "speed follows vibration" was on by default, but the same speed
-  // counted 35% to 148% depending on how rough the floor was. Off by default now.
-  if (!s.wheelchairScaleMigrated) {
-    s.wheelchairScale = false;
-    s.wheelchairScaleMigrated = true;
   }
 
   return s;

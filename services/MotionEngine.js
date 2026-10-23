@@ -82,10 +82,10 @@ export const MOTION_CONFIG = {
   SWING_REPEAT_CORR: 0.3,
   MAX_ROT_SWING_DPS: 700,
   // Consecutive evaluations needed to start / stop walking.
-  ENTER_EVALS: 1, // was 2: one evaluation (250 ms) confirms walking, so the dot starts sooner
+  ENTER_EVALS: 2,
   // Walking only starts with at least this many evenly spaced peaks in the
   // window (a phone being picked up makes one or two).
-  START_MIN_PEAKS: 2, // was 3: one step period sooner
+  START_MIN_PEAKS: 3,
   START_GAP_TOLERANCE: 0.35,
   // A peak must be at least this fraction of the recent steps' bounce
   // (slowing down / standing after a walk makes small bumps).

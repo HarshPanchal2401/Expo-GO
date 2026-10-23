@@ -234,8 +234,6 @@ export default function AppAndroid() {
         pushM: s?.wheelchairPushM,
         sensitivity: s?.wheelchairSensitivity,
         auto: s?.wheelchairAuto !== false,
-        scale: s?.wheelchairScale === true,
-        refRmsG: s?.wheelchairRefRmsG ?? null,
       });
       // Switching mode: start each engine clean, nothing carried over.
       if (prevMode !== undefined && prevMode !== s?.mobilityMode) {
@@ -308,15 +306,11 @@ export default function AppAndroid() {
     // replaced by a 0.70 m guess — quietly discarding the calibration for
     // exactly the users who needed it most. Sourcing the range from the model
     // keeps one definition of what counts as a plausible step.
-    // A wheelchair move (rolling leftover, push) is its own length: the walking
-    // range below would turn a 0.3 m leftover into a 0.70 m guess.
-    const wheelchairMove = extra?.carry === "wheelchair" && isFinite(dynamicLen) && dynamicLen >= 0.1 && dynamicLen <= STEP_MODEL_CONFIG.MAX_STEP_LENGTH_M;
     const len =
-      wheelchairMove ||
-      (dynamicLen &&
+      dynamicLen &&
       isFinite(dynamicLen) &&
       dynamicLen >= STEP_MODEL_CONFIG.MIN_STEP_LENGTH_M &&
-      dynamicLen <= STEP_MODEL_CONFIG.MAX_STEP_LENGTH_M)
+      dynamicLen <= STEP_MODEL_CONFIG.MAX_STEP_LENGTH_M
         ? dynamicLen
         : 0.70;
 
@@ -745,28 +739,21 @@ export default function AppAndroid() {
   // --------------------------------------------------------------------------
   // Stable identity, so the memoised Fusion Map does not re-render each time
   // the app shell does.
-  // facingDeg: the map direction the user is facing now (0 = map up, the
-  // default; a saved start spot can give 90 / 180 / 270). Anything that is not
-  // a number (e.g. a button's press event) means 0.
-  const setZero = useCallback((facingDeg) => {
-    const facing = Number.isFinite(facingDeg) ? facingDeg : 0;
+  const setZero = useCallback(() => {
     const rawNow = rawHeadingRef.current;
-    // heading = zero - raw (DeviceMotion alpha) or raw - zero (magnetometer):
-    // choose the zero that makes the current heading equal to `facing`.
-    const zero = hasMotionRotationRef.current ? norm(rawNow + facing) : norm(rawNow - facing);
-    headingZeroRef.current = zero;
-    setHeadingZero(zero);
+    headingZeroRef.current = rawNow;
+    setHeadingZero(rawNow);
     setHeadingCalibrated(true);
-    AsyncStorage.setItem(HEADING_ZERO_KEY, String(zero)).catch((err) =>
+    AsyncStorage.setItem(HEADING_ZERO_KEY, String(rawNow)).catch((err) =>
       console.warn("Heading zero save failed:", err)
     );
-    headingFilter.reset(facing);
+    headingFilter.reset(0);
     // Headings buffered before the zero are in the old reference.
     motionEngineRef.current?.clearHeadings?.();
     wheelchairEngine.clearHeadings();
-    headingRef.current = headingFilter.heading;
-    setHeading(headingFilter.heading);
-    setStatus(facing ? `Heading set: facing ${facing}° on the map` : "Heading zero calibrated (Forward = 0°)");
+    headingRef.current = 0;
+    setHeading(0);
+    setStatus("Heading zero calibrated (Forward = 0°)");
   }, []);
 
   const start = () => {

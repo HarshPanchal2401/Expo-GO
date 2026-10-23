@@ -260,11 +260,6 @@ export class HeadingFilter {
     if (!this._magDisturbed) this._magBaseline += this.cfg.MAG_BASELINE_LPF * (total - this._magBaseline);
   }
 
-  /** True while the heading is held through a repositioning of the phone (diagnostics). */
-  get isHeld() {
-    return Boolean(this._held);
-  }
-
   /** Snap the heading to a known value (e.g. 0 right after Zero Heading). */
   reset(headingDeg = 0) {
     this._heading = wrap180(headingDeg);

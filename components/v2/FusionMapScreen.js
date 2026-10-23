@@ -57,12 +57,9 @@ import Svg, {
   G,
 } from "react-native-svg";
 import { fusionEngine } from "../../services/FusionEngine.js";
-import { headingFilter } from "../../services/HeadingFilter.js";
 import { v2Scanner } from "../../services/v2BeaconScannerService.js";
 import MobilityModeSwitch from "./MobilityModeSwitch.js";
-import { loadStartSpots, saveStartSpot, removeStartSpot, MAX_NAME, FACINGS } from "../../services/StartSpots.js";
-// Map direction of a start spot's facing (0 = up).
-const FACING_ARROW = { 0: "↑", 90: "→", 180: "↓", 270: "←" };
+import { loadStartSpots, saveStartSpot, removeStartSpot, MAX_NAME } from "../../services/StartSpots.js";
 import { checkRangeGeometry } from "../../services/BeaconRangingCalibration.js";
 import { metresToFeet, feetToMetres } from "../../services/PdrEngine.js";
 import { savePath, getSavedPaths, deleteSavedPath } from "../../PathStorage.js";
@@ -73,7 +70,7 @@ import { obstacleMap, OBSTACLE_TYPES, AREA_TYPES, DEFAULT_PILLAR_RADIUS_FT, Obst
 import { testRecorder } from "../../services/TestRecorder.js";
 import { floorplanGrid } from "../../services/WalkableGrid.js";
 import { wheelchairEngine } from "../../services/WheelchairEngine.js";
-import { getAppSettings, subscribeAppSettings, saveAppSettings } from "../../services/appSettingsStorage.js";
+import { getAppSettings, subscribeAppSettings } from "../../services/appSettingsStorage.js";
 
 // Everything the obstacle editor can draw: RF obstacles + no-walk areas.
 const EDIT_TYPES = [...OBSTACLE_TYPES, ...AREA_TYPES];
@@ -188,8 +185,6 @@ const SPOT_WINDOW_MS = 6000;
 // searching animation instead of a jumping dot: shown once the position has
 // stayed within SETTLE_STEADY_FT for SETTLE_WINDOW_MS (and at least
 // SETTLE_MIN_MS after the fix), at the first step, or after SETTLE_MAX_MS.
-// Once the start is found, steps carry the track and beacons only correct it slowly (1 = full influence).
-const NAV_BLE_WEIGHT = 0.25;
 const SETTLE_MIN_MS = 3000;
 const SETTLE_WINDOW_MS = 3000;
 const SETTLE_STEADY_FT = 3;
@@ -934,8 +929,8 @@ function OfficeMapCanvas({
             strokeOpacity={0.85} strokeLinecap="round" strokeLinejoin="round"
           />
         )}
-        {/* The last walk, kept after Stop. Hidden once a new start is being found (locating, choosing, picking). */}
-        {navPhase === "idle" && lastTrail && lastTrail.length > 1 && (
+        {/* The last walk, kept after Stop until the next navigation begins. */}
+        {navPhase !== "navigating" && lastTrail && lastTrail.length > 1 && (
           <Polyline
             points={lastTrail.map((pt) => { const { cx, cy } = toScreen(pt.x, pt.y); return `${cx.toFixed(1)},${cy.toFixed(1)}`; }).join(" ")}
             fill="none" stroke={C.trail} strokeWidth={3 * inv}
@@ -1254,21 +1249,17 @@ function FusionMapScreen({
   // Named start spots (Entrance, Desk 4 ...) saved on the phone.
   const [startSpots, setStartSpots] = useState([]);
   const [spotName, setSpotName] = useState("");
-  // Way the user faces at a new spot (FACINGS) or null: starting there sets the heading too.
-  const [spotFacing, setSpotFacing] = useState(null);
   useEffect(() => { loadStartSpots().then((l) => setStartSpots([...l])); }, []);
   const pickSpot = (spot) => {
     const w = floorplanGrid.nearest({ x: spot.x, y: spot.y });
-    setPendingStart({ ...(w ? { x: w.x, y: w.y } : { x: spot.x, y: spot.y }), facingDeg: spot.facingDeg ?? null, spotName: spot.name });
+    setPendingStart(w ? { x: w.x, y: w.y } : { x: spot.x, y: spot.y });
   };
   const handleSaveSpot = async () => {
     if (!pendingStart || !spotName.trim()) return;
-    const res = await saveStartSpot(spotName, pendingStart.x, pendingStart.y, spotFacing);
+    const res = await saveStartSpot(spotName, pendingStart.x, pendingStart.y);
     setStartSpots([...res.list]);
     if (!res.ok) { Alert.alert("Spot not saved", res.reason); return; }
-    setPendingStart((p) => p && { ...p, facingDeg: spotFacing, spotName: spotName.trim() });
     setSpotName("");
-    setSpotFacing(null);
   };
   const handleDeleteSpot = async (id) => setStartSpots([...(await removeStartSpot(id))]);
   // "choosing": the beacons fit two spots; which one the user says they are at.
@@ -1290,9 +1281,6 @@ function FusionMapScreen({
     settlingRef.current = false;
     setSettling(false);
     setLocatedAt(Date.now());
-    // The path starts here: walking done while the position was being found is not drawn.
-    fusionEngine.restartTrail();
-    fusionEngine.setBleWeight(NAV_BLE_WEIGHT);
     setFusionState({ ...fusionEngine.getState() });
   };
   // Spot calibration: { stage: "pick" | "measuring" | "done", point, startedAt, result }
@@ -1553,8 +1541,9 @@ function FusionMapScreen({
       let f = cache.get(key);
       if (f === undefined) {
         const a = num === 1 ? anchor1 : anchor2;
-        const p = { x: Math.round(x), y: Math.round(y) };
-        const L = obstacleMap.items.length ? ObstacleMap.lossFromCounts(obstacleMap.crossingCounts(p, a)) : 0;
+        const L = obstacleMap.items.length
+          ? ObstacleMap.lossFromCounts(obstacleMap.crossingCounts({ x: Math.round(x), y: Math.round(y) }, a))
+          : 0;
         f = Math.pow(10, L / (10 * n));
         if (cache.size > 40000) cache.clear();
         cache.set(key, f);
@@ -1565,7 +1554,6 @@ function FusionMapScreen({
   useEffect(() => {
     const apply = (st) => {
       fusionEngine.setParticleFilterEnabled(st?.particleFilter !== false);
-      fusionEngine.setNearBeaconGuard(st?.nearBeaconGuard !== false);
       fusionEngine.setMobility(st?.mobilityMode);
       setMobilityMode(st?.mobilityMode === "wheelchair" ? "wheelchair" : "walking");
     };
@@ -1593,7 +1581,7 @@ function FusionMapScreen({
     // Locating: the factor each range is shortened by at a candidate place,
     // for what the obstacles AND the radio map say is lost between there and
     // the beacon (see FusionEngine._solveWithObstacles).
-    fusionEngine.setRangeCorrector((x, y, d1, d2) => {
+    fusionEngine.setRangeCorrector((x, y) => {
       const out = {};
       for (const [num, key, a] of [[1, "f1", anchor1], [2, "f2", anchor2]]) {
         const L = obstacleLossDb(num, { x, y }, a, 3) - radioMapsRef.current[num].query(x, y).meanDb;
@@ -1734,10 +1722,7 @@ function FusionMapScreen({
         fusionEngine.predict(stepLengthFt, heading, { headingJumpSdDeg: headingReset ? 15 : 0, t });
         if (carry) setCarryMode(carry);
         const stAfter = fusionEngine.getState();
-        // Wheelchair: say how the map handled the move and whether the heading was held, to find why a dot stops.
-        const pfi = carry === "wheelchair" ? fusionEngine.getLastStepInfo() : null;
-        const text = (pfi ? `wheelchair map=${pfi.action} ok=${pfi.okFrac.toFixed(2)} headingHeld=${headingFilter.isHeld ? 1 : 0}` : carry || "");
-        testRecorder.add("step", { len: stepLengthFt, heading, x: stAfter.x, y: stAfter.y, text });
+        testRecorder.add("step", { len: stepLengthFt, heading, x: stAfter.x, y: stAfter.y, text: carry || "" });
         setFusionState({ ...stAfter });
       };
       return () => {
@@ -1898,8 +1883,6 @@ function FusionMapScreen({
     settleRef.current = { start: Date.now(), hist: [] };
     settlingRef.current = settle;
     setSettling(settle);
-    // Beacons settle the fix at full strength; after that (or at once for a chosen start) they only nudge.
-    fusionEngine.setBleWeight(settle ? 1 : NAV_BLE_WEIGHT);
     setLocatedAt(settle ? 0 : Date.now());
     return true;
   };
@@ -1933,7 +1916,6 @@ function FusionMapScreen({
   /** Commits the fix and starts drawing the walked path from it. */
   const handleStartNavigation = () => {
     fusionEngine.beginNavigation();
-    fusionEngine.setBleWeight(NAV_BLE_WEIGHT);
     setFusionState({ ...fusionEngine.getState() });
     setNavPhase("navigating");
   };
@@ -2094,13 +2076,6 @@ function FusionMapScreen({
     fusionEngine.setRoomSize(roomW, roomH);
     fusionEngine.setBleAnchors(anchor1, anchor2);
     const fix = fusionEngine.setManualPosition(pendingStart.x, pendingStart.y);
-    // A saved spot with a facing direction: the user stands facing it, so the
-    // heading is set exactly (no zeroing by eye).
-    if (Number.isFinite(pendingStart.facingDeg) && onZeroHeading) {
-      onZeroHeading(pendingStart.facingDeg);
-      setHeadingZeroFlash(true);
-      setTimeout(() => setHeadingZeroFlash(false), 2000);
-    }
     setPendingStart(null);
     completeLocating(fix);
   };
@@ -2110,7 +2085,6 @@ function FusionMapScreen({
       const t = fusionEngine.getState().trail;
       if (t && t.length > 1) setLastTrail(t.map((p) => ({ x: p.x, y: p.y })));
     }
-    fusionEngine.setBleWeight(1);
     pickStartChoice(null);
     settlingRef.current = false;
     setSettling(false);
@@ -2751,7 +2725,7 @@ function FusionMapScreen({
                   { text: "Delete", style: "destructive", onPress: () => handleDeleteSpot(sp.id) },
                 ])}
               >
-                <Text style={styles.spotChipText}>📍 {sp.name}{Number.isFinite(sp.facingDeg) ? ` ${FACING_ARROW[sp.facingDeg]}` : ""}</Text>
+                <Text style={styles.spotChipText}>📍 {sp.name}</Text>
               </TouchableOpacity>
             ))}
           </View>
@@ -2770,22 +2744,7 @@ function FusionMapScreen({
               </TouchableOpacity>
             </View>
           )}
-          {pendingStart && spotName.trim() !== "" && (
-            <View style={[styles.spotWrap, { marginTop: 8, alignItems: "center" }]}>
-              <Text style={[styles.hintText, { marginBottom: 8, marginRight: 8 }]}>Facing (map):</Text>
-              {[null, ...FACINGS].map((f) => (
-                <TouchableOpacity key={String(f)} style={[styles.spotChip, spotFacing === f && styles.spotChipOn]} onPress={() => setSpotFacing(f)}>
-                  <Text style={styles.spotChipText}>{f === null ? "none" : FACING_ARROW[f]}</Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-          )}
-          {pendingStart && Number.isFinite(pendingStart.facingDeg) && (
-            <Text style={[styles.hintText, { color: C.textPrimary }]}>
-              Stand at {pendingStart.spotName || "the spot"} facing {FACING_ARROW[pendingStart.facingDeg]} on the map, then press Start Here: the heading is set from it.
-            </Text>
-          )}
-          <Text style={styles.hintText}>Long-press a spot to delete it. Give a spot a facing direction to set the heading when you start there.</Text>
+          <Text style={styles.hintText}>Long-press a spot to delete it.</Text>
         </View>
       )}
 

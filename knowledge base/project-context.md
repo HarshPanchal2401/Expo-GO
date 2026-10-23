@@ -40,7 +40,7 @@ An **indoor navigation app** for one office. It shows the user's live position o
 | 🗺️ Fusion Map | `components/v2/FusionMapScreen.js` | The main screen. Floor plan, beacon placement, locating, navigation, trail, obstacle editor, test-walk recorder. **Walking / Wheelchair switch** at the top (idle only). **Saved start spots** while picking a start. |
 | 🚶 PDR | `components/v2/PdrTrackerScreen.js` | PDR-only canvas, heading zero, step-length calibration walk, **Walking / Wheelchair switch** (locked while tracking) |
 | 📏 Raw | `components/v2/RawDistanceScreen.js` + `BeaconSetupCard.js` + `Calibrate1mCard.js` | **Choose B1 / B2**; **1 m calibration**: phone 1 m from the beacon, 15 s of raw RSSI (first 1.5 s skipped), 20% trimmed mean → Measured Power for that beacon; shows what the current MP reads at 1 m (the check) and saves the new MP (warns under 20 packets or spread over ±5 dB); (devices in range, Swap, scan only B1 & B2 or all), raw RSSI → formula distance, Measured Power and n per beacon set live, both Kalman filters toggleable. (The Signal Lab tab was removed; its calibrations fed an older engine the map did not use.) |
-| ⚙️ Settings | `components/AppSettingsScreen.js` | **Wheelchair card** (shown only in wheelchair mode; the mode itself is switched on the PDR tab or Fusion Map): rolling detection on/off, sensitivity, rolling speed, push length and a calibration. **PDR card:** Weinberg K, ZUPT, peak threshold, min bounce, min cadence. **Toggles:** Step Engine (NEW / CLASSIC), Map Matching (ON / OFF), Near-Beacon Guard (ON), Shake Filter (classic engine only). |
+| ⚙️ Settings | `components/AppSettingsScreen.js` | **Wheelchair card** (shown only in wheelchair mode; the mode itself is switched on the PDR tab or Fusion Map): rolling detection on/off, sensitivity, rolling speed, push length and a calibration. **PDR card:** Weinberg K, ZUPT, peak threshold, min bounce, min cadence. **Toggles:** Step Engine (NEW / CLASSIC), Map Matching (ON / OFF), Shake Filter (classic engine only). |
 
 The app shells are `App.android.js` and `App.ios.js`, which are nearly identical. They own the sensor subscriptions, `addStep()` and the tab bar, and pass `pdrStepCallbackRef` and `headingRef` to the Fusion Map.
 
@@ -141,10 +141,10 @@ A **transition** (the phone being repositioned) is flagged when the average tilt
 
 ### 6.5 Wheelchair mode (`services/WheelchairEngine.js`)
 Wheelchair mode (switch on the PDR tab or Fusion Map, saved at once). Both step detectors are switched off; the engine hands over **0.7 m moves** through the same `addStep()` path:
-- **Rolling:** RMS of the high-passed (~2.7 Hz) gravity-free acceleration. Starts after 1.2 s at or above the start level (Sensitivity low / medium / high = 0.05 / 0.03 / 0.018 g). Stops after 2 s below 50% of it; the time while it was low is dropped. **Speed follows vibration:** counted speed = `wheelchairSpeedMps` × √(level ÷ reference), limited to 0.5×–1.5×. The reference is the level measured in the calibration roll (`wheelchairRefRmsG`), or 3× the start level before one. Settings → "Speed Follows Vibration" OFF gives one fixed speed again.
-- Not rolling while the phone is handled (tilt rotation > 90°/s); no distance while spinning on the spot (turn rate > 150°/s), so ordinary turns still move you.
+- **Rolling:** RMS of the high-passed (~2.7 Hz) gravity-free acceleration. Starts after 0.8 s at or above the start level (Sensitivity low / medium / high = 0.035 / 0.02 / 0.012 g). Stops after 1 s below 60% of it; the time while it was low is dropped. Moves at `wheelchairSpeedMps` (default 0.8), building up from 0 over the first 1.0 s of each roll (`START_RAMP_S`; calibration counts the same way).
+- Not rolling while the phone is handled (tilt rotation > 45°/s); no distance while spinning (turn rate > 70°/s).
 - **Push button** (Fusion Map, and in the Settings calibration): one push = `wheelchairPushM` (default 1.0 m), split into parts ≤ 1 m.
-- **Calibration:** roll a measured distance → speed from the rolling time **and the vibration level it happened at**; or tap Push per push → push length.
+- **Calibration:** roll a measured distance → speed from the rolling time; or tap Push per push → push length.
 - Map matching widens its distance doubt (`FusionEngine.setMobility`: scale σ 0.2, per-move noise 12%).
 - The PDR tab shows the live vibration level; a recorded test walk logs it once a second as `note` rows.
 - **Untuned on a real wheelchair.** On carpet the vibration is too small: use the Push button.
@@ -181,7 +181,7 @@ Wheelchair mode (switch on the PDR tab or Fusion Map, saved at once). Both step 
     - Tempered: weight 0.6 while walking, 0.25 while still.
     - NLOS asymmetry: the "too long" side is allowed 1.8× more spread.
     - Outlier floor 0.05.
-    - **Near-beacon guard** (default ON): range and expected range are raised to at least 3 ft, and 2.5 ft of error in feet is added to the log error. Stops a beacon the user passes from pulling the track onto it.
+    - A wall range factor `10^(L/(10n))` is applied.
   - Systematic resampling with 0.25 ft roughening. The estimate is taken from the majority side of the beacon baseline, and ambiguity is reported.
 - **EKF (fallback when Map Matching is off):** PDR predicts. BLE corrects along the B1–B2 baseline, `t = (L² + d1² − d2²) / (2L)`.
 - **Snapping:** every reported position is moved onto the walkable area: EKF output, particle-filter estimate, start fix and manual taps.
@@ -215,7 +215,7 @@ Wheelchair mode (switch on the PDR tab or Fusion Map, saved at once). Both step 
 | `services/StepLengthModel.js` | Weinberg + cadence model, calibration |
 | `services/StepGate.js` | Shake gate for the classic engine only |
 | `services/WheelchairEngine.js` | Wheelchair rolling detection, Push button, calibration |
-| `services/StartSpots.js` | Named start spots (max 12, saved on the phone, in feet), with an optional facing direction that sets the heading on start |
+| `services/StartSpots.js` | Named start spots (max 12, saved on the phone, in feet) |
 | `components/v2/MobilityModeSwitch.js` | Walking / Wheelchair switch used on the PDR tab and Fusion Map; saves `mobilityMode` |
 | `services/SimpleRanging.js` | RSSI → distance chain with the two Kalman filters |
 | `services/v2BeaconScannerService.js` | BLE scan hub, beacon slots, anchors |
