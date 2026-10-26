@@ -29,6 +29,7 @@ import React, {
   useState,
   useCallback,
   useMemo,
+  useLayoutEffect,
 } from "react";
 import {
   View,
@@ -43,6 +44,7 @@ import {
   Share,
   Animated,
   Easing,
+  Image,
 } from "react-native";
 import Svg, {
   Rect,
@@ -53,7 +55,6 @@ import Svg, {
   Defs,
   RadialGradient,
   Stop,
-  Image as SvgImage,
   G,
 } from "react-native-svg";
 import { fusionEngine } from "../../services/FusionEngine.js";
@@ -348,6 +349,31 @@ function MetricPill({ label, value, color = C.accent }) {
   );
 }
 
+// ─── Map markers (native views) ──────────────────────────────────────────────
+// The beacons, the user dot and its heading needle are native views over the
+// map, not Svg elements. They follow a pinch / drag through the same native
+// values that move the map (screen point = TX + Z * drawn point), so while
+// zooming they keep their size, stay sharp and need no redraw. Inside the Svg
+// they were redrawn with the whole map (a new full-size bitmap on Android) on
+// every heading tick, and grew with the map during a pinch, then jumped back.
+
+/** Native-driven screen position of a drawn (unzoomed) map point. */
+function useMapPoint(nav, px, py) {
+  const bx = Math.round(px * 10) / 10;
+  const by = Math.round(py * 10) / 10;
+  return useMemo(
+    () => [
+      { translateX: Animated.add(nav.TX, Animated.multiply(nav.Z, bx)) },
+      { translateY: Animated.add(nav.TY, Animated.multiply(nav.Z, by)) },
+    ],
+    [nav, bx, by]
+  );
+}
+
+const BEACON_HALO_PX = BEACON_RADIUS_PX * 2.2;
+const BEACON_BOX_W = 160;
+const BEACON_BOX_H = 2 * BEACON_HALO_PX + 30;
+
 // ─── Draggable Beacon Marker ─────────────────────────────────────────────────
 
 function BeaconMarker({
@@ -357,13 +383,15 @@ function BeaconMarker({
   worldPos,
   transform,
   roomH,
+  nav,
   draggable,
   deviceName,
   onDragEnd,
-  inv = 1,
-  dragScale,
+  getScale,
 }) {
   const [dragOffsetPx, setDragOffsetPx] = useState({ dx: 0, dy: 0 });
+  const onDragEndRef = useRef(onDragEnd);
+  onDragEndRef.current = onDragEnd;
 
   const panResponder = useMemo(
     () =>
@@ -377,73 +405,137 @@ function BeaconMarker({
           // Uses the EFFECTIVE on-screen scale, not the base one: while zoomed
           // in, a given finger travel covers fewer feet, and dividing by the
           // unzoomed scale would move the beacon much too far.
-          const sc = dragScale || transform.scale;
+          const sc = getScale();
           const dxFt = gesture.dx / sc;
           const dyFt = -gesture.dy / sc; // screen down = world Y down
           setDragOffsetPx({ dx: 0, dy: 0 });
-          onDragEnd(id, worldPos.x + dxFt, worldPos.y + dyFt);
+          onDragEndRef.current(id, worldPos.x + dxFt, worldPos.y + dyFt);
         },
       }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [draggable, transform.scale, dragScale, worldPos.x, worldPos.y]
+    [draggable, getScale, id, worldPos.x, worldPos.y]
   );
 
   const basePx = worldToScreen(worldPos.x, worldPos.y, transform, roomH);
-  const cx = basePx.cx + dragOffsetPx.dx;
-  const cy = basePx.cy + dragOffsetPx.dy;
+  const point = useMapPoint(nav, basePx.cx, basePx.cy);
   const subLabel = deviceName || `(${worldPos.x.toFixed(0)}, ${worldPos.y.toFixed(0)}) ft`;
 
   return (
-    <>
-      <Circle cx={cx} cy={cy} r={BEACON_RADIUS_PX * 2.2 * inv} fill={color} fillOpacity={0.18} />
-      <Circle
-        cx={cx}
-        cy={cy}
-        r={BEACON_RADIUS_PX * inv}
-        fill={color}
-        fillOpacity={0.95}
-        stroke={draggable ? "#fff" : "none"}
-        strokeWidth={draggable ? 2 * inv : 0}
-        {...panResponder.panHandlers}
+    <Animated.View
+      pointerEvents="box-none"
+      style={[
+        styles.beaconBox,
+        { left: -BEACON_BOX_W / 2 + dragOffsetPx.dx, top: -BEACON_BOX_H / 2 + dragOffsetPx.dy, transform: point },
+      ]}
+    >
+      <View
+        pointerEvents="none"
+        style={[styles.mapCircle, {
+          width: 2 * BEACON_HALO_PX, height: 2 * BEACON_HALO_PX, borderRadius: BEACON_HALO_PX,
+          left: BEACON_BOX_W / 2 - BEACON_HALO_PX, top: BEACON_BOX_H / 2 - BEACON_HALO_PX,
+          backgroundColor: color, opacity: 0.18,
+        }]}
       />
-      <SvgText x={cx} y={cy + 4.5 * inv} textAnchor="middle" fontSize={11 * inv} fill="#fff" fontWeight="bold">
-        {label}
-      </SvgText>
-      <SvgText x={cx} y={cy + (BEACON_RADIUS_PX + 13) * inv} textAnchor="middle" fontSize={9 * inv} fill={color}>
+      <View
+        pointerEvents={draggable ? "auto" : "none"}
+        style={[styles.mapCircle, styles.beaconCore, {
+          width: 2 * BEACON_RADIUS_PX, height: 2 * BEACON_RADIUS_PX, borderRadius: BEACON_RADIUS_PX,
+          left: BEACON_BOX_W / 2 - BEACON_RADIUS_PX, top: BEACON_BOX_H / 2 - BEACON_RADIUS_PX,
+          backgroundColor: color, borderWidth: draggable ? 2 : 0,
+        }]}
+        {...panResponder.panHandlers}
+      >
+        <Text style={styles.beaconLabel}>{label}</Text>
+      </View>
+      <Text
+        pointerEvents="none"
+        numberOfLines={1}
+        style={[styles.beaconSubLabel, { top: BEACON_BOX_H / 2 + BEACON_RADIUS_PX + 3, color }]}
+      >
         {subLabel}
-      </SvgText>
-    </>
+      </Text>
+    </Animated.View>
   );
 }
 
 // ─── Heading needle ──────────────────────────────────────────────────────────
-// Follows the heading by itself, 10x a second, redrawing only the needle.
-// Read from headingRef only when the map redrew, it lagged up to a second
-// behind a turn made standing still (nothing else redraws the map then) and
-// then jumped.
-function HeadingNeedle({ headingRef, fallbackDeg, cx, cy, lenPx, strokeWidth, opacity }) {
-  const [deg, setDeg] = useState(() => {
+// Rotated natively from headingRef 20x a second: no React render, no redraw.
+function HeadingNeedle({ headingRef, fallbackDeg, x, y, len, width, opacity }) {
+  const startDeg = () => {
     const h = headingRef?.current;
-    return Number.isFinite(h) ? h : fallbackDeg;
-  });
+    return Number.isFinite(h) ? h : Number.isFinite(fallbackDeg) ? fallbackDeg : 0;
+  };
+  const [rot] = useState(() => new Animated.Value(startDeg()));
   useEffect(() => {
+    // Native once, then setValue() turns the needle without a React render.
+    let last = startDeg();
+    Animated.timing(rot, { toValue: last, duration: 0, useNativeDriver: true }).start();
     if (!headingRef) return undefined;
     const id = setInterval(() => {
       const h = headingRef.current;
-      if (!Number.isFinite(h)) return;
-      setDeg((d) => (Number.isFinite(d) && Math.abs(((((h - d) % 360) + 540) % 360) - 180) < 1.5 ? d : h));
-    }, 100);
+      if (!Number.isFinite(h) || Math.abs(((((h - last) % 360) + 540) % 360) - 180) < 0.5) return;
+      last = h;
+      rot.setValue(h);
+    }, 50);
     return () => clearInterval(id);
-  }, [headingRef]);
-  const h = headingRef ? deg : fallbackDeg;
-  if (!Number.isFinite(h)) return null;
-  const rad = (h * Math.PI) / 180;
-  // World heading (0°=+Y/up, 90°=+X/right) -> screen delta (Y flipped)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [headingRef, rot]);
+  useEffect(() => {
+    if (!headingRef && Number.isFinite(fallbackDeg)) rot.setValue(fallbackDeg);
+  }, [headingRef, fallbackDeg, rot]);
+  // World heading (0°=+Y/up, 90°=+X/right) is clockwise on screen, as is rotate.
+  const spin = useMemo(
+    () => rot.interpolate({ inputRange: [-360, 360], outputRange: ["-360deg", "360deg"] }),
+    [rot]
+  );
+  const boxStyle = useMemo(
+    () => ({
+      position: "absolute", left: x - len, top: y - len, width: 2 * len, height: 2 * len,
+      opacity, transform: [{ rotate: spin }],
+    }),
+    [x, y, len, opacity, spin]
+  );
   return (
-    <Line
-      x1={cx} y1={cy} x2={cx + Math.sin(rad) * lenPx} y2={cy - Math.cos(rad) * lenPx}
-      stroke="#fff" strokeWidth={strokeWidth} strokeOpacity={opacity} strokeLinecap="round"
+    <Animated.View pointerEvents="none" style={boxStyle}>
+      <View
+        style={{
+          position: "absolute", left: len - width / 2, top: 0, width, height: len,
+          borderRadius: width / 2, backgroundColor: "#fff",
+        }}
+      />
+    </Animated.View>
+  );
+}
+
+// ─── User dot ────────────────────────────────────────────────────────────────
+// Opacity reflects confidence, never overstates certainty.
+const NEEDLE_LEN_PX = USER_DOT_RADIUS + 10;
+const DOT_BOX = 2 * NEEDLE_LEN_PX;
+
+function UserDotMarker({ nav, px, py, opacity, headingRef, fallbackDeg }) {
+  const point = useMapPoint(nav, px, py);
+  const circle = (r, color, alpha) => (
+    <View
+      style={[styles.mapCircle, {
+        width: 2 * r, height: 2 * r, borderRadius: r,
+        left: DOT_BOX / 2 - r, top: DOT_BOX / 2 - r,
+        backgroundColor: color, opacity: alpha,
+      }]}
     />
+  );
+  return (
+    <Animated.View
+      pointerEvents="none"
+      style={{ position: "absolute", left: -DOT_BOX / 2, top: -DOT_BOX / 2, width: DOT_BOX, height: DOT_BOX, transform: point }}
+    >
+      {circle(USER_DOT_RADIUS + 4, C.userDot, opacity * 0.25)}
+      {circle(USER_DOT_RADIUS, C.userDot, opacity)}
+      {circle(USER_DOT_RADIUS - 3, "#fff", opacity * 0.65)}
+      {/* Heading indicator — short needle pointing the way the user is facing */}
+      <HeadingNeedle
+        headingRef={headingRef} fallbackDeg={fallbackDeg}
+        x={DOT_BOX / 2} y={DOT_BOX / 2} len={NEEDLE_LEN_PX} width={2.5} opacity={opacity}
+      />
+    </Animated.View>
   );
 }
 
@@ -484,358 +576,76 @@ function SearchingOverlay({ label }) {
 
 // ─── Live Office Map SVG ─────────────────────────────────────────────────────
 
-function OfficeMapCanvas({
-  roomW,
-  roomH,
-  anchor1,
-  anchor2,
-  fusionState,
-  d1Ft,
-  d2Ft,
-  b1Name,
-  b2Name,
-  headingDeg,
-  headingRef = null,
-  placementMode,
-  onBeaconDragEnd,
-  view = { zoom: 1, cx: null, cy: null },
-  onViewChange,
-  onAnimateView,
-  onGestureActive,
-  navPhase = "idle",
-  // The walk that just ended (frozen at Stop): stays drawn until the next navigation starts.
-  lastTrail = null,
-  savedRoutesOnMap = [],
-  // Tap-to-choose: when on, a tap (not a drag) on the plan reports the tapped
-  // floor-plan point in feet through onMapTap.
-  pickMode = false,
-  onMapTap,
-  pendingPoint = null,
-  obstacles = [],
-  // "choosing": which of the two start spots the user picked ("A" | "B" | null).
-  startChoice = null,
-  // Position not known yet (locating / settling): no dot, halo or track -
-  // the searching animation instead.
-  searching = false,
-  searchLabel = "",
-  // Small panel at the bottom of the map (the A/B choice), so it is in view
-  // without scrolling.
-  bottomPanel = null,
-}) {
-  const {
-    x, y, uncertaintyRadius, trail,
-    totalDistanceFt = 0,
-    netDisplacementFt = 0,
-    isWalking = false,
-    positionAmbiguous = false,
-    alternatePosition = null,
-  } = fusionState;
-  const canvasHeight = Math.min(CANVAS_SIZE * (roomH / roomW), CANVAS_SIZE * 1.6);
+const DEFAULT_VIEW = { zoom: 1, cx: null, cy: null };
 
-  // ── Viewport model ───────────────────────────────────────────────────────
-  // The view is described by WHICH WORLD POINT SITS AT THE CENTRE plus a zoom
-  // factor, rather than by a pixel pan offset. That distinction matters: with a
-  // pixel offset, the point that stays still while zooming is whichever point
-  // was centred in the UNPANNED view, so zooming after panning visibly drifts
-  // the map away under your finger. Anchoring on the centred world point makes
-  // zoom stable wherever you have scrolled to, and makes "centre on me" and
-  // "reset" trivial instead of inverse-transform arithmetic.
-  const baseTransform = useMemo(
-    () => computeTransform(roomW, roomH, CANVAS_SIZE, canvasHeight),
-    [roomW, roomH, canvasHeight]
-  );
-
+/**
+ * The view (centred world point + zoom) as a transform of the drawn map: that
+ * point placed at the canvas centre, at the requested magnification. Derived
+ * from the point's BASE screen position, so it is right for any room shape.
+ * A drawn (unzoomed) point p appears at (tx + z * p.cx, ty + z * p.cy).
+ */
+function computeViewTransform(view, baseTransform, roomW, roomH, canvasHeight) {
   const zoom = view.zoom ?? 1;
-  const centreX = Number.isFinite(view.cx) ? view.cx : roomW / 2;
-  const centreY = Number.isFinite(view.cy) ? view.cy : roomH / 2;
+  const cx = Number.isFinite(view.cx) ? view.cx : roomW / 2;
+  const cy = Number.isFinite(view.cy) ? view.cy : roomH / 2;
+  const basePt = worldToScreen(cx, cy, baseTransform, roomH);
+  return {
+    tx: MAP_PADDING + CANVAS_SIZE / 2 - zoom * basePt.cx,
+    ty: MAP_PADDING + canvasHeight / 2 - zoom * basePt.cy,
+    z: zoom,
+  };
+}
 
-  // Everything is drawn ONCE at the fit-to-canvas scale, and zoom/pan are
-  // applied as a single SVG group transform on top.
-  //
-  // The earlier version folded zoom into the coordinates of every element, so
-  // each pinch frame re-derived roughly seventy grid lines plus every marker in
-  // JavaScript before React could re-render them — which is why the gesture
-  // stuttered instead of tracking the fingers. With a group transform the grid
-  // is computed once and the only thing changing per frame is one transform
-  // string, which the SVG layer applies natively.
-  const transform = baseTransform;
+// ─── Map line layer ──────────────────────────────────────────────────────────
+// Grid, obstacles, routes, the walked path, range rings and halo: the thin
+// lines, drawn as an Svg at one fixed view `vt` (stroke widths are divided by
+// its zoom so they stay thin on screen). The floor-plan image, the dot and the
+// beacons are native views instead (see OfficeMapCanvas).
+const MapLineLayer = React.memo(function MapLineLayer({
+  width, height, roomW, roomH, transform, vt,
+  obstacles, obstacleVer, savedRoutesOnMap, lastTrail, live,
+}) {
+  const inv = 1 / vt.z;
+  const toScreen = (wx, wy) => worldToScreen(wx, wy, transform, roomH);
 
-  // Group transform: place the centred world point at the canvas centre, at the
-  // requested magnification. Derived from the point's BASE screen position, so
-  // it stays correct however the room is shaped.
-  const viewTransform = useMemo(() => {
-    const basePt = worldToScreen(centreX, centreY, baseTransform, roomH);
-    const targetX = MAP_PADDING + CANVAS_SIZE / 2;
-    const targetY = MAP_PADDING + canvasHeight / 2;
-    return {
-      tx: targetX - zoom * basePt.cx,
-      ty: targetY - zoom * basePt.cy,
-      z: zoom,
+  // Everything that does not change while walking, built once per view.
+  const still = useMemo(() => {
+    const roomPx = {
+      x: MAP_PADDING + transform.offsetX,
+      y: MAP_PADDING + transform.offsetY,
+      w: roomW * transform.scale,
+      h: roomH * transform.scale,
     };
-  }, [baseTransform, centreX, centreY, roomH, canvasHeight, zoom]);
-
-  // Effective on-screen scale, for converting gesture pixels into feet.
-  const effectiveScale = baseTransform.scale * zoom;
-
-  // Markers and strokes are counter-scaled so they keep a constant on-screen
-  // size: a user dot that grew with zoom would swamp the map at 8x, and hairline
-  // grid strokes would turn into thick bars.
-  const inv = 1 / zoom;
-
-  // ── Gestures: drag to pan, pinch to zoom ────────────────────────────────
-  // Live values are mirrored into refs so the responder can be created ONCE.
-  // Rebuilding it whenever the view changes (which is every frame of a drag)
-  // tears down the gesture that is currently in progress, which is what made
-  // dragging stutter and sometimes stop dead mid-swipe.
-  const viewRef = useRef(view);
-  viewRef.current = view;
-  const scaleRef = useRef(effectiveScale);
-  scaleRef.current = effectiveScale;
-  const placementRef = useRef(placementMode);
-  placementRef.current = placementMode;
-  const gestureRef = useRef({ startView: null, startDist: 0, pinching: false, sawPinch: false });
-  const pickRef = useRef(pickMode);
-  pickRef.current = pickMode;
-  const onMapTapRef = useRef(onMapTap);
-  onMapTapRef.current = onMapTap;
-  const wrapperRef = useRef(null);
-  const tapGeomRef = useRef(null); // { viewTransform, transform, roomW, roomH }
-  // Must come AFTER the useRef above. Assigning it earlier crashed the whole
-  // Fusion Map ("Cannot set property 'current' of undefined"): Metro compiles
-  // const to var, so the ref was still undefined at that point.
-  tapGeomRef.current = { viewTransform, transform: baseTransform, roomW, roomH };
-
-  // Screen tap -> floor-plan feet. Inverts exactly what rendering does: the
-  // wrapper's position on the page (and its 1 px border), then the zoom/pan
-  // group transform, then worldToScreen.
-  const reportTap = (pageX, pageY) => {
-    const node = wrapperRef.current;
-    if (!node || typeof node.measure !== "function") return;
-    node.measure((_fx, _fy, _w, _h, px, py) => {
-      const g = tapGeomRef.current;
-      if (!g || !Number.isFinite(px) || !Number.isFinite(py)) return;
-      const lx = pageX - px - 1;
-      const ly = pageY - py - 1;
-      const bx = (lx - g.viewTransform.tx) / g.viewTransform.z;
-      const by = (ly - g.viewTransform.ty) / g.viewTransform.z;
-      const wx = (bx - MAP_PADDING - g.transform.offsetX) / g.transform.scale;
-      const wy = g.roomH - (by - MAP_PADDING - g.transform.offsetY) / g.transform.scale;
-      const margin = 3; // allow a slightly-off tap at the wall
-      if (wx < -margin || wx > g.roomW + margin || wy < -margin || wy > g.roomH + margin) return;
-      onMapTapRef.current?.(clamp(wx, 0, g.roomW), clamp(wy, 0, g.roomH));
-    });
-  };
-
-  const touchDistance = (touches) =>
-    Math.hypot(touches[0].pageX - touches[1].pageX, touches[0].pageY - touches[1].pageY);
-
-  const mapPanResponder = useMemo(
-    () =>
-      PanResponder.create({
-        // Crucially FALSE. Claiming the touch on press meant every tap was
-        // swallowed before it reached the zoom buttons sitting on top of the
-        // map, so those buttons simply did nothing. The map only takes over
-        // once the finger actually moves, which leaves taps to the buttons.
-        //
-        // The exception is pick mode, where a TAP is the input: the map claims
-        // the touch on press so it can tell a tap from a drag on release. The
-        // zoom buttons still work, because they are deeper in the tree and the
-        // deepest view is asked first.
-        onStartShouldSetPanResponder: () => pickRef.current,
-        onStartShouldSetPanResponderCapture: () => false,
-        onMoveShouldSetPanResponder: (evt, g) => {
-          if (placementRef.current) return false; // markers own the drag there
-          if (evt.nativeEvent.touches?.length === 2) return true;
-          return Math.abs(g.dx) > 4 || Math.abs(g.dy) > 4;
-        },
-        onPanResponderGrant: (evt) => {
-          // Freeze the page scroll for the duration. The map lives inside a
-          // ScrollView, and without this a mostly-vertical drag is claimed by
-          // the scroll view instead of panning the map — which is the other
-          // half of why the gesture felt unreliable.
-          onGestureActive?.(true);
-          gestureRef.current.startView = { ...viewRef.current };
-          const t = evt.nativeEvent.touches || [];
-          gestureRef.current.pinching = t.length === 2;
-          gestureRef.current.sawPinch = t.length === 2;
-          gestureRef.current.startDist = t.length === 2 ? touchDistance(t) : 0;
-        },
-        onPanResponderMove: (evt, g) => {
-          const start = gestureRef.current.startView;
-          if (!start) return;
-          const t = evt.nativeEvent.touches || [];
-
-          if (t.length === 2) {
-            // A pinch can begin part-way through a drag, so capture its
-            // reference separation the first time two fingers are seen.
-            if (!gestureRef.current.pinching) {
-              gestureRef.current.pinching = true;
-              gestureRef.current.sawPinch = true;
-              gestureRef.current.startDist = touchDistance(t);
-              gestureRef.current.startView = { ...viewRef.current };
-              return;
-            }
-            const d = touchDistance(t);
-            if (gestureRef.current.startDist > 10 && d > 10) {
-              const next = clamp(
-                (gestureRef.current.startView.zoom ?? 1) * (d / gestureRef.current.startDist),
-                MIN_ZOOM,
-                MAX_ZOOM
-              );
-              onViewChange?.({ ...viewRef.current, zoom: next });
-            }
-            return;
-          }
-
-          if (gestureRef.current.pinching) return; // ignore the leftover finger
-          // Drag: moving the finger right should move the MAP right, which
-          // means the centred world point moves left — hence the negated dx.
-          const sc = scaleRef.current || 1;
-          const startCx = Number.isFinite(start.cx) ? start.cx : roomW / 2;
-          const startCy = Number.isFinite(start.cy) ? start.cy : roomH / 2;
-          onViewChange?.({
-            zoom: start.zoom ?? 1,
-            cx: clamp(startCx - g.dx / sc, 0, roomW),
-            cy: clamp(startCy + g.dy / sc, 0, roomH),
-          });
-        },
-        onPanResponderRelease: (_evt, g) => {
-          const wasPinch = gestureRef.current.sawPinch;
-          gestureRef.current.pinching = false;
-          gestureRef.current.sawPinch = false;
-          onGestureActive?.(false);
-          // A finger that barely moved is a tap, anything more was a pan.
-          if (pickRef.current && !wasPinch && Math.abs(g.dx) < 8 && Math.abs(g.dy) < 8) {
-            reportTap(g.x0, g.y0);
-          }
-        },
-        onPanResponderTerminate: () => {
-          gestureRef.current.pinching = false;
-          onGestureActive?.(false);
-        },
-        // Hold the gesture against the enclosing ScrollView, which would
-        // otherwise steal a vertical drag half-way through a pan.
-        onPanResponderTerminationRequest: () => false,
-      }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [roomW, roomH, onViewChange, onGestureActive]
-  );
-
-  const toScreen = useCallback(
-    (wx, wy) => worldToScreen(wx, wy, transform, roomH),
-    [transform, roomH]
-  );
-
-  const roomPx = {
-    x: MAP_PADDING + transform.offsetX,
-    y: MAP_PADDING + transform.offsetY,
-    w: roomW * transform.scale,
-    h: roomH * transform.scale,
-  };
-
-  const userPx = toScreen(x, y);
-  const haloPx = uncertaintyRadius * transform.scale;
-  const quality = getPositionQuality(uncertaintyRadius);
-
-  const trailPoints = trail
-    .map((pt) => {
-      const { cx, cy } = toScreen(pt.x, pt.y);
-      return `${cx.toFixed(1)},${cy.toFixed(1)}`;
-    })
-    .join(" ");
-
-  const b1px = toScreen(anchor1.x, anchor1.y);
-  const b2px = toScreen(anchor2.x, anchor2.y);
-  const ring1Px = Number.isFinite(d1Ft) && d1Ft > 0 ? d1Ft * transform.scale : null;
-  const ring2Px = Number.isFinite(d2Ft) && d2Ft > 0 ? d2Ft * transform.scale : null;
-
-  // ── Static grid ──────────────────────────────────────────────────────────
-  // Split into minor lines, major lines and labels, and the line elements carry
-  // NO stroke props of their own. Stroke colour and width are set on the
-  // enclosing group instead, so keeping hairlines hairline while zoomed costs a
-  // single changed prop rather than rebuilding every line. This memo therefore
-  // depends only on the room and the base transform — it does not re-run while
-  // pinching, which is what made the gesture smooth.
-  const gridMinor = useMemo(() => {
-    const out = [];
+    const minor = [];
+    const major = [];
     for (let gx = 0; gx <= roomW + 0.001; gx += GRID_MINOR_FT) {
-      if (Math.round(gx) % GRID_MAJOR_FT === 0) continue;
       const { cx } = toScreen(gx, 0);
-      out.push(<Line key={`vg${gx}`} x1={cx} y1={roomPx.y} x2={cx} y2={roomPx.y + roomPx.h} />);
+      (Math.round(gx) % GRID_MAJOR_FT === 0 ? major : minor).push(
+        <Line key={`v${gx}`} x1={cx} y1={roomPx.y} x2={cx} y2={roomPx.y + roomPx.h} />
+      );
     }
     for (let gy = 0; gy <= roomH + 0.001; gy += GRID_MINOR_FT) {
-      if (Math.round(gy) % GRID_MAJOR_FT === 0) continue;
       const { cy } = toScreen(0, gy);
-      out.push(<Line key={`hg${gy}`} x1={roomPx.x} y1={cy} x2={roomPx.x + roomPx.w} y2={cy} />);
+      (Math.round(gy) % GRID_MAJOR_FT === 0 ? major : minor).push(
+        <Line key={`h${gy}`} x1={roomPx.x} y1={cy} x2={roomPx.x + roomPx.w} y2={cy} />
+      );
     }
-    return out;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomW, roomH, transform.scale, transform.offsetX, transform.offsetY]);
-
-  const gridMajor = useMemo(() => {
-    const out = [];
-    for (let gx = 0; gx <= roomW + 0.001; gx += GRID_MAJOR_FT) {
-      const { cx } = toScreen(gx, 0);
-      out.push(<Line key={`vG${gx}`} x1={cx} y1={roomPx.y} x2={cx} y2={roomPx.y + roomPx.h} />);
-    }
-    for (let gy = 0; gy <= roomH + 0.001; gy += GRID_MAJOR_FT) {
-      const { cy } = toScreen(0, gy);
-      out.push(<Line key={`hG${gy}`} x1={roomPx.x} y1={cy} x2={roomPx.x + roomPx.w} y2={cy} />);
-    }
-    return out;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomW, roomH, transform.scale, transform.offsetX, transform.offsetY]);
-
-  // Labels are counter-scaled so they stay readable rather than growing with
-  // zoom. There are only a handful, so recomputing them per zoom step is cheap.
-  const gridLabels = useMemo(() => {
-    const out = [];
+    const labels = [];
     for (let gx = GRID_MAJOR_FT; gx <= roomW + 0.001; gx += GRID_MAJOR_FT) {
       const { cx } = toScreen(gx, 0);
-      out.push(
+      labels.push(
         <SvgText
           key={`vgl${gx}`} x={cx} y={roomPx.y - 4 * inv}
           textAnchor="middle" fontSize={8 * inv} fill={C.textMuted}
         >{gx}</SvgText>
       );
     }
-    return out;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomW, transform.scale, transform.offsetX, transform.offsetY, inv]);
-
-  return (
-    <View ref={wrapperRef} collapsable={false} style={styles.mapCanvasWrapper} {...mapPanResponder.panHandlers}>
-      <Svg width={MAP_SIZE} height={canvasHeight + MAP_PADDING * 2}>
-        <Defs>
-          <RadialGradient id="haloGrad" cx="50%" cy="50%" r="50%">
-            <Stop offset="0%" stopColor={quality.color} stopOpacity="0.30" />
-            <Stop offset="70%" stopColor={quality.color} stopOpacity="0.10" />
-            <Stop offset="100%" stopColor={quality.color} stopOpacity="0.00" />
-          </RadialGradient>
-        </Defs>
-
-        {/* Everything below is drawn at the fit-to-canvas scale; this single
-            group transform supplies zoom and pan. Keeping it as one transform
-            is what makes pinching smooth — the alternative, folding zoom into
-            every element's coordinates, rebuilt the whole grid in JS on every
-            frame of the gesture. */}
-        <G transform={`translate(${viewTransform.tx} ${viewTransform.ty}) scale(${viewTransform.z})`}>
-
-        {/* ── Real floor plan background ── */}
-        <SvgImage
-          x={roomPx.x}
-          y={roomPx.y}
-          width={roomPx.w}
-          height={roomPx.h}
-          href={FLOORPLAN_IMAGE}
-          preserveAspectRatio="none"
-          opacity={0.92}
-        />
-
+    return (
+      <>
         {/* ── Grid overlay (2 ft minor / 10 ft major, matches floor plan's own grid) ── */}
-        <G stroke={C.gridMinor} strokeWidth={0.4 * inv}>{gridMinor}</G>
-        <G stroke={C.gridMajor} strokeWidth={0.9 * inv}>{gridMajor}</G>
-        {gridLabels}
+        <G stroke={C.gridMinor} strokeWidth={0.4 * inv}>{minor}</G>
+        <G stroke={C.gridMajor} strokeWidth={0.9 * inv}>{major}</G>
+        {labels}
 
         {/* ── Room boundary ── */}
         <Rect
@@ -843,23 +653,7 @@ function OfficeMapCanvas({
           fill="none" stroke={C.border} strokeWidth={1.5} rx={2}
         />
 
-        {/* ── "You're roughly here" proximity rings (NOT a precise fix) ── */}
-        {ring1Px !== null && (
-          <Circle
-            cx={b1px.cx} cy={b1px.cy} r={ring1Px}
-            fill="none" stroke={C.beacon1} strokeWidth={1.5}
-            strokeDasharray={`${6 * inv},${5 * inv}`} strokeOpacity={0.55}
-          />
-        )}
-        {ring2Px !== null && (
-          <Circle
-            cx={b2px.cx} cy={b2px.cy} r={ring2Px}
-            fill="none" stroke={C.beacon2} strokeWidth={1.5}
-            strokeDasharray={`${6 * inv},${5 * inv}`} strokeOpacity={0.55}
-          />
-        )}
-
-        {/* ── Obstacles (walls, glass, pillars, cabinets) ──────────────────── */}
+        {/* ── Obstacles (walls, glass, pillars, cabinets) ── */}
         {obstacles.map((o) => {
           const t = EDIT_TYPES.find((k) => k.key === o.type);
           const color = t?.color || C.textSecondary;
@@ -900,9 +694,8 @@ function OfficeMapCanvas({
         })}
 
         {/* ── Saved routes ─────────────────────────────────────────────────
-            Drawn beneath the live trail, dashed, with a start dot and an end
-            ring, so a recorded route is clearly a record and not the walk in
-            progress. */}
+            Dashed, with a start dot and an end ring, so a recorded route is
+            clearly a record and not the walk in progress. */}
         {savedRoutesOnMap.map((r) => {
           if (!r.points || r.points.length < 2) return null;
           const pts = r.points.map((pt) => toScreen(pt.x, pt.y));
@@ -922,23 +715,51 @@ function OfficeMapCanvas({
           );
         })}
 
-        {/* ── PDR path: the route actually walked ──────────────────────────
-            Only drawn while navigating. Before that there is no journey to
-            show, and rendering a stub of a trail during the locating phase
-            would suggest movement the user has not made. */}
-        {navPhase === "navigating" && !searching && trail.length > 1 && (
-          <Polyline
-            points={trailPoints}
-            fill="none" stroke={C.trail} strokeWidth={3 * inv}
-            strokeOpacity={0.85} strokeLinecap="round" strokeLinejoin="round"
-          />
-        )}
         {/* The last walk, kept after Stop until the next navigation begins. */}
-        {navPhase !== "navigating" && lastTrail && lastTrail.length > 1 && (
+        {lastTrail && lastTrail.length > 1 && (
           <Polyline
             points={lastTrail.map((pt) => { const { cx, cy } = toScreen(pt.x, pt.y); return `${cx.toFixed(1)},${cy.toFixed(1)}`; }).join(" ")}
             fill="none" stroke={C.trail} strokeWidth={3 * inv}
             strokeOpacity={0.6} strokeLinecap="round" strokeLinejoin="round"
+          />
+        )}
+      </>
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomW, roomH, transform, vt, obstacles, obstacleVer, savedRoutesOnMap, lastTrail]);
+
+  const { userPx, alt, pending } = live;
+
+  return (
+    <Svg width={width} height={height} pointerEvents="none">
+      <Defs>
+        <RadialGradient id="haloGrad" cx="50%" cy="50%" r="50%">
+          <Stop offset="0%" stopColor={live.haloColor} stopOpacity="0.30" />
+          <Stop offset="70%" stopColor={live.haloColor} stopOpacity="0.10" />
+          <Stop offset="100%" stopColor={live.haloColor} stopOpacity="0.00" />
+        </RadialGradient>
+      </Defs>
+      <G transform={`translate(${vt.tx} ${vt.ty}) scale(${vt.z})`}>
+        {still}
+
+        {/* ── "You're roughly here" proximity rings (NOT a precise fix) ── */}
+        {live.rings.map((r) => (
+          <Circle
+            key={r.key} cx={r.cx} cy={r.cy} r={r.r}
+            fill="none" stroke={r.color} strokeWidth={1.5}
+            strokeDasharray={`${6 * inv},${5 * inv}`} strokeOpacity={0.55}
+          />
+        ))}
+
+        {/* ── PDR path: the route actually walked ──────────────────────────
+            Only drawn while navigating. Before that there is no journey to
+            show, and rendering a stub of a trail during the locating phase
+            would suggest movement the user has not made. */}
+        {live.trailPoints && (
+          <Polyline
+            points={live.trailPoints}
+            fill="none" stroke={C.trail} strokeWidth={3 * inv}
+            strokeOpacity={0.85} strokeLinecap="round" strokeLinejoin="round"
           />
         )}
 
@@ -947,12 +768,11 @@ function OfficeMapCanvas({
             which one you are standing on. Drawing the second candidate is more
             honest than picking one at random and rendering it like a certainty
             — and it shows the user immediately which way to walk to settle it. */}
-        {positionAmbiguous && alternatePosition && !searching && (() => {
-          const altPx = toScreen(alternatePosition.x, alternatePosition.y);
+        {alt && (() => {
           // Asking "where are you?": both spots labelled, the chosen one ringed.
-          if (navPhase === "choosing") {
+          if (live.choosing) {
             const spot = (p, label) => {
-              const on = startChoice === label;
+              const on = live.startChoice === label;
               const r = (USER_DOT_RADIUS + 7) * inv;
               return (
                 <G key={`choice-${label}`}>
@@ -972,29 +792,29 @@ function OfficeMapCanvas({
             return (
               <>
                 <Line
-                  x1={userPx.cx} y1={userPx.cy} x2={altPx.cx} y2={altPx.cy}
+                  x1={userPx.cx} y1={userPx.cy} x2={alt.cx} y2={alt.cy}
                   stroke={C.textMuted} strokeWidth={1.5 * inv}
                   strokeDasharray={`${5 * inv},${5 * inv}`} strokeOpacity={0.5}
                 />
                 {spot(userPx, "A")}
-                {spot(altPx, "B")}
+                {spot(alt, "B")}
               </>
             );
           }
           return (
             <>
               <Line
-                x1={userPx.cx} y1={userPx.cy} x2={altPx.cx} y2={altPx.cy}
+                x1={userPx.cx} y1={userPx.cy} x2={alt.cx} y2={alt.cy}
                 stroke={C.textMuted} strokeWidth={1.5 * inv}
                 strokeDasharray={`${5 * inv},${5 * inv}`} strokeOpacity={0.5}
               />
               <Circle
-                cx={altPx.cx} cy={altPx.cy} r={USER_DOT_RADIUS * inv}
+                cx={alt.cx} cy={alt.cy} r={USER_DOT_RADIUS * inv}
                 fill="none" stroke={C.textMuted} strokeWidth={2.5 * inv}
                 strokeDasharray={`${4 * inv},${3 * inv}`} strokeOpacity={0.85}
               />
               <SvgText
-                x={altPx.cx} y={altPx.cy + 4 * inv} fontSize={11 * inv} fontWeight="700"
+                x={alt.cx} y={alt.cy + 4 * inv} fontSize={11 * inv} fontWeight="700"
                 fill={C.textMuted} textAnchor="middle"
               >?</SvgText>
             </>
@@ -1002,73 +822,535 @@ function OfficeMapCanvas({
         })()}
 
         {/* ── Uncertainty halo — grows honestly when the fix is unreliable ── */}
-        {!searching && haloPx > 3 && (
-          <Circle cx={userPx.cx} cy={userPx.cy} r={Math.min(haloPx, CANVAS_SIZE)} fill="url(#haloGrad)" />
+        {live.halo && (
+          <Circle cx={live.halo.cx} cy={live.halo.cy} r={live.halo.r} fill="url(#haloGrad)" />
         )}
 
-        {/* ── Beacon markers (draggable in placement mode) ── */}
-        <BeaconMarker
-          id={1} label="B1" color={C.beacon1} worldPos={anchor1}
-          transform={transform} roomH={roomH} draggable={placementMode}
-          inv={inv} dragScale={effectiveScale}
-          deviceName={b1Name} onDragEnd={onBeaconDragEnd}
-        />
-        <BeaconMarker
-          id={2} label="B2" color={C.beacon2} worldPos={anchor2}
-          transform={transform} roomH={roomH} draggable={placementMode}
-          inv={inv} dragScale={effectiveScale}
-          deviceName={b2Name} onDragEnd={onBeaconDragEnd}
-        />
-
-        {/* ── Fused user position — opacity reflects confidence, never overstates certainty ── */}
-        {!placementMode && !searching && (
-          <>
-            <Circle cx={userPx.cx} cy={userPx.cy} r={(USER_DOT_RADIUS + 4) * inv} fill={C.userDot} fillOpacity={quality.dotOpacity * 0.25} />
-            <Circle cx={userPx.cx} cy={userPx.cy} r={USER_DOT_RADIUS * inv} fill={C.userDot} fillOpacity={quality.dotOpacity} />
-            <Circle cx={userPx.cx} cy={userPx.cy} r={(USER_DOT_RADIUS - 3) * inv} fill="#fff" fillOpacity={quality.dotOpacity * 0.65} />
-            {/* Heading indicator — short needle pointing the way the user is facing */}
-            <HeadingNeedle
-              headingRef={headingRef} fallbackDeg={headingDeg}
-              cx={userPx.cx} cy={userPx.cy} lenPx={(USER_DOT_RADIUS + 10) * inv}
-              strokeWidth={2.5 * inv} opacity={quality.dotOpacity}
-            />
-          </>
-        )}
         {/* ── Start point the user tapped (not yet confirmed) ── */}
-        {pendingPoint && (() => {
-          const p = toScreen(pendingPoint.x, pendingPoint.y);
+        {pending && (() => {
           const r = 11 * inv;
           return (
             <G>
-              <Circle cx={p.cx} cy={p.cy} r={r * 1.9} fill={C.accent} fillOpacity={0.15} />
-              <Circle cx={p.cx} cy={p.cy} r={r} fill="none" stroke={C.accent} strokeWidth={2.5 * inv} />
-              <Line x1={p.cx - r * 1.6} y1={p.cy} x2={p.cx + r * 1.6} y2={p.cy} stroke={C.accent} strokeWidth={1.5 * inv} />
-              <Line x1={p.cx} y1={p.cy - r * 1.6} x2={p.cx} y2={p.cy + r * 1.6} stroke={C.accent} strokeWidth={1.5 * inv} />
-              <SvgText x={p.cx} y={p.cy - r * 2.2} textAnchor="middle" fontSize={10 * inv} fill={C.accent} fontWeight="bold">
+              <Circle cx={pending.cx} cy={pending.cy} r={r * 1.9} fill={C.accent} fillOpacity={0.15} />
+              <Circle cx={pending.cx} cy={pending.cy} r={r} fill="none" stroke={C.accent} strokeWidth={2.5 * inv} />
+              <Line x1={pending.cx - r * 1.6} y1={pending.cy} x2={pending.cx + r * 1.6} y2={pending.cy} stroke={C.accent} strokeWidth={1.5 * inv} />
+              <Line x1={pending.cx} y1={pending.cy - r * 1.6} x2={pending.cx} y2={pending.cy + r * 1.6} stroke={C.accent} strokeWidth={1.5 * inv} />
+              <SvgText x={pending.cx} y={pending.cy - r * 2.2} textAnchor="middle" fontSize={10 * inv} fill={C.accent} fontWeight="bold">
                 START
               </SvgText>
             </G>
           );
         })()}
-        </G>
-      </Svg>
+      </G>
+    </Svg>
+  );
+});
+
+function OfficeMapCanvas({
+  roomW,
+  roomH,
+  anchor1,
+  anchor2,
+  fusionState,
+  d1Ft,
+  d2Ft,
+  b1Name,
+  b2Name,
+  headingDeg,
+  headingRef = null,
+  placementMode,
+  onBeaconDragEnd,
+  onGestureActive,
+  navPhase = "idle",
+  // The walk that just ended (frozen at Stop): stays drawn until the next navigation starts.
+  lastTrail = null,
+  savedRoutesOnMap = [],
+  // Tap-to-choose: when on, a tap (not a drag) on the plan reports the tapped
+  // floor-plan point in feet through onMapTap.
+  pickMode = false,
+  onMapTap,
+  pendingPoint = null,
+  obstacles = [],
+  // Bumped whenever obstacles change (the list is edited in place).
+  obstacleVer = 0,
+  // "choosing": which of the two start spots the user picked ("A" | "B" | null).
+  startChoice = null,
+  // Position not known yet (locating / settling): no dot, halo or track -
+  // the searching animation instead.
+  searching = false,
+  searchLabel = "",
+  // Small panel at the bottom of the map (the A/B choice), so it is in view
+  // without scrolling.
+  bottomPanel = null,
+}) {
+  const {
+    x, y, uncertaintyRadius, trail,
+    totalDistanceFt = 0,
+    netDisplacementFt = 0,
+    isWalking = false,
+    positionAmbiguous = false,
+    alternatePosition = null,
+  } = fusionState;
+  const canvasHeight = Math.min(CANVAS_SIZE * (roomH / roomW), CANVAS_SIZE * 1.6);
+  const W = MAP_SIZE;
+  const H = canvasHeight + MAP_PADDING * 2;
+
+  // ── Viewport model ───────────────────────────────────────────────────────
+  // The view is described by WHICH WORLD POINT SITS AT THE CENTRE plus a zoom
+  // factor, rather than by a pixel pan offset. With a pixel offset, the point
+  // that stays still while zooming is whichever point was centred in the
+  // UNPANNED view, so zooming after panning drifts the map away under your
+  // finger. Anchoring on the centred world point keeps zoom stable wherever you
+  // have scrolled to, and makes "centre on me" and "reset" trivial.
+  const baseTransform = useMemo(
+    () => computeTransform(roomW, roomH, CANVAS_SIZE, canvasHeight),
+    [roomW, roomH, canvasHeight]
+  );
+  const transform = baseTransform;
+
+  // ── Zoom / pan without redrawing ─────────────────────────────────────────
+  // The view shown is three native values: Z (zoom) and TX/TY, a drawn point p
+  // appearing at TX + Z * p. Pinch, drag and the zoom buttons change only
+  // these (setValue / native-driver animations): no React render and no Svg
+  // redraw per frame - each frame used to redraw the whole map, which is what
+  // made zooming lag.
+  //   • floor-plan image: a native image scaled by Z - sharp at any zoom;
+  //   • dot, needle, beacons: native views placed at TX + Z * p - same size
+  //     at any zoom;
+  //   • thin lines (Svg): drawn at one view and scaled to the view shown. After
+  //     a zoom they are drawn again at the new view in a SECOND, hidden copy,
+  //     which is swapped in once drawn - so the redraw is never seen, and both
+  //     copies always sit exactly where the map is.
+  const liveRef = useRef(DEFAULT_VIEW); // the view shown (or being animated to)
+  const geomRef = useRef(null);
+  geomRef.current = { base: baseTransform, roomW, roomH, canvasHeight };
+  const [nav] = useState(() => ({
+    Z: new Animated.Value(1),
+    TX: new Animated.Value(0),
+    TY: new Animated.Value(0),
+    O: [new Animated.Value(1), new Animated.Value(0)],
+  }));
+  const vtOf = useCallback((v) => {
+    const g = geomRef.current;
+    return computeViewTransform(v, g.base, g.roomW, g.roomH, g.canvasHeight);
+  }, []);
+  const showLive = useCallback((v) => {
+    liveRef.current = v;
+    const vt = vtOf(v);
+    nav.Z.setValue(vt.z);
+    nav.TX.setValue(vt.tx);
+    nav.TY.setValue(vt.ty);
+  }, [nav, vtOf]);
+  // Placed again whenever the room / canvas geometry changes (and at mount).
+  useLayoutEffect(() => {
+    showLive(liveRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [baseTransform, canvasHeight]);
+  useEffect(() => {
+    // Native once; from then on setValue() moves the map without going through React.
+    const vt = vtOf(liveRef.current);
+    const now = (v, toValue) => Animated.timing(v, { toValue, duration: 0, useNativeDriver: true });
+    Animated.parallel([
+      now(nav.Z, vt.z), now(nav.TX, vt.tx), now(nav.TY, vt.ty), now(nav.O[0], 1), now(nav.O[1], 0),
+    ]).start();
+  }, [nav, vtOf]);
+
+  // The two copies of the line layer: the view each is drawn at, and whether it
+  // is drawn at all (the hidden copy is emptied once it is not needed).
+  const [bufs, setBufs] = useState(() => [
+    { view: DEFAULT_VIEW, show: true, token: 0 },
+    { view: DEFAULT_VIEW, show: false, token: 0 },
+  ]);
+  const frontRef = useRef(0);
+  const swapRef = useRef(null); // { back, token } while a new drawing is prepared
+  const tokenRef = useRef(0);
+  const hideTimerRef = useRef(null);
+
+  // Redraw the lines at the view now shown, in the hidden copy.
+  const commitView = useCallback((v) => {
+    liveRef.current = v;
+    const back = 1 - frontRef.current;
+    const token = ++tokenRef.current;
+    swapRef.current = { back, token };
+    setBufs((b) => {
+      const n = b.slice();
+      n[back] = { view: v, show: true, token };
+      return n;
+    });
+  }, []);
+  // Once the hidden copy has been drawn (a few frames), swap the two in one step.
+  useLayoutEffect(() => {
+    const p = swapRef.current;
+    if (!p || bufs[p.back].token !== p.token) return undefined;
+    let raf = null;
+    let frames = 0;
+    const tick = () => {
+      if (++frames < 3) {
+        raf = requestAnimationFrame(tick);
+        return;
+      }
+      if (swapRef.current !== p) return;
+      swapRef.current = null;
+      const old = frontRef.current;
+      // Both in the same native batch, so they change in the same frame.
+      nav.O[p.back].setValue(1);
+      nav.O[old].setValue(0);
+      frontRef.current = p.back;
+      // Empty the old copy a little later (it is invisible already).
+      clearTimeout(hideTimerRef.current);
+      hideTimerRef.current = setTimeout(() => {
+        setBufs((b) => {
+          if (frontRef.current === old || swapRef.current?.back === old || !b[old].show) return b;
+          const n = b.slice();
+          n[old] = { ...n[old], show: false };
+          return n;
+        });
+      }, 300);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [bufs, nav]);
+
+  const bufVts = useMemo(
+    () => bufs.map((b) => computeViewTransform(b.view, baseTransform, roomW, roomH, canvasHeight)),
+    [bufs, baseTransform, roomW, roomH, canvasHeight]
+  );
+  // A copy drawn at view d shows view (Z, TX, TY) when scaled by k = Z / d.z and
+  // moved so that a drawn point lands on TX + Z * p (RN scales about the centre).
+  const bufStyles = useMemo(
+    () => bufVts.map((d, i) => {
+      const k = Animated.multiply(nav.Z, 1 / d.z);
+      return {
+        position: "absolute", left: 0, top: 0, width: W, height: H, opacity: nav.O[i],
+        transform: [
+          { translateX: Animated.add(nav.TX, Animated.add(Animated.multiply(k, W / 2 - d.tx), -W / 2)) },
+          { translateY: Animated.add(nav.TY, Animated.add(Animated.multiply(k, H / 2 - d.ty), -H / 2)) },
+          { scale: k },
+        ],
+      };
+    }),
+    [bufVts, nav, W, H]
+  );
+  const imageLayerStyle = useMemo(
+    () => ({
+      position: "absolute", left: 0, top: 0, width: W, height: H,
+      transform: [
+        { translateX: Animated.add(nav.TX, Animated.add(Animated.multiply(nav.Z, W / 2), -W / 2)) },
+        { translateY: Animated.add(nav.TY, Animated.add(Animated.multiply(nav.Z, H / 2), -H / 2)) },
+        { scale: nav.Z },
+      ],
+    }),
+    [nav, W, H]
+  );
+
+  // Button zoom and "centre on me" are tweened (natively) rather than applied
+  // instantly: a jump straight from 1x to 1.6x gives no sense of where the view
+  // went. Pinch is NOT tweened - it must track the fingers exactly.
+  const viewAnimRef = useRef(null); // { anim, target }
+  const animateView = useCallback((target, durationMs = 220) => {
+    const prev = viewAnimRef.current;
+    viewAnimRef.current = null;
+    prev?.anim.stop();
+    // From the view shown (or being animated to), so quick taps add up.
+    const from = liveRef.current;
+    const to = {
+      zoom: clamp(target.zoom ?? from.zoom ?? 1, MIN_ZOOM, MAX_ZOOM),
+      cx: target.cx === undefined ? from.cx : target.cx,
+      cy: target.cy === undefined ? from.cy : target.cy,
+    };
+    liveRef.current = to;
+    const vt = vtOf(to);
+    const opts = (toValue) => ({ toValue, duration: durationMs, easing: Easing.out(Easing.cubic), useNativeDriver: true });
+    const a = {
+      target: to,
+      anim: Animated.parallel([
+        Animated.timing(nav.Z, opts(vt.z)),
+        Animated.timing(nav.TX, opts(vt.tx)),
+        Animated.timing(nav.TY, opts(vt.ty)),
+      ]),
+    };
+    viewAnimRef.current = a;
+    a.anim.start(({ finished }) => {
+      if (viewAnimRef.current !== a) return;
+      viewAnimRef.current = null;
+      if (finished) commitView(to);
+    });
+  }, [nav, vtOf, commitView]);
+  const stopViewAnim = useCallback(() => {
+    const a = viewAnimRef.current;
+    if (!a) return;
+    viewAnimRef.current = null;
+    a.anim.stop();
+    showLive(a.target);
+  }, [showLive]);
+  useEffect(() => () => {
+    const a = viewAnimRef.current;
+    viewAnimRef.current = null;
+    a?.anim.stop();
+    clearTimeout(hideTimerRef.current);
+  }, []);
+
+  // Effective on-screen scale (px per ft) of the view shown, for drags.
+  const getScale = useCallback(
+    () => geomRef.current.base.scale * (liveRef.current.zoom ?? 1),
+    []
+  );
+
+  // ── Gestures: drag to pan, pinch to zoom ────────────────────────────────
+  // Live values are mirrored into refs so the responder can be created ONCE.
+  // Rebuilding it while a gesture is in progress tears that gesture down.
+  const placementRef = useRef(placementMode);
+  placementRef.current = placementMode;
+  const gestureRef = useRef({ startView: null, startDist: 0, pinching: false, sawPinch: false, moved: false });
+  const pickRef = useRef(pickMode);
+  pickRef.current = pickMode;
+  const onMapTapRef = useRef(onMapTap);
+  onMapTapRef.current = onMapTap;
+  const onGestureActiveRef = useRef(onGestureActive);
+  onGestureActiveRef.current = onGestureActive;
+  const wrapperRef = useRef(null);
+
+  // Screen tap -> floor-plan feet. Inverts exactly what rendering does: the
+  // wrapper's position on the page (and its 1 px border), then the view
+  // shown, then worldToScreen.
+  const reportTap = (pageX, pageY) => {
+    const node = wrapperRef.current;
+    if (!node || typeof node.measure !== "function") return;
+    node.measure((_fx, _fy, _w, _h, px, py) => {
+      const g = geomRef.current;
+      if (!g || !Number.isFinite(px) || !Number.isFinite(py)) return;
+      const vt = vtOf(liveRef.current);
+      const lx = pageX - px - 1;
+      const ly = pageY - py - 1;
+      const bx = (lx - vt.tx) / vt.z;
+      const by = (ly - vt.ty) / vt.z;
+      const wx = (bx - MAP_PADDING - g.base.offsetX) / g.base.scale;
+      const wy = g.roomH - (by - MAP_PADDING - g.base.offsetY) / g.base.scale;
+      const margin = 3; // allow a slightly-off tap at the wall
+      if (wx < -margin || wx > g.roomW + margin || wy < -margin || wy > g.roomH + margin) return;
+      onMapTapRef.current?.(clamp(wx, 0, g.roomW), clamp(wy, 0, g.roomH));
+    });
+  };
+  const reportTapRef = useRef(reportTap);
+  reportTapRef.current = reportTap;
+
+  const touchDistance = (touches) =>
+    Math.hypot(touches[0].pageX - touches[1].pageX, touches[0].pageY - touches[1].pageY);
+
+  const mapPanResponder = useMemo(() => {
+    const endGesture = () => {
+      const gs = gestureRef.current;
+      gs.pinching = false;
+      gs.sawPinch = false;
+      onGestureActiveRef.current?.(false);
+      if (gs.moved) commitView(liveRef.current);
+      gs.moved = false;
+    };
+    return PanResponder.create({
+      // Crucially FALSE. Claiming the touch on press meant every tap was
+      // swallowed before it reached the zoom buttons sitting on top of the
+      // map, so those buttons simply did nothing. The map only takes over
+      // once the finger actually moves, which leaves taps to the buttons.
+      //
+      // The exception is pick mode, where a TAP is the input: the map claims
+      // the touch on press so it can tell a tap from a drag on release. The
+      // zoom buttons still work, because they are deeper in the tree and the
+      // deepest view is asked first.
+      onStartShouldSetPanResponder: () => pickRef.current,
+      onStartShouldSetPanResponderCapture: () => false,
+      onMoveShouldSetPanResponder: (evt, g) => {
+        if (placementRef.current) return false; // markers own the drag there
+        if (evt.nativeEvent.touches?.length === 2) return true;
+        return Math.abs(g.dx) > 4 || Math.abs(g.dy) > 4;
+      },
+      onPanResponderGrant: (evt) => {
+        // Freeze the page scroll for the duration. The map lives inside a
+        // ScrollView, and without this a mostly-vertical drag is claimed by
+        // the scroll view instead of panning the map.
+        onGestureActiveRef.current?.(true);
+        const gs = gestureRef.current;
+        // A zoom animation still running is finished at once (and drawn after).
+        gs.moved = Boolean(viewAnimRef.current);
+        stopViewAnim();
+        gs.startView = { ...liveRef.current };
+        const t = evt.nativeEvent.touches || [];
+        gs.pinching = t.length === 2;
+        gs.sawPinch = t.length === 2;
+        gs.startDist = t.length === 2 ? touchDistance(t) : 0;
+      },
+      onPanResponderMove: (evt, g) => {
+        const gs = gestureRef.current;
+        const start = gs.startView;
+        if (!start) return;
+        const t = evt.nativeEvent.touches || [];
+
+        if (t.length === 2) {
+          // A pinch can begin part-way through a drag, so capture its
+          // reference separation the first time two fingers are seen.
+          if (!gs.pinching) {
+            gs.pinching = true;
+            gs.sawPinch = true;
+            gs.startDist = touchDistance(t);
+            gs.startView = { ...liveRef.current };
+            return;
+          }
+          const d = touchDistance(t);
+          if (gs.startDist > 10 && d > 10) {
+            const next = clamp((gs.startView.zoom ?? 1) * (d / gs.startDist), MIN_ZOOM, MAX_ZOOM);
+            gs.moved = true;
+            showLive({ ...liveRef.current, zoom: next });
+          }
+          return;
+        }
+
+        if (gs.pinching) return; // ignore the leftover finger
+        // Drag: moving the finger right should move the MAP right, which
+        // means the centred world point moves left — hence the negated dx.
+        const geo = geomRef.current;
+        const sc = geo.base.scale * (start.zoom ?? 1) || 1;
+        const startCx = Number.isFinite(start.cx) ? start.cx : geo.roomW / 2;
+        const startCy = Number.isFinite(start.cy) ? start.cy : geo.roomH / 2;
+        gs.moved = true;
+        showLive({
+          zoom: start.zoom ?? 1,
+          cx: clamp(startCx - g.dx / sc, 0, geo.roomW),
+          cy: clamp(startCy + g.dy / sc, 0, geo.roomH),
+        });
+      },
+      onPanResponderRelease: (_evt, g) => {
+        const wasPinch = gestureRef.current.sawPinch;
+        endGesture();
+        // A finger that barely moved is a tap, anything more was a pan.
+        if (pickRef.current && !wasPinch && Math.abs(g.dx) < 8 && Math.abs(g.dy) < 8) {
+          reportTapRef.current(g.x0, g.y0);
+        }
+      },
+      onPanResponderTerminate: endGesture,
+      // Hold the gesture against the enclosing ScrollView, which would
+      // otherwise steal a vertical drag half-way through a pan.
+      onPanResponderTerminationRequest: () => false,
+    });
+  }, [showLive, commitView, stopViewAnim]);
+
+  const toScreen = useCallback(
+    (wx, wy) => worldToScreen(wx, wy, transform, roomH),
+    [transform, roomH]
+  );
+
+  const roomPx = {
+    x: MAP_PADDING + transform.offsetX,
+    y: MAP_PADDING + transform.offsetY,
+    w: roomW * transform.scale,
+    h: roomH * transform.scale,
+  };
+  const userPx = toScreen(x, y);
+  const haloPx = uncertaintyRadius * transform.scale;
+  const quality = getPositionQuality(uncertaintyRadius);
+  const b1px = toScreen(anchor1.x, anchor1.y);
+  const b2px = toScreen(anchor2.x, anchor2.y);
+  // Ranges to the nearest half foot (~2 px): the rings then stay put instead of
+  // redrawing the layer on every tiny wobble of the smoothed distance.
+  const ringFt = (d) => (Number.isFinite(d) && d > 0 ? Math.round(d * 2) / 2 : null);
+  const rings = [];
+  if (ringFt(d1Ft) !== null) rings.push({ key: "r1", cx: b1px.cx, cy: b1px.cy, r: ringFt(d1Ft) * transform.scale, color: C.beacon1 });
+  if (ringFt(d2Ft) !== null) rings.push({ key: "r2", cx: b2px.cx, cy: b2px.cy, r: ringFt(d2Ft) * transform.scale, color: C.beacon2 });
+
+  const live = {
+    rings,
+    trailPoints: navPhase === "navigating" && !searching && trail.length > 1
+      ? trail.map((pt) => {
+        const { cx, cy } = toScreen(pt.x, pt.y);
+        return `${cx.toFixed(1)},${cy.toFixed(1)}`;
+      }).join(" ")
+      : null,
+    userPx,
+    alt: positionAmbiguous && alternatePosition && !searching ? toScreen(alternatePosition.x, alternatePosition.y) : null,
+    choosing: navPhase === "choosing",
+    startChoice,
+    haloColor: quality.color,
+    halo: !searching && haloPx > 3 ? { cx: userPx.cx, cy: userPx.cy, r: Math.min(haloPx, CANVAS_SIZE) } : null,
+    pending: pendingPoint ? toScreen(pendingPoint.x, pendingPoint.y) : null,
+  };
+  const shownLastTrail = navPhase !== "navigating" ? lastTrail : null;
+
+  const showDot = !placementMode && !searching;
+  const zoom = liveRef.current.zoom ?? 1;
+
+  return (
+    <View
+      ref={wrapperRef} collapsable={false}
+      style={[styles.mapCanvasWrapper, { width: W + 2, height: H + 2 }]}
+      {...mapPanResponder.panHandlers}
+    >
+      {/* ── Real floor plan background ── drawn at twice the size and halved,
+          so the image is loaded at full resolution and stays sharp zoomed in. */}
+      <Animated.View pointerEvents="none" style={imageLayerStyle}>
+        <Image
+          source={FLOORPLAN_IMAGE}
+          resizeMode="stretch"
+          fadeDuration={0}
+          style={{
+            position: "absolute",
+            left: roomPx.x - roomPx.w / 2, top: roomPx.y - roomPx.h / 2,
+            width: roomPx.w * 2, height: roomPx.h * 2,
+            opacity: 0.92, transform: [{ scale: 0.5 }],
+          }}
+        />
+      </Animated.View>
+
+      {[0, 1].map((i) => (
+        <Animated.View key={`lines${i}`} pointerEvents="none" style={bufStyles[i]}>
+          {bufs[i].show && (
+            <MapLineLayer
+              width={W} height={H}
+              roomW={roomW} roomH={roomH}
+              transform={baseTransform} vt={bufVts[i]}
+              obstacles={obstacles} obstacleVer={obstacleVer}
+              savedRoutesOnMap={savedRoutesOnMap}
+              lastTrail={shownLastTrail}
+              live={live}
+            />
+          )}
+        </Animated.View>
+      ))}
+
+      {/* ── Beacon markers (draggable in placement mode) ── */}
+      <BeaconMarker
+        id={1} label="B1" color={C.beacon1} worldPos={anchor1}
+        transform={transform} roomH={roomH} nav={nav} draggable={placementMode}
+        getScale={getScale} deviceName={b1Name} onDragEnd={onBeaconDragEnd}
+      />
+      <BeaconMarker
+        id={2} label="B2" color={C.beacon2} worldPos={anchor2}
+        transform={transform} roomH={roomH} nav={nav} draggable={placementMode}
+        getScale={getScale} deviceName={b2Name} onDragEnd={onBeaconDragEnd}
+      />
+
+      {/* ── Fused user position ── */}
+      {showDot && (
+        <UserDotMarker
+          nav={nav} px={userPx.cx} py={userPx.cy} opacity={quality.dotOpacity}
+          headingRef={headingRef} fallbackDeg={headingDeg}
+        />
+      )}
+
       {searching && <SearchingOverlay label={searchLabel} />}
       {bottomPanel}
 
       {/* ── Zoom controls ────────────────────────────────────────────────
-          A 72 ft room on a phone screen puts roughly four feet in a
+          A 70 ft room on a phone screen puts roughly four feet in a
           fingertip, which is finer than the position is accurate — zooming is
           what makes the 2 ft grid usable for reading off a real location. */}
       <View style={styles.zoomCluster}>
         <TouchableOpacity
           style={styles.zoomBtn}
-          onPress={() => onAnimateView?.({ zoom: clamp(zoom * 1.6, MIN_ZOOM, MAX_ZOOM) })}
+          onPress={() => animateView({ zoom: (liveRef.current.zoom ?? 1) * 1.6 })}
         >
           <Text style={styles.zoomBtnText}>+</Text>
         </TouchableOpacity>
         <TouchableOpacity
           style={styles.zoomBtn}
-          onPress={() => onAnimateView?.({ zoom: clamp(zoom / 1.6, MIN_ZOOM, MAX_ZOOM) })}
+          onPress={() => animateView({ zoom: (liveRef.current.zoom ?? 1) / 1.6 })}
         >
           <Text style={styles.zoomBtnText}>−</Text>
         </TouchableOpacity>
@@ -1076,14 +1358,14 @@ function OfficeMapCanvas({
             "make the user's world position the centred one". */}
         <TouchableOpacity
           style={styles.zoomBtn}
-          onPress={() => onAnimateView?.({ zoom: Math.max(zoom, 2.5), cx: x, cy: y }, 320)}
+          onPress={() => animateView({ zoom: Math.max(liveRef.current.zoom ?? 1, 2.5), cx: x, cy: y }, 320)}
         >
           <Text style={styles.zoomBtnIcon}>◎</Text>
         </TouchableOpacity>
-        {(zoom !== 1 || Number.isFinite(view.cx)) && (
+        {(zoom !== 1 || Number.isFinite(liveRef.current.cx)) && (
           <TouchableOpacity
             style={styles.zoomBtn}
-            onPress={() => onAnimateView?.({ zoom: 1, cx: null, cy: null }, 260)}
+            onPress={() => animateView(DEFAULT_VIEW, 260)}
           >
             <Text style={styles.zoomBtnIcon}>⤢</Text>
           </TouchableOpacity>
@@ -1141,62 +1423,13 @@ function FusionMapScreen({
   //   located    - fix established, waiting for the user to start walking
   //   navigating - PDR active, trail drawing
   const [navPhase, setNavPhase] = useState("idle");
-  // Viewport: which world point is centred, and at what magnification.
-  // null centre = "fit the whole floor plan", the default.
-  // Room size comes first: the view animation below lists roomW/roomH as
-  // dependencies, and reading them before this declaration gave it
-  // [undefined, undefined], so it never saw a changed room size.
   const [roomWidthStr, setRoomWidthStr] = useState(String(DEFAULT_ROOM_W_FT));
   const [roomHeightStr, setRoomHeightStr] = useState(String(DEFAULT_ROOM_H_FT));
   const roomW = parseFloatSafe(roomWidthStr, DEFAULT_ROOM_W_FT);
   const roomH = parseFloatSafe(roomHeightStr, DEFAULT_ROOM_H_FT);
 
-  const [view, setView] = useState({ zoom: 1, cx: null, cy: null });
   // Page scrolling is suspended while the map is being dragged or pinched.
   const [mapGestureActive, setMapGestureActive] = useState(false);
-
-  // ── Animated viewport moves ──────────────────────────────────────────────
-  // Button zoom and "centre on me" are tweened rather than applied instantly.
-  // A jump straight from 1x to 1.6x gives no sense of where the view went, and
-  // reads as the control misbehaving; easing over a fifth of a second lets the
-  // eye follow the map. Pinch is deliberately NOT tweened — it must track the
-  // fingers exactly, and interpolation there would feel like lag.
-  const viewAnimRef = useRef(null);
-  const liveViewRef = useRef(view);
-  liveViewRef.current = view;
-
-  const animateView = useCallback((target, durationMs = 220) => {
-    if (viewAnimRef.current) cancelAnimationFrame(viewAnimRef.current);
-    const from = liveViewRef.current;
-    const fromZoom = from.zoom ?? 1;
-    const fromCx = Number.isFinite(from.cx) ? from.cx : roomW / 2;
-    const fromCy = Number.isFinite(from.cy) ? from.cy : roomH / 2;
-    const toZoom = clamp(target.zoom ?? fromZoom, MIN_ZOOM, MAX_ZOOM);
-    const toCx = Number.isFinite(target.cx) ? target.cx : fromCx;
-    const toCy = Number.isFinite(target.cy) ? target.cy : fromCy;
-
-    const t0 = Date.now();
-    const step = () => {
-      const t = Math.min(1, (Date.now() - t0) / durationMs);
-      const e = 1 - Math.pow(1 - t, 3); // ease-out cubic
-      setView({
-        zoom: fromZoom + (toZoom - fromZoom) * e,
-        cx: fromCx + (toCx - fromCx) * e,
-        cy: fromCy + (toCy - fromCy) * e,
-      });
-      if (t < 1) viewAnimRef.current = requestAnimationFrame(step);
-      else if (target.cx === null && target.cy === null && toZoom === 1) {
-        // Landing exactly on the default restores "fit the whole plan", so the
-        // reset button genuinely resets rather than leaving a centre pinned.
-        setView({ zoom: 1, cx: null, cy: null });
-      }
-    };
-    viewAnimRef.current = requestAnimationFrame(step);
-  }, [roomW, roomH]);
-
-  useEffect(() => () => {
-    if (viewAnimRef.current) cancelAnimationFrame(viewAnimRef.current);
-  }, []);
   const [savedRoutes, setSavedRoutes] = useState([]);
   const [showRoutes, setShowRoutes] = useState(false);
   // Saved routes currently drawn on the map. A just-saved route is added
@@ -2027,6 +2260,15 @@ function FusionMapScreen({
     return SAVED_ROUTE_COLORS[idx % SAVED_ROUTE_COLORS.length];
   };
 
+  // Same array between renders, so the map's background layer is not redrawn.
+  const savedRoutesOnMap = useMemo(
+    () => savedRoutes
+      .filter((r) => shownRouteIds.has(r.id) && isFusionMapRoute(r))
+      .map((r) => ({ id: r.id, points: r.points, color: routeColor(r.id) })),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [savedRoutes, shownRouteIds]
+  );
+
   const toggleRouteOnMap = (id) => {
     setShownRouteIds((prev) => {
       const next = new Set(prev);
@@ -2568,13 +2810,11 @@ function FusionMapScreen({
         ) : null}
         placementMode={placementMode}
         onBeaconDragEnd={handleBeaconDragEnd}
-        view={view}
-        onViewChange={setView}
-        onAnimateView={animateView}
         onGestureActive={setMapGestureActive}
         navPhase={navPhase}
         lastTrail={lastTrail}
         obstacles={obstacleMap.items}
+        obstacleVer={obstacleVer}
         pickMode={
           Boolean(obstacleEdit) ||
           (recState.active && navPhase === "navigating") ||
@@ -2593,9 +2833,7 @@ function FusionMapScreen({
             ? spotCal.point
             : navPhase === "picking" ? pendingStart : null
         }
-        savedRoutesOnMap={savedRoutes
-          .filter((r) => shownRouteIds.has(r.id) && isFusionMapRoute(r))
-          .map((r) => ({ id: r.id, points: r.points, color: routeColor(r.id) }))}
+        savedRoutesOnMap={savedRoutesOnMap}
       />
 
       {/* ── Status cards ─────────────────────────────────────────────────
@@ -3322,6 +3560,11 @@ const styles = StyleSheet.create({
   spotChip: { backgroundColor: C.surfaceAlt, borderRadius: 16, borderWidth: 1, borderColor: C.border, paddingHorizontal: 12, paddingVertical: 7, marginRight: 8, marginBottom: 8 },
   spotChipOn: { borderColor: C.accent, backgroundColor: "#12263f" },
   spotChipText: { color: C.textPrimary, fontSize: 13, fontWeight: "600" },
+  beaconBox: { position: "absolute", width: BEACON_BOX_W, height: BEACON_BOX_H },
+  mapCircle: { position: "absolute" },
+  beaconCore: { alignItems: "center", justifyContent: "center", borderColor: "#fff", opacity: 0.95 },
+  beaconLabel: { color: "#fff", fontSize: 11, fontWeight: "bold" },
+  beaconSubLabel: { position: "absolute", left: 0, width: BEACON_BOX_W, textAlign: "center", fontSize: 9 },
   mapCanvasWrapper: {
     alignSelf: "center", marginBottom: 14, borderRadius: 14, overflow: "hidden",
     backgroundColor: C.bg, borderWidth: 1, borderColor: C.border,

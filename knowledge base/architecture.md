@@ -67,7 +67,7 @@ The runtime version follows the app version (`1.0.0`). An OTA update is download
 ### 3.2 Screens (`components/`)
 | File | Role |
 |---|---|
-| `v2/FusionMapScreen.js` | The main navigation screen. Floor-plan SVG map with zoom and pan, beacon placement, the locate → navigate flow, live fused position, trail, saved routes, metrics and beacon info. |
+| `v2/FusionMapScreen.js` | The main navigation screen. Floor-plan SVG map with zoom and pan, beacon placement, the locate → navigate flow, live fused position, trail, saved routes, metrics and beacon info. Zoom and pan are three native values (zoom, x, y) changed without React renders. The floor-plan image is a native image scaled by them (sharp at any zoom); the dot, heading needle and beacons are native views placed by them (same size at any zoom); the thin lines (grid, obstacles, routes, path, rings, halo) are an Svg drawn at one view and scaled, redrawn after a zoom in a second hidden copy that is swapped in once drawn. |
 | `v2/PdrTrackerScreen.js` | Step-only tracking: path canvas, step-length calibration card, loop closure, saved PDR paths, magnetometer diagnostics. |
 | `v2/BeaconSignalLabScreen.js` | BLE workbench: scan control, choosing Beacon 1 and 2, live RSSI graph, per-beacon analytics, two-stand ranging calibration, 1 m calibration, multi-distance regression, match pair, packet log. |
 | `v2/RssiSignalGraph.js` | SVG chart of raw and filtered RSSI over a 15/20/30 s window. |
