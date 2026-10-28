@@ -40,7 +40,7 @@ GPS doesn't work indoors, so a phone can't show where a person is inside an offi
 | S-4 | Set the floor-plan size (default 72 × 72 ft) | ✅ Done |
 | S-5 | Calibrate ranging with **two stands and no measuring**: 1 m from B1, then 1 m from B2 | ✅ Done |
 | S-6 | Show each beacon's calibration status (calibrated / advertised / default) | ✅ Done |
-| S-7 | Set the heading zero once ("I'm facing map-up"). It is remembered | ✅ Done |
+| S-7 | Map direction from real north (north is on the left of the floor plan), with no Zero Heading step | ✅ Done |
 | S-8 | Personal step-length calibration by walking a known distance | ✅ Done |
 
 ### 4.2 Locating

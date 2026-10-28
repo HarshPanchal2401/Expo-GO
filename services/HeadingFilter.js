@@ -109,6 +109,38 @@ export const HEADING_CONFIG = {
   ALIGN_MAX_AGE_S: 1.0,
   ALIGN_MIN_DEG: 2,
   ALIGN_MAX_DEG: 30,
+  // FAST TURNS (Android). Expo does not hand over every gyro reading: once per
+  // screen frame (~30 a second) it sends only the LATEST turn rate. Summing
+  // those point readings is exact for a slow turn, but in a fast one (90 deg in
+  // 0.3 s) the rate changes faster than it is sampled, and when the screen is
+  // busy and frames are skipped, 15-25 deg of a single quick turn were lost -
+  // more with every flick. The phone's own orientation (rotation vector) is
+  // fused natively from every gyro reading, so its change over the whole turn
+  // is exact however few samples arrive.
+  //
+  // The arrow still moves with the gyro alone (no magnetic field can bend it).
+  // Once a fast turn has ended, its total is compared with the orientation's
+  // change over the same turn, and what the gyro missed is added in one go.
+  // Following the orientation sample by sample instead (as first done) also
+  // took in its short glitches - the jolt of starting to walk bent it ~10 deg
+  // for a fraction of a second, and the arrow flicked aside and back - and the
+  // phone's sway while walking kept switching to it, compass and all.
+  //
+  // A turn starts above this rate (deg/s, gyro)...
+  FAST_TURN_DPS: 40,
+  // ...and ends once below this for FAST_TURN_CALM_S (s).
+  FAST_TURN_EXIT_DPS: 20,
+  FAST_TURN_CALM_S: 0.1,
+  // Only a real turn is corrected: at least this big (deg; sway is a few)...
+  FAST_TURN_MIN_DEG: 20,
+  // ...no longer than this (s; a "turn" lasting longer is sway while walking)...
+  FAST_TURN_MAX_S: 2.5,
+  // ...and only by up to this fraction of it (more is a compass jump, not a
+  // missed part of the turn).
+  FAST_TURN_MAX_CORR_FRAC: 0.4,
+  // The orientation's angle is only defined while the phone's top is not
+  // pointing nearly straight up or down (deg of tilt).
+  FAST_TURN_MAX_PITCH_DEG: 65,
 };
 
 const wrap180 = (d) => {
@@ -155,6 +187,9 @@ export class HeadingFilter {
     this._prevW = null;
     this._alignErr = null;      // smoothed compass - heading (deg), see alignToCompass()
     this._alignErrT = null;     // when it was last updated (s)
+    this._axisIsTop = false;    // the followed axis is the phone's top (held in front)
+    this._natPrev = null;       // last native orientation sample {az (deg), t (s)}
+    this._turn = null;          // fast turn in progress (FAST_TURN_*): {startAz, gyro, startMs, calmSince}
   }
 
   get heading() { return Number(this._heading.toFixed(2)); }
@@ -392,11 +427,19 @@ export class HeadingFilter {
     if (dt <= this.cfg.MAX_DT_S) this._yaw += headingRate * dt;
     if (!this._axis) this._chooseAxis(this._carry?.gMean || { x: dx, y: dy, z: dz });
     const az = this._axisAzimuth();
+    let inc = 0;
     if (this._anchor) this._anchorStep(az, nowMs);
     else if (az !== null && this._prevAz !== null && this._initialized && dt <= this.cfg.MAX_DT_S && !this._held) {
-      this._heading = wrap180(this._heading + wrap180(az - this._prevAz));
+      inc = wrap180(az - this._prevAz);
+      this._heading = wrap180(this._heading + inc);
     }
     if (az !== null) this._prevAz = az;
+    // A fast turn just ended: add what the gyro missed of it (FAST_TURN_*).
+    const corr = this._fastTurnCheck(platform === "android" ? data.rotation : null, headingRate, inc, nowMs);
+    if (corr) {
+      this._heading = wrap180(this._heading + corr);
+      this._yaw += corr;
+    }
     this._prevRateDps = headingRate;
     this._sampleForStep();
     const last = this._history[this._history.length - 1];
@@ -404,6 +447,56 @@ export class HeadingFilter {
       this._history.push({ t: nowMs, h: this._heading, y: this._yaw, d: { x: dx, y: dy, z: dz } });
       while (this._history.length && this._history[0].t < nowMs - 4000) this._history.shift();
     }
+  }
+
+  /**
+   * Fast turns (FAST_TURN_*). Follows a fast turn from start to end and, when it
+   * has ended, returns what the gyro missed of it (deg), measured from the
+   * phone's own orientation (Expo Android `rotation`, radians: alpha = -azimuth
+   * of the phone's top, beta = -pitch) over the whole turn. 0 otherwise.
+   * gyroIncDeg: what the gyro turned the heading by in this sample.
+   */
+  _fastTurnCheck(rot, gyroRateDps, gyroIncDeg, nowMs) {
+    const c = this.cfg;
+    let nat = null;
+    if (rot && Number.isFinite(rot.alpha) && Number.isFinite(rot.beta) && this._axisIsTop && !this._held && !this._anchor &&
+        Math.abs(rot.alpha) <= 7 && Math.abs(rot.beta) <= 7 &&
+        Math.abs(rot.beta) * (180 / Math.PI) < c.FAST_TURN_MAX_PITCH_DEG) {
+      const t = Number.isFinite(rot.timestamp) && rot.timestamp > 0 ? rot.timestamp : nowMs / 1000;
+      nat = { az: wrap180((-rot.alpha * 180) / Math.PI), t };
+    }
+    if (!nat) {
+      // Not usable (phone upright, pocket, repositioned): the gyro alone.
+      this._natPrev = null;
+      this._turn = null;
+      return 0;
+    }
+    const prev = this._natPrev;
+    const isNew = !prev || nat.t > prev.t;
+    if (isNew) this._natPrev = nat;
+    const rate = Math.abs(gyroRateDps);
+    const turn = this._turn;
+    if (!turn) {
+      // Starts from the orientation just before this sample.
+      if (rate > c.FAST_TURN_DPS && prev) this._turn = { startAz: prev.az, gyro: gyroIncDeg, startMs: nowMs, calmSince: null };
+      return 0;
+    }
+    turn.gyro += gyroIncDeg;
+    if (nowMs - turn.startMs > c.FAST_TURN_MAX_S * 1000) {
+      this._turn = null;
+      return 0;
+    }
+    if (rate >= c.FAST_TURN_EXIT_DPS) turn.calmSince = null;
+    else if (turn.calmSince === null) turn.calmSince = nowMs;
+    // Ended: calm for a moment, and an orientation sample from after it.
+    if (turn.calmSince === null || nowMs - turn.calmSince < c.FAST_TURN_CALM_S * 1000 || !isNew) return 0;
+    this._turn = null;
+    // The orientation's change, taken the same way round as the gyro's (turns over 180 deg).
+    const corr = wrap180(wrap180(nat.az - turn.startAz) - turn.gyro);
+    const total = turn.gyro + corr;
+    if (Math.abs(total) < c.FAST_TURN_MIN_DEG || Math.sign(total) !== Math.sign(turn.gyro)) return 0;
+    if (Math.abs(corr) > c.FAST_TURN_MAX_CORR_FRAC * Math.abs(total)) return 0;
+    return corr;
   }
 
   /**
@@ -469,6 +562,7 @@ export class HeadingFilter {
     const l = Math.hypot(a.x, a.y, a.z);
     if (!(l > 1e-3)) return;
     this._axis = { x: a.x / l, y: a.y / l, z: a.z / l };
+    this._axisIsTop = e === axes[0];
     this._prevAz = this._axisAzimuth();
   }
 

@@ -1438,10 +1438,20 @@ export class FusionEngine {
     // between two points may cross gray. Where the step alone would, the path goes to
     // the dot (always on green) instead, with a bend on the green if needed.
     for (const p of this._trailOnFloor(last, { x: nx, y: ny })) {
-      this._trail.push({ x: Number(p.x.toFixed(2)), y: Number(p.y.toFixed(2)) });
+      this._trail.push(this._trailPoint(p.x, p.y));
     }
     this._trailTip = false;
     while (this._trail.length > this._maxTrailLength) this._trail.shift();
+  }
+
+  /**
+   * A trail point, to 0.01 ft - unless rounding would move it off the green: a point
+   * right at the edge of a cell (55.499 -> 55.50) then landed on gray.
+   */
+  _trailPoint(x, y) {
+    const r = { x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) };
+    if (this._grid && !this._grid.isWalkable(r.x, r.y) && this._grid.isWalkable(x, y)) return { x, y };
+    return r;
   }
 
   /** Points (after `from`) that reach `to`, or the dot, without leaving the green. */
@@ -1484,7 +1494,7 @@ export class FusionEngine {
       const minMove = this._cfg.MIN_TRAIL_MOVE_FT;
       if (dx * dx + dy * dy < minMove * minMove) return;
     }
-    this._trail.push({ x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) });
+    this._trail.push(this._trailPoint(x, y));
     this._trailTip = false;
     if (this._trail.length > this._maxTrailLength) {
       this._trail.shift();
@@ -1507,7 +1517,7 @@ export class FusionEngine {
     }
     // After the first step corrections never draw track: the trail grows from steps (_trailStep).
     if (this._lastStepAt !== null) return;
-    const p = { x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) };
+    const p = this._trailPoint(x, y);
     if (this._lastStepAt === null) {
       this._trail[this._trail.length - 1] = p;
       this._startX = x;

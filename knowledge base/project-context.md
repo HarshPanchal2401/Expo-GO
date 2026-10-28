@@ -137,7 +137,7 @@ A **transition** (the phone being repositioned) is flagged when the average tilt
 - **Repositioning:** during a transition, the heading is held at its average from before the phone moved. After the phone settles, the new axis is averaged for 1.2 s and then takes over from the held value.
 - **Wrist tilt during a turn:** if the hold ends with the phone back within 20° of its tilt before the hold (and it was not swinging), it was a wrist tilting during a turn, not a move: the hold is released with the turn the gyro measured meanwhile (integrated rate about gravity). Dropping it used to leave the arrow 90–180° off.
 - **Map needle:** the Fusion Map's heading needle reads the heading itself 10× a second (`HeadingNeedle`), so it follows a turn made standing still instead of waiting for the next map redraw.
-- **Zero:** the heading is relative to a calibrated zero, set with "Zero Heading" and stored in `@pdr_heading_zero_deg`.
+- **North:** fixed to the floor plan. Real north is on the **left** of the drawing, so map-up is compass east (`services/MapNorth.js`: map heading = bearing − 90° + 10°: the drawing is turned 10°, `MAP_ROTATION_DEG`). There's no Zero Heading step any more: the old saved `@pdr_heading_zero_deg` is deleted. `AlphaNorthCheck` confirms against the magnetometer, while the phone is flat, which way the phone's `rotation.alpha` is turned (Android `bearing = −alpha`, iOS `270 − alpha`). The PDR tab's 🧭 Re-sync only re-takes the direction from the compass.
 
 ### 6.5 Wheelchair mode (`services/WheelchairEngine.js`)
 Wheelchair mode (switch on the PDR tab or Fusion Map, saved at once). Both step detectors are switched off; the engine hands over **0.7 m moves** through the same `addStep()` path:

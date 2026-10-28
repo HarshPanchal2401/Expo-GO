@@ -130,8 +130,15 @@ export const MOTION_CONFIG = {
   PREVIEW_MIN_PEAKS: 2,
   // ...at most this many preview steps are shown before walking is confirmed...
   PREVIEW_MAX_STEPS: 5,
-  // ...and a preview with no new bounce for this long (s) is withdrawn.
+  // ...and a preview with no new bounce for this long (s) is withdrawn. Bounces that
+  // continue the rhythm keep it alive after PREVIEW_MAX_STEPS too.
   PREVIEW_TIMEOUT_S: 1.6,
+  // "Standing" (the whole 2.5 s window is quiet) withdraws a preview only when no
+  // bounce has come for this long (s). At the start of a gentle walk the first
+  // steps fill only the end of the window, which still read as standing: the
+  // preview was withdrawn mid-walk (the dot went back to the start for a moment,
+  // then forward again once walking was confirmed) - 1 start in 6 in tests.
+  PREVIEW_STANDING_QUIET_S: 1.0,
   // Preview only while the phone is held steady (tilting rate over the last half second,
   // deg/s): stricter than walking itself, because a wrong preview makes the dot jump
   // back. A swinging phone (pocket, hand) is not previewed; it moves once confirmed.
@@ -373,7 +380,7 @@ export class MotionEngine {
    */
   _maybePreview(p) {
     const cfg = this.cfg;
-    if (!this.onPreview || this.previewSteps >= cfg.PREVIEW_MAX_STEPS) return;
+    if (!this.onPreview) return;
     // Shaking or handling right now (last half second): no preview.
     const recentCut = p.t - cfg.RECENT_TILT_S * 1000;
     let rt = 0, rot = 0, n = 0;
@@ -391,6 +398,11 @@ export class MotionEngine {
     // before the first real step is not released as a step later either); then one per bounce.
     const strongest = Math.max(...run.map((q) => q.bounce));
     if (p.bounce < cfg.MIN_BOUNCE_FRAC * strongest) return;
+    // Enough shown: the bounce only keeps the preview alive.
+    if (this.previewSteps >= cfg.PREVIEW_MAX_STEPS) {
+      this.previewLastT = p.t;
+      return;
+    }
     const count = this.previewSteps === 0
       ? Math.min(cfg.PREVIEW_MAX_STEPS, run.filter((q) => q.bounce >= cfg.MIN_BOUNCE_FRAC * strongest).length)
       : 1;
@@ -551,8 +563,9 @@ export class MotionEngine {
       }
     }
     this.reason = this.walking ? "walking" : reason;
-    // Shaking or standing: what was previewed was not walking.
-    if (!this.walking && this.previewSteps && (reason === "standing" || reason.startsWith("shaking"))) this._cancelPreview();
+    // Shaking, or standing with no bounce for a while: what was previewed was not walking.
+    const quiet = this.previewLastT !== null && t - this.previewLastT > cfg.PREVIEW_STANDING_QUIET_S * 1000;
+    if (!this.walking && this.previewSteps && ((reason === "standing" && quiet) || reason.startsWith("shaking"))) this._cancelPreview();
   }
 
   _startWalking(t) {

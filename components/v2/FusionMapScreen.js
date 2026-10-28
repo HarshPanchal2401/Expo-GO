@@ -73,6 +73,7 @@ import { testRecorder } from "../../services/TestRecorder.js";
 import { floorplanGrid } from "../../services/WalkableGrid.js";
 import { wheelchairEngine } from "../../services/WheelchairEngine.js";
 import { getAppSettings, subscribeAppSettings } from "../../services/appSettingsStorage.js";
+import { MAP_NORTH_SIDE, getMapRotationDeg } from "../../services/MapNorth.js";
 
 // Everything the obstacle editor can draw: RF obstacles + no-walk areas.
 const EDIT_TYPES = [...OBSTACLE_TYPES, ...AREA_TYPES];
@@ -180,8 +181,10 @@ const LOCATE_STALE_MS = 10000;
 // otherwise invisible from here.
 // Spot calibration: settle after tapping, then average this long.
 const SPOT_SETTLE_MS = 1500;
-// Fastest screen redraw driven by BLE packets (see scheduleUiRefresh).
-const UI_REFRESH_MS = 200;
+// Fastest screen redraw driven by BLE packets (see scheduleUiRefresh). Each
+// redraw is the whole screen; the dot moves on steps at once regardless, so the
+// numbers do not need more than ~2.5 updates a second.
+const UI_REFRESH_MS = 400;
 const SPOT_WINDOW_MS = 6000;
 // After a beacon fix the first corrections still move the position, often by
 // many feet, a few times over. Until it holds still the map keeps showing the
@@ -268,7 +271,7 @@ function describeSimple(num) {
 const AUTO_CAL_PAUSE_TEXT = {
   "no-anchor": "tap 👆 Set My Start (or calibrate a spot), then walk",
   drift: "walked far enough that the track is uncertain - set the start or calibrate a spot again",
-  "left-room": "track left the room - zero the heading, then set the start again",
+  "left-room": "track left the room - check the beacon positions, then set the start again",
   "heading-not-zeroed": "zero the heading first, then set the start",
   stopped: "navigation stopped",
   relocating: "locating again",
@@ -849,6 +852,8 @@ const MapLineLayer = React.memo(function MapLineLayer({
 function OfficeMapCanvas({
   roomW,
   roomH,
+  // The floor plan's turn from north-on-the-left (deg, Settings), for the N marker.
+  mapRotationDeg = 0,
   anchor1,
   anchor2,
   fusionState,
@@ -1244,7 +1249,8 @@ function OfficeMapCanvas({
     h: roomH * transform.scale,
   };
   const userPx = toScreen(x, y);
-  const haloPx = uncertaintyRadius * transform.scale;
+  // To the nearest half foot, so the halo is not redrawn for every tiny change.
+  const haloPx = (Math.round(uncertaintyRadius * 2) / 2) * transform.scale;
   const quality = getPositionQuality(uncertaintyRadius);
   const b1px = toScreen(anchor1.x, anchor1.y);
   const b2px = toScreen(anchor2.x, anchor2.y);
@@ -1255,7 +1261,7 @@ function OfficeMapCanvas({
   if (ringFt(d1Ft) !== null) rings.push({ key: "r1", cx: b1px.cx, cy: b1px.cy, r: ringFt(d1Ft) * transform.scale, color: C.beacon1 });
   if (ringFt(d2Ft) !== null) rings.push({ key: "r2", cx: b2px.cx, cy: b2px.cy, r: ringFt(d2Ft) * transform.scale, color: C.beacon2 });
 
-  const live = {
+  const liveNow = {
     rings,
     trailPoints: navPhase === "navigating" && !searching && trail.length > 1
       ? trail.map((pt) => {
@@ -1271,6 +1277,11 @@ function OfficeMapCanvas({
     halo: !searching && haloPx > 3 ? { cx: userPx.cx, cy: userPx.cy, r: Math.min(haloPx, CANVAS_SIZE) } : null,
     pending: pendingPoint ? toScreen(pendingPoint.x, pendingPoint.y) : null,
   };
+  // The same object while nothing in it changed, so the line layer (memo) is not
+  // even re-rendered on the screen's other updates.
+  const liveKey = JSON.stringify(liveNow);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const live = useMemo(() => liveNow, [liveKey]);
   const shownLastTrail = navPhase !== "navigating" ? lastTrail : null;
 
   const showDot = !placementMode && !searching;
@@ -1332,6 +1343,16 @@ function OfficeMapCanvas({
           nav={nav} px={userPx.cx} py={userPx.cy} opacity={quality.dotOpacity}
           headingRef={headingRef} fallbackDeg={headingDeg}
         />
+      )}
+
+      {/* ── Real north: to the left of the floor plan, turned by the map
+          rotation (MapNorth.js, Settings). The direction arrow uses it, so
+          facing north points the arrow this way. ── */}
+      {MAP_NORTH_SIDE === "left" && (
+        <View style={styles.northMark} pointerEvents="none">
+          <Text style={[styles.northMarkArrow, { transform: [{ rotate: `${mapRotationDeg}deg` }] }]}>←</Text>
+          <Text style={styles.northMarkText}>N</Text>
+        </View>
       )}
 
       {searching && <SearchingOverlay label={searchLabel} />}
@@ -1404,6 +1425,30 @@ function OfficeMapCanvas({
   );
 }
 
+/**
+ * What the screen shows from a FusionEngine state, as a string: numbers to 0.01
+ * (the uncertainty to 0.25 ft), the trail by its length and last point.
+ */
+function fusionStateKey(st) {
+  let k = "";
+  for (const name in st) {
+    const v = st[name];
+    if (name === "trail") {
+      const last = v && v[v.length - 1];
+      k += `|${v ? v.length : 0}:${last ? `${last.x},${last.y}` : ""}`;
+    } else if (name === "uncertaintyRadius") {
+      k += `|${Math.round(v * 4)}`;
+    } else if (typeof v === "number") {
+      k += `|${Math.round(v * 100)}`;
+    } else if (v && typeof v === "object") {
+      k += `|${JSON.stringify(v)}`;
+    } else {
+      k += `|${v}`;
+    }
+  }
+  return k;
+}
+
 // ─── Main Screen ──────────────────────────────────────────────────────────────
 
 function FusionMapScreen({
@@ -1458,11 +1503,20 @@ function FusionMapScreen({
     fusionEngine.setRoomSize(DEFAULT_ROOM_W_FT, DEFAULT_ROOM_H_FT);
     return { ...fusionEngine.getState() };
   });
+  // Engine state to the screen, but only when something shown has changed:
+  // every update redraws the whole screen, and most (the 1 s tick, beacon
+  // refreshes while beacons are held off) changed nothing.
+  const shownStateKeyRef = useRef("");
+  const showFusionState = useCallback((st) => {
+    const key = fusionStateKey(st);
+    if (key === shownStateKeyRef.current) return;
+    shownStateKeyRef.current = key;
+    setFusionState(st);
+  }, []);
 
   const [bleStats, setBleStats] = useState({ b1: null, b2: null });
   const [isScanning, setIsScanning] = useState(false);
   const [scanError, setScanError] = useState(null);
-  const [headingZeroFlash, setHeadingZeroFlash] = useState(false);
 
   const tickIntervalRef = useRef(null);
   const statsUnsubRef = useRef(null);
@@ -1482,6 +1536,8 @@ function FusionMapScreen({
   const [locateClock, setLocateClock] = useState(0);
   // When the last fix was committed, for the brief "position found" banner.
   const [locatedAt, setLocatedAt] = useState(0);
+  const locatedAtRef = useRef(0);
+  locatedAtRef.current = locatedAt;
   // Start point tapped on the map in "picking", awaiting Start Here.
   const [pendingStart, setPendingStart] = useState(null);
   // Named start spots (Entrance, Desk 4 ...) saved on the phone.
@@ -1531,7 +1587,7 @@ function FusionMapScreen({
     setLocatedAt(Date.now());
     // Start settled: from here steps carry the track, beacons only nudge it.
     fusionEngine.setBleWeight(NAV_BLE_WEIGHT);
-    setFusionState({ ...fusionEngine.getState() });
+    showFusionState(fusionEngine.getState());
   };
   // Spot calibration: { stage: "pick" | "measuring" | "done", point, startedAt, result }
   const [spotCal, setSpotCal] = useState(null);
@@ -1617,7 +1673,7 @@ function FusionMapScreen({
         fusionEngine.setBleAnchors({ x: 6, y: 6 }, { x: w - 6, y: 6 });
       }
       fusionEngine.reset(w / 2, h / 2);
-      setFusionState({ ...fusionEngine.getState() });
+      showFusionState(fusionEngine.getState());
       setConfigLoaded(true);
     })();
   }, []);
@@ -1628,14 +1684,18 @@ function FusionMapScreen({
   // shows). Redrawing this large screen on every packet saturated the JS
   // thread, which is what froze the UI and made the distances look stuck.
   const latestStatsRef = useRef(null);
+  const pendingLocProgressRef = useRef(null);
   const uiRefreshRef = useRef({ last: 0, timer: null });
   const flushUi = useCallback(() => {
     uiRefreshRef.current.last = Date.now();
     uiRefreshRef.current.timer = null;
     const st = latestStatsRef.current;
     if (st) setBleStats({ b1: st.b1, b2: st.b2 });
-    setFusionState({ ...fusionEngine.getState() });
-  }, []);
+    const lp = pendingLocProgressRef.current;
+    pendingLocProgressRef.current = null;
+    if (lp && navPhaseRef.current === "locating") setLocProgress(lp);
+    showFusionState(fusionEngine.getState());
+  }, [showFusionState]);
   const scheduleUiRefresh = useCallback(() => {
     const r = uiRefreshRef.current;
     if (r.timer) return;
@@ -1692,8 +1752,13 @@ function FusionMapScreen({
         const stale = (b) => !Number.isFinite(b?.lastSeen) || now - b.lastSeen > LOCATE_STALE_MS;
         if (stale(stats.b1) || stale(stats.b2)) return;
         const r = fusionEngine.feedLocatingSample(d1Ft, d2Ft, c1, c2);
-        setLocProgress(r);
-        if (r.done && r.fix?.position) completeLocating(r.fix);
+        // Shown with the next screen refresh, not on every packet (each was a
+        // whole-screen redraw, ~12 a second).
+        pendingLocProgressRef.current = r;
+        if (r.done && r.fix?.position) {
+          setLocProgress(r);
+          completeLocating(r.fix);
+        }
         scheduleUiRefresh();
         return;
       }
@@ -1808,10 +1873,13 @@ function FusionMapScreen({
       fusionEngine.setParticleFilterEnabled(st?.particleFilter !== false);
       fusionEngine.setMobility(st?.mobilityMode);
       setMobilityMode(st?.mobilityMode === "wheelchair" ? "wheelchair" : "walking");
+      setMapRotationDeg(Number.isFinite(st?.mapRotationDeg) ? st.mapRotationDeg : getMapRotationDeg());
     };
     apply(getAppSettings());
     return subscribeAppSettings(apply);
   }, []);
+  // Map rotation (Settings), for the N marker on the map.
+  const [mapRotationDeg, setMapRotationDeg] = useState(() => getMapRotationDeg());
   // Walking or wheelchair (Settings): wheelchair mode shows the Push button.
   const [mobilityMode, setMobilityMode] = useState(
     () => (getAppSettings()?.mobilityMode === "wheelchair" ? "wheelchair" : "walking")
@@ -1979,7 +2047,7 @@ function FusionMapScreen({
         if (carry) setCarryMode(carry);
         const stAfter = fusionEngine.getState();
         testRecorder.add("step", { len: stepLengthFt, heading, x: stAfter.x, y: stAfter.y, text: carry || "" });
-        setFusionState({ ...stAfter });
+        showFusionState(stAfter);
       };
       return () => {
         pdrStepCallbackRef.current = null;
@@ -2035,7 +2103,7 @@ function FusionMapScreen({
         setSettling(false);
         choiceDuringNavRef.current = true;
         pickStartChoice(null);
-        setFusionState({ ...st });
+        showFusionState(st);
         setNavPhase("choosing");
         return;
       }
@@ -2066,8 +2134,13 @@ function FusionMapScreen({
             if (r.done && r.fix?.position) completeLocating(r.fix);
           }
         }
-        setFusionState({ ...fusionEngine.getState() });
-        setLocateClock(Date.now());
+        showFusionState(fusionEngine.getState());
+        // The clock is shown only while locating / settling and in the
+        // "position found" banner (5 s): redrawing for it otherwise was a
+        // whole-screen redraw every second for nothing.
+        if (navPhaseRef.current === "locating" || settlingRef.current || Date.now() - locatedAtRef.current < 6000) {
+          setLocateClock(Date.now());
+        }
       }, 1000);
     } else if (tickIntervalRef.current) {
       clearInterval(tickIntervalRef.current);
@@ -2146,7 +2219,7 @@ function FusionMapScreen({
       coldStartDoneRef.current = true;
       setLocProgress(null);
       pickStartChoice(null);
-      setFusionState({ ...fusionEngine.getState() });
+      showFusionState(fusionEngine.getState());
       setNavPhase("choosing");
       return true;
     }
@@ -2163,7 +2236,7 @@ function FusionMapScreen({
     fusionEngine.beginNavigation({ keepSide });
     const st0 = fusionEngine.getState();
     testRecorder.add("start", { x: st0.x, y: st0.y, text: fix?.status || "" });
-    setFusionState({ ...st0 });
+    showFusionState(st0);
     setNavPhase("navigating");
     // A beacon fix is still being corrected for a while: hold the dot back
     // until it settles. A spot the user chose, or a start while already
@@ -2211,7 +2284,7 @@ function FusionMapScreen({
   const handleStartNavigation = () => {
     fusionEngine.beginNavigation();
     fusionEngine.setBleWeight(NAV_BLE_WEIGHT);
-    setFusionState({ ...fusionEngine.getState() });
+    showFusionState(fusionEngine.getState());
     setNavPhase("navigating");
   };
 
@@ -2370,7 +2443,7 @@ function FusionMapScreen({
     }
     if (navPhase === "navigating" && fusionState.positionAmbiguous) {
       if (fusionEngine.chooseHypothesisNear(xFt, yFt)) {
-        setFusionState({ ...fusionEngine.getState() });
+        showFusionState(fusionEngine.getState());
       }
     }
   };
@@ -2427,18 +2500,6 @@ function FusionMapScreen({
     setNavPhase("locating");
   };
 
-  // Whatever direction the phone is facing right now becomes 0° / forward.
-  // Do this while physically facing the same direction as the floor plan's
-  // printed "up" (+Y) so the heading needle and PDR step direction line up
-  // with the map instead of some arbitrary earlier orientation.
-  const handleZeroHeading = () => {
-    if (!onZeroHeading) return;
-    onZeroHeading();
-    setHeadingZeroFlash(true);
-    setTimeout(() => setHeadingZeroFlash(false), 2000);
-    // The heading prompt was the only thing holding navigation back.
-    if (navPhase === "located") handleStartNavigation();
-  };
 
   const renderConfBar = (value, color) => {
     const pct = clamp(value, 0, 1) * 100;
@@ -2525,17 +2586,12 @@ function FusionMapScreen({
         <View style={{ flex: 1 }}>
           <Text style={styles.screenTitle}>🏢 Office Map</Text>
           <Text style={styles.runSubtitle}>
-            {headingZeroFlash
-              ? "✓ Heading zeroed — this direction is now Forward (0°)"
-              : placementMode
+            {placementMode
               ? "Drag markers to their real position, then Save"
               : `${roomW} × ${roomH} ft  •  ${stepCount} steps  •  ${quality.label}`}
           </Text>
         </View>
-        <TouchableOpacity style={styles.reconfigBtn} onPress={handleZeroHeading}>
-          <Text style={styles.reconfigBtnText}>🎯 Zero Heading</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={[styles.reconfigBtn, { marginLeft: 8 }]} onPress={() => setSettingsOpen((s) => !s)}>
+        <TouchableOpacity style={styles.reconfigBtn} onPress={() => setSettingsOpen((s) => !s)}>
           <Text style={styles.reconfigBtnText}>⚙ Floor Plan</Text>
         </TouchableOpacity>
       </View>
@@ -2772,6 +2828,7 @@ function FusionMapScreen({
 
       <OfficeMapCanvas
         roomW={roomW} roomH={roomH}
+        mapRotationDeg={mapRotationDeg}
         anchor1={anchor1} anchor2={anchor2}
         fusionState={previewOffset ? { ...fusionState, x: fusionState.x + previewOffset.dx, y: fusionState.y + previewOffset.dy } : fusionState}
         d1Ft={d1Ft} d2Ft={d2Ft}
@@ -2892,25 +2949,6 @@ function FusionMapScreen({
         </View>
       )}
 
-      {/* ── Heading alignment ────────────────────────────────────────────
-          A position fix says WHERE you are; it says nothing about which way you
-          are facing. PDR needs both — every step is placed with
-          x += len·sin(heading) — so until the app is told which real-world
-          direction the floor plan's "up" points in, a walk north on the map can
-          come out pointing anywhere. This is asked once and then remembered,
-          since it is a property of the building, not of the session. */}
-      {(navPhase === "located" || navPhase === "navigating") && !headingCalibrated && (
-        <View style={[styles.statusBanner, styles.fixBannerWarn, styles.statusCard]}>
-          <Text style={styles.statusCardText}>
-            🧭 Set your forward direction before walking. Stand facing the way the map's
-            ↑ (up / +Y) points, then tap Zero Heading. Without this the path will be drawn
-            rotated away from the direction you actually walk.
-          </Text>
-          <TouchableOpacity style={styles.headingFixBtn} onPress={handleZeroHeading}>
-            <Text style={styles.headingFixBtnText}>🎯 I'm facing map-up — Zero Heading</Text>
-          </TouchableOpacity>
-        </View>
-      )}
 
       {navPhase === "navigating" && locatedAt > 0 && (locateClock || Date.now()) - locatedAt < 5000 && (
         <View style={[styles.statusBanner, styles.fixBannerReady]}>
@@ -3427,6 +3465,14 @@ const styles = StyleSheet.create({
   },
   zoomBtnText: { color: "#e6edf3", fontSize: 20, fontWeight: "700", lineHeight: 23 },
   zoomBtnIcon: { color: "#e6edf3", fontSize: 15, fontWeight: "700" },
+  northMark: {
+    position: "absolute", left: 6, top: "50%", marginTop: -22,
+    alignItems: "center", justifyContent: "center",
+    width: 30, height: 44, borderRadius: 8,
+    backgroundColor: "rgba(13,17,23,0.85)", borderWidth: 1, borderColor: "#30363d",
+  },
+  northMarkArrow: { color: "#f85149", fontSize: 16, fontWeight: "900", lineHeight: 18 },
+  northMarkText: { color: "#e6edf3", fontSize: 13, fontWeight: "900", lineHeight: 16 },
   zoomBadge: {
     position: "absolute", bottom: 12, right: 12,
     backgroundColor: "rgba(13,17,23,0.85)",

@@ -153,6 +153,32 @@ export default function AppSettingsScreen() {
       <MobilityCard settings={settings} updateParam={updateParam} onSaved={(patch) => setSettings((prev) => ({ ...prev, ...patch }))} />
 
       {/* ──────────────────────────────────────────────────────────────────── */}
+      {/* MAP DIRECTION (services/MapNorth.js)                                 */}
+      {/* ──────────────────────────────────────────────────────────────────── */}
+      <View style={s.card}>
+        <View style={s.cardHeader}>
+          <View style={{ flex: 1 }}>
+            <Text style={s.cardTitle}>🧭 Map Direction</Text>
+            <Text style={s.cardDesc}>
+              Real north is on the left of the floor plan. The drawing is not exactly square to north, so the direction arrow is turned by this much.
+            </Text>
+          </View>
+        </View>
+
+        <SettingNumberRow
+          label="Map Rotation"
+          hint="Arrow points LEFT of where you walk → raise it. Points RIGHT → lower it. Default 10°."
+          unit="°"
+          value={Number.isFinite(settings.mapRotationDeg) ? settings.mapRotationDeg : 10}
+          step={1}
+          min={-45}
+          max={45}
+          decimals={0}
+          onChange={(val) => updateParam("mapRotationDeg", val)}
+        />
+      </View>
+
+      {/* ──────────────────────────────────────────────────────────────────── */}
       {/* SECTION 3: PDR STEP DETECTOR & WEINBERG STRIDE                       */}
       {/* ──────────────────────────────────────────────────────────────────── */}
       <View style={s.card}>

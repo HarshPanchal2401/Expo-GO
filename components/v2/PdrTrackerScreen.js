@@ -384,7 +384,7 @@ export default function PdrTrackerScreen({
           onPress={setZero}
           style={({ pressed }) => [styles.actionBtn, styles.btnOutline, pressed && styles.btnPressed]}
         >
-          <Text style={styles.actionBtnText}>🎯 Set Zero</Text>
+          <Text style={styles.actionBtnText}>🧭 Re-sync</Text>
         </Pressable>
 
         <Pressable

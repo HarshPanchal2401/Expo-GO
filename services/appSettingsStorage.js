@@ -54,6 +54,7 @@ export const DEFAULT_APP_SETTINGS = {
   wheelchairSensitivity: "medium", // "low" | "medium" | "high": vibration needed to count as rolling
 
   // ─── Room & Map Environment ───────────────────────────────────────────────
+  mapRotationDeg: 10,              // floor plan turned from north-on-the-left (deg, + = arrow turns clockwise); services/MapNorth.js
   roomWidthFt: 18,                 // Room width in feet (X axis)
   roomHeightFt: 15,                // Room height in feet (Y axis)
 

@@ -31,7 +31,7 @@ Accelerometer sampled every **30 ms**.
 
 ### 1.1 Walking start and preview (`MotionEngine.js`)
 - Walking is confirmed when the vertical bounce has a steady rhythm (autocorrelation ≥ 0.5 over 2.5 s) and 3 evenly spaced bounces, or 2 when the rhythm is very clear (≥ 0.65). The steps that confirmed it are then released with their own times.
-- **Preview:** before that, from the 2nd bounce in step rhythm, each bounce is sent as `onPreview` and the Fusion Map moves the dot ahead (on the green only), without counting it. Only while the phone is held steady (tilting < 50°/s); at most 5 steps. Confirmed steps replace the preview; standing, shaking or 1.6 s without a bounce withdraws it (`onPreviewCancel`). First movement: about 0.6–1.2 s after starting to walk instead of 1.2–2.5 s.
+- **Preview:** before that, from the 2nd bounce in step rhythm, each bounce is sent as `onPreview` and the Fusion Map moves the dot ahead (on the green only), without counting it. Only while the phone is held steady (tilting < 50°/s); at most 5 steps. Confirmed steps replace the preview; standing, shaking or 1.6 s without a bounce withdraws it (`onPreviewCancel`). First movement: about 0.6–1.2 s after starting to walk instead of 1.2–2.5 s. The preview is withdrawn after 1.6 s with no bounce in rhythm (bounces keep it alive after the 5th step too), or on shaking. "Standing" withdraws it only after 1 s with no bounce: the 2.5 s window still reads as standing while the first gentle steps fill only its end, and the dot used to jump back to the start and forward again (1 start in 6 in tests).
 - Wall unstick (`ParticleFilter._slide`): only when every particle's step is blocked, particles move along the wall instead of holding.
 
 ## 2. Step length (`StepLengthModel.js`)
@@ -73,6 +73,7 @@ k   = dt / τ,   τ = 3 s        when the field is clean
 - **Turning:** no compass correction while `|dθ/dt| > 40°/s`, because orientation sensors lag during turns.
 - **Resync:** if `|err| > 30°` for 1.5 s while the field is clean (6 s when unknown), snap to the compass.
 - **Standing still** (`setMoving(false)`: not walking, no preview steps, not rolling, no step for 2 s): no compass pull and no resync. The gyro holds the arrow, so a field bent by a desk or pillar can't swing it. Walking starts with walk-start alignment instead.
+- **Fast turns (Android):** Expo sends only the *latest* gyro rate once per screen frame (~30/s), so summing it lost 15–25° of a quick 90° turn when frames were skipped. The arrow still moves with the gyro alone. A fast turn (gyro over 40°/s) is followed until it calms (under 20°/s for 0.1 s). If it was a real turn (at least 20°, under 2.5 s), the change of the phone's own orientation over the whole turn (`rotation.alpha`, natively fused from every gyro reading) is compared with the gyro's, and the difference (at most 40% of the turn) is added once. Short orientation glitches (the jolt of starting to walk) and the hand's sway never reach the arrow. This applies only when the phone's top is the followed axis and it's tilted less than 65°.
 - **Per-step heading:** the **circular mean** of θ over the stride, which cancels the phone's left-right sway.
 
 - **Walk-start alignment** (`alignToCompass`): when walking starts (first preview step, or confirmed walking without a preview), the heading is set to the compass at once using the compass−heading difference smoothed over 0.6 s. Only if the phone is held in front, the field is not disturbed, not turning, and the difference is 2–30°. The buffered stride headings are shifted by the same amount, so the first steps use it too.
@@ -189,7 +190,7 @@ K  = P Hᵀ / (H P Hᵀ + R) ;   x += K·(t − H·x) ;   P = (I − K H) P
 2. Samples go into §5.2. Once there are 4 or more, a provisional dot is shown but not used for tracking.
 3. Fix committed:
    - `beginNavigation()` **always** runs right away, and a "✓ Position found" banner shows for 5 s.
-   - If the heading has never been zeroed, the Zero Heading prompt stays visible while navigating. It no longer blocks navigation.
+   - The direction needs no setup: real north is fixed to the left of the floor plan, turned 10° (`MapNorth.js`, `MAP_ROTATION_DEG`: map up = compass bearing 80°), and a **N ←** marker on the map's left edge shows it.
 4. **Navigating:** steps call `predict`, BLE calls `correct`, and the trail is drawn. Beacon weight is 0.15 (1 while a beacon fix settles). With weight below 1, beacons are **held off** (`bleHeld`):
    - `still`: no step for 1.4 s. The dot doesn't move at all while you stand.
    - `walk-start`: the first 4 steps of a walk. The smoothed ranges still describe where you stood.

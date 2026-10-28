@@ -24,6 +24,7 @@ import { headingFilter } from "./services/HeadingFilter.js";
 import { StepGate } from "./services/StepGate.js";
 import { MotionEngine } from "./services/MotionEngine.js";
 import { wheelchairEngine } from "./services/WheelchairEngine.js";
+import { AlphaNorthCheck, defaultAlphaNorth, mapHeadingZero, mapHeadingFromBearing, setMapRotationDeg } from "./services/MapNorth.js";
 import { testRecorder } from "./services/TestRecorder.js";
 
 // Which sensor heading corresponds to the floor plan's "up". A property of
@@ -69,7 +70,6 @@ export default function AppIOS() {
   const [lastBounce, setLastBounce] = useState(0);
   const [liveBounce, setLiveBounce] = useState(0);
   const [heading, setHeading] = useState(0);
-  const [headingZero, setHeadingZero] = useState(null);
   const [position, setPosition] = useState({ x: 0, y: 0 });
   const [path, setPath] = useState([{ x: 0, y: 0 }]);
   const [status, setStatus] = useState("Tracking paused. Press Start");
@@ -109,15 +109,17 @@ export default function AppIOS() {
 
   const runningRef = useRef(false);
   const headingRef = useRef(0);
-  // 0 by default = uncalibrated heading reads as raw sensor azimuth. This is
-  // ONLY ever changed by the explicit setZero() action below — nothing else
-  // (mount, Start) silently recalibrates it.
-  const headingZeroRef = useRef(0);
-  // Whether the user has ever told the app which way the floor plan's "up" is.
-  // Until they have, heading 0 means "whatever direction the sensor calls zero",
-  // which has no relationship to the map. Persisted, because it is a property of
-  // the BUILDING and does not change between sessions.
-  const [headingCalibrated, setHeadingCalibrated] = useState(false);
+  // Heading = zero - alpha. The zero puts the floor plan's REAL NORTH (to the
+  // left of the drawing) where it belongs, so the map's up is compass east
+  // (services/MapNorth.js). It used to be whatever the phone faced when Zero
+  // Heading was tapped; a wrong or missing tap turned every walk.
+  const alphaNorthRef = useRef(null);
+  if (!alphaNorthRef.current) alphaNorthRef.current = new AlphaNorthCheck("ios");
+  const headingZeroRef = useRef(mapHeadingZero(defaultAlphaNorth("ios")));
+  // Latest magnetometer bearing { deg, t }, to confirm the north (AlphaNorthCheck).
+  const magBearingRef = useRef(null);
+  // The direction is tied to the map from the start (real north).
+  const [headingCalibrated, setHeadingCalibrated] = useState(true);
   const positionRef = useRef({ x: 0, y: 0 });
   const totalDistanceRef = useRef(0);
   const lastStepTimeRef = useRef(0);
@@ -237,22 +239,8 @@ export default function AppIOS() {
     // have to re-walk their calibration distance on every app start.
     stepLengthModel.load();
 
-    // Restore which real-world direction counts as the map's forward.
-    (async () => {
-      try {
-        const saved = await AsyncStorage.getItem(HEADING_ZERO_KEY);
-        const v = saved === null ? NaN : Number(saved);
-        if (Number.isFinite(v)) {
-          headingZeroRef.current = v;
-          setHeadingZero(v);
-          // The heading so far was relative to the default zero; re-take it.
-          headingFilter.resync();
-          setHeadingCalibrated(true);
-        }
-      } catch (err) {
-        console.warn("Heading zero restore failed:", err);
-      }
-    })();
+    // A zero saved by the old Zero Heading button is no longer used (real north is).
+    AsyncStorage.removeItem(HEADING_ZERO_KEY).catch(() => {});
 
     const applyWheelchair = (s, prevMode) => {
       wheelchairEngine.setSettings({
@@ -270,11 +258,21 @@ export default function AppIOS() {
       }
     };
     applyWheelchair(appSettingsRef.current);
+    // Map rotation (Settings): the zero moves with it, and the direction is re-taken.
+    const applyMapRotation = (s) => {
+      if (!setMapRotationDeg(Number(s?.mapRotationDeg))) return;
+      headingZeroRef.current = mapHeadingZero(alphaNorthRef.current.value);
+      headingFilter.resync();
+      motionEngineRef.current?.clearHeadings?.();
+      wheelchairEngine.clearHeadings();
+    };
+    applyMapRotation(appSettingsRef.current);
     const unsub = subscribeAppSettings((newSettings) => {
       const prevMode = appSettingsRef.current?.mobilityMode;
       appSettingsRef.current = newSettings;
       setAppSettings(newSettings);
       applyWheelchair(newSettings, prevMode);
+      applyMapRotation(newSettings);
     });
     // The stored settings may have finished loading between the first render and this subscription: catch up.
     const loaded = getAppSettings();
@@ -426,9 +424,11 @@ export default function AppIOS() {
           });
         }
 
+        // Compass bearing (a true bearing only while the phone is flat).
+        const magBearing = norm(Math.atan2(-x, y) * (180 / Math.PI));
+        magBearingRef.current = { deg: magBearing, t: nowMs };
         if (!hasMotionRotationRef.current) {
-          let magDeg = Math.atan2(-x, y) * (180 / Math.PI);
-          magDeg = norm(magDeg);
+          const magDeg = magBearing;
           rawHeadingRef.current = magDeg;
 
           // NOTE THE SIGN, it differs from the DeviceMotion branch below on
@@ -441,7 +441,7 @@ export default function AppIOS() {
           // Applying the same subtraction to both mirrored this branch: turning
           // right swung the map left, and because PDR places each step with
           // x += len*sin(heading), every sideways step landed on the wrong side.
-          headingFilter.updateAbsolute(signed(magDeg - headingZeroRef.current));
+          headingFilter.updateAbsolute(mapHeadingFromBearing(magDeg));
           headingRef.current = headingFilter.heading;
           publishHeading();
         }
@@ -466,6 +466,19 @@ export default function AppIOS() {
           hasMotionRotationRef.current = true;
           const raw = norm(alphaDeg(data.rotation.alpha));
           rawHeadingRef.current = raw;
+          // Which way this phone's alpha is turned against north, checked against
+          // the magnetometer while the phone is held flat (MapNorth.js).
+          const mb = magBearingRef.current;
+          if (!alphaNorthRef.current.done && mb && Date.now() - mb.t < 300 &&
+              Math.abs(alphaDeg(data.rotation.beta || 0)) < 20 && Math.abs(alphaDeg(data.rotation.gamma || 0)) < 20) {
+            const c = alphaNorthRef.current.add(raw, mb.deg);
+            if (c !== null) {
+              headingZeroRef.current = mapHeadingZero(c);
+              headingFilter.resync();
+              motionEngineRef.current?.clearHeadings?.();
+              wheelchairEngine.clearHeadings();
+            }
+          }
           // rotation.alpha increases counter-clockwise, so subtracting it from
           // the zero reference is what converts it into the app's clockwise
           // heading. See the sign note in the magnetometer branch above.
@@ -749,20 +762,14 @@ export default function AppIOS() {
   // Stable identity, so the memoised Fusion Map does not re-render each time
   // the app shell does.
   const setZero = useCallback(() => {
-    const rawNow = rawHeadingRef.current;
-    headingZeroRef.current = rawNow;
-    setHeadingZero(rawNow);
-    setHeadingCalibrated(true);
-    AsyncStorage.setItem(HEADING_ZERO_KEY, String(rawNow)).catch((err) =>
-      console.warn("Heading zero save failed:", err)
-    );
-    headingFilter.reset(0);
-    // Headings buffered before the zero are in the old reference.
+    // North is fixed to the map (MapNorth.js); this only re-takes the direction
+    // from the compass now, for when the arrow has drifted.
+    headingFilter.resync();
+    // Headings buffered before it are in the old direction.
     motionEngineRef.current?.clearHeadings?.();
     wheelchairEngine.clearHeadings();
-    headingRef.current = 0;
-    setHeading(0);
-    setStatus("Heading zero calibrated (Forward = 0°)");
+    setHeadingCalibrated(true);
+    setStatus("Direction re-taken from the compass (map north is on the left)");
   }, []);
 
   const start = () => {
