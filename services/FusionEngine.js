@@ -134,6 +134,19 @@ export const FUSION_CONFIG = {
   STATIONARY_R_MULTIPLIER: 6.0,
   STATIONARY_Q_SCALE: 0.15,
 
+  // ── Beacons while navigating (setBleWeight below 1) ──
+  // Steps carry the track; beacons only correct it slowly, and are held off
+  // where they can only move a dot that is right:
+  //   - standing still: nobody moved, so the dot must not either (each beacon
+  //     update shifted it a little, and the dot crept while the user stood);
+  //   - the first steps of a walk: the smoothed ranges still describe where
+  //     the user stood, and pulled the dot back as walking started;
+  //   - turns: the ranges lag behind the turn and pulled the corner sideways.
+  NAV_BLE_START_STEPS: 4,
+  // A turn: step headings within this window differ by more than this.
+  NAV_BLE_TURN_DEG: 30,
+  NAV_BLE_TURN_WINDOW_MS: 3000,
+
   // ── Two-candidate (mirror) ambiguity resolution ──
   // Two range circles meet at two points mirrored about the beacon line, and no
   // amount of further ranging separates them while the user moves parallel to
@@ -228,6 +241,9 @@ export class FusionEngine {
     this._lastCorrectionTime = null;
     this._lastTickTime = Date.now();
     this._lastStepAt = null;     // drives the stationary gate - see correct()
+    this._walkSteps = 0;         // steps since the user last stood still
+    this._stepHeads = [];        // {t, h} of recent steps, for turns (NAV_BLE_*)
+    this._bleHeld = null;        // why the last beacon update was held off, or null
 
     // Optional second position hypothesis (the mirror candidate). null when the
     // fix is unambiguous, which is the normal case for wall-mounted beacons.
@@ -288,6 +304,8 @@ export class FusionEngine {
   /**
    * How strongly beacons correct the position (0..1). 1 while the start is being found,
    * low once navigating, so steps carry the track and beacons only pull it back slowly.
+   * Below 1 beacons are also held off while standing, as a walk starts and in turns
+   * (see NAV_BLE_*).
    */
   setBleWeight(w) {
     this._pf.bleWeight = Math.min(1, Math.max(0, Number.isFinite(w) ? w : 1));
@@ -398,6 +416,9 @@ export class FusionEngine {
     this._lastCorrectionTime = null;
     this._lastTickTime = Date.now();
     this._lastStepAt = null;
+    this._walkSteps = 0;
+    this._stepHeads = [];
+    this._bleHeld = null;
     this._alt = null;
     this._primaryLogLik = 0;
     this._primaryOobDebt = 0;
@@ -761,10 +782,15 @@ export class FusionEngine {
   predict(stepLengthFt, headingDeg, opts = {}) {
     // 0.30 m (shortest wheelchair push) to 1.20 m (StepLengthModel's longest step), in feet.
     // A tighter range cut long strides and raised short moves, so this map and the PDR tab disagreed.
-    const len = Math.max(0.98, Math.min(3.94, stepLengthFt || 2.3));
+    const len = Math.max(0.49, Math.min(3.94, stepLengthFt || 2.3));
     // A step IS the motion signal the correction step needs. Recording it here
     // means the stationary gate needs no separate sensor or external wiring.
-    this._lastStepAt = Date.now();
+    const nowMs = Date.now();
+    const wasStill = this._lastStepAt === null || nowMs - this._lastStepAt >= this._cfg.STATIONARY_AFTER_MS;
+    this._walkSteps = wasStill ? 1 : this._walkSteps + 1;
+    if (Number.isFinite(headingDeg)) this._stepHeads.push({ t: nowMs, h: headingDeg });
+    while (this._stepHeads.length && this._stepHeads[0].t < nowMs - this._cfg.NAV_BLE_TURN_WINDOW_MS) this._stepHeads.shift();
+    this._lastStepAt = nowMs;
     if (this._pfActive) {
       this._pf.step(len, headingDeg, opts.headingJumpSdDeg || 0, Number.isFinite(opts.t) ? opts.t : Date.now());
       this._pfSync();
@@ -844,6 +870,8 @@ export class FusionEngine {
     // Guard: both distances must be valid finite positives
     if (!Number.isFinite(d1) || !Number.isFinite(d2)) return;
     if (d1 <= 0 || d2 <= 0) return;
+    this._bleHeld = this._navBleHeld(Date.now());
+    if (this._bleHeld) return;
     if (this._pfActive) {
       // A beacon with almost no confidence (stale / just appeared) is left out.
       const use1 = (c1 ?? 1) >= 0.15, use2 = (c2 ?? 1) >= 0.15;
@@ -1039,6 +1067,24 @@ export class FusionEngine {
     this._trailFollow(this._x, this._y, isWalking);
   }
 
+  /**
+   * Navigating (beacon weight below 1): why beacons must not move the dot right
+   * now - "still", "walk-start" or "turning" - or null when they may (NAV_BLE_*).
+   */
+  _navBleHeld(now) {
+    if (!(this._pf.bleWeight < 1)) return null;
+    const c = this._cfg;
+    if (this._lastStepAt === null || now - this._lastStepAt >= c.STATIONARY_AFTER_MS) return "still";
+    if (this._walkSteps <= c.NAV_BLE_START_STEPS) return "walk-start";
+    const hs = this._stepHeads.filter((s) => s.t >= now - c.NAV_BLE_TURN_WINDOW_MS);
+    for (let i = 0; i < hs.length; i++) {
+      for (let j = i + 1; j < hs.length; j++) {
+        if (Math.abs(((hs[j].h - hs[i].h + 540) % 360) - 180) > c.NAV_BLE_TURN_DEG) return "turning";
+      }
+    }
+    return null;
+  }
+
   // --------------------------------------------------------------------------
   // PASSIVE TICK — call from setInterval (1 Hz) for passive drift
   // --------------------------------------------------------------------------
@@ -1114,6 +1160,8 @@ export class FusionEngine {
       netDisplacementFt: Number(
         Math.hypot(this._x - this._startX, this._y - this._startY).toFixed(2)
       ),
+      // Navigating: why beacons are not moving the dot now ("still", "walk-start", "turning").
+      bleHeld: this._bleHeld,
       isWalking: this._lastStepAt !== null
         && Date.now() - this._lastStepAt < this._cfg.STATIONARY_AFTER_MS,
       // Surfaced so the map can show BOTH possibilities rather than presenting

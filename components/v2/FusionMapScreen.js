@@ -1744,7 +1744,7 @@ function FusionMapScreen({
       fusionEngine.correct(d1Ft, d2Ft, c1, c2, s1, s2, { lag1Ms: lagOf(r1), lag2Ms: lagOf(r2) });
       if (testRecorder.active) {
         const stAfter = fusionEngine.getState();
-        testRecorder.add("ble", { d1: d1Ft, d2: d2Ft, x: stAfter.x, y: stAfter.y });
+        testRecorder.add("ble", { d1: d1Ft, d2: d2Ft, x: stAfter.x, y: stAfter.y, text: stAfter.bleHeld ? `held: ${stAfter.bleHeld}` : "" });
       }
       scheduleUiRefresh();
     });

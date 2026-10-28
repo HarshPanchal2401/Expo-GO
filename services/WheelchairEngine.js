@@ -37,6 +37,11 @@ export const WHEELCHAIR_CONFIG = {
   // average with this time constant (stopping, spinning).
   WINDOW_S: 1.0,
   SHORT_TAU_S: 0.3,
+  // ...which falls faster than it rises: falling at 0.3 s, the fade after the
+  // chair stopped still read as rolling for about a second - 0.5-0.8 m too
+  // far at every stop. A dip on a smooth floor is not lost: it is held and
+  // added back if the vibration returns (see ingest).
+  SHORT_RELEASE_TAU_S: 0.08,
   // Vibration (g RMS) that starts rolling, by Sensitivity. Rolling stops once
   // it drops below EXIT_FRAC of that.
   START_RMS_G: { low: 0.035, medium: 0.02, high: 0.012 },
@@ -55,13 +60,14 @@ export const WHEELCHAIR_CONFIG = {
   // Spinning the chair on the spot: turning faster than this (deg/s) adds no
   // forward distance.
   SPIN_YAW_DPS: 70,
-  // Distance handed to the app per move while rolling (m). Matches a step,
-  // which is what the position filters expect.
-  SEGMENT_M: 0.7,
+  // Distance handed to the app per move while rolling (m). Half a step: at
+  // 0.7 m the dot jumped forward in big hops about once a second, and a roll
+  // that stopped early still moved it a whole hop.
+  SEGMENT_M: 0.35,
   // A leftover shorter than this when rolling stops is dropped.
-  MIN_SEGMENT_M: 0.45,
+  MIN_SEGMENT_M: 0.15,
   // A push longer than this is handed over in equal parts.
-  MAX_SEGMENT_M: 1.0,
+  MAX_SEGMENT_M: 0.5,
   // Speed / push length limits (m/s, m).
   MIN_SPEED: 0.2,
   MAX_SPEED: 2.5,
@@ -179,7 +185,7 @@ export class WheelchairEngine {
     // Fast averages (~0.3 s): stopping and spinning must take effect at once,
     // not a whole window later.
     const ks = Math.min(1, dt / cfg.SHORT_TAU_S);
-    this.eShort += ks * (e - this.eShort);
+    this.eShort += Math.min(1, dt / (e < this.eShort ? cfg.SHORT_RELEASE_TAU_S : cfg.SHORT_TAU_S)) * (e - this.eShort);
     this.yawShort += ks * (yaw - this.yawShort);
 
     const s = { t, e, rt, yaw };

@@ -72,6 +72,7 @@ k   = dt / τ,   τ = 3 s        when the field is clean
 - **Disturbance test:** `| |B| − baseline | / baseline > 0.12`. The baseline is learned only from clean readings (EMA 0.01).
 - **Turning:** no compass correction while `|dθ/dt| > 40°/s`, because orientation sensors lag during turns.
 - **Resync:** if `|err| > 30°` for 1.5 s while the field is clean (6 s when unknown), snap to the compass.
+- **Standing still** (`setMoving(false)`: not walking, no preview steps, not rolling, no step for 2 s): no compass pull and no resync. The gyro holds the arrow, so a field bent by a desk or pillar can't swing it. Walking starts with walk-start alignment instead.
 - **Per-step heading:** the **circular mean** of θ over the stride, which cancels the phone's left-right sway.
 
 - **Walk-start alignment** (`alignToCompass`): when walking starts (first preview step, or confirmed walking without a preview), the heading is set to the compass at once using the compass−heading difference smoothed over 0.6 s. Only if the phone is held in front, the field is not disturbed, not turning, and the difference is 2–30°. The buffered stride headings are shifted by the same amount, so the first steps use it too.
@@ -189,7 +190,13 @@ K  = P Hᵀ / (H P Hᵀ + R) ;   x += K·(t − H·x) ;   P = (I − K H) P
 3. Fix committed:
    - `beginNavigation()` **always** runs right away, and a "✓ Position found" banner shows for 5 s.
    - If the heading has never been zeroed, the Zero Heading prompt stays visible while navigating. It no longer blocks navigation.
-4. **Navigating:** steps call `predict`, BLE calls `correct`, and the trail is drawn.
+4. **Navigating:** steps call `predict`, BLE calls `correct`, and the trail is drawn. Beacon weight is 0.15 (1 while a beacon fix settles). With weight below 1, beacons are **held off** (`bleHeld`):
+   - `still`: no step for 1.4 s. The dot doesn't move at all while you stand.
+   - `walk-start`: the first 4 steps of a walk. The smoothed ranges still describe where you stood.
+   - `turning`: step headings within 3 s differ by more than 30°. The ranges lag the turn.
+
+   Walking straight, beacons nudge the position slowly.
+   - **Wheelchair:** moves of 0.35 m while rolling, and Push in parts of up to 0.5 m. These keep their own length: the step range of 0.4–1.2 m used to turn short moves into 0.7 m. The vibration level falls fast (0.08 s), so the fade after a stop isn't counted as rolling.
 5. **Manual start** ("👆 Set My Start on the Map", or a tap on the map while locating):
    - Tap where you are, or tap a **saved start spot** (`StartSpots.js`: save a name at the tapped point, long-press to delete), then **Start Here**. `setManualPosition(x, y)` cancels locating, clamps the point into the room and seeds ±3 ft of uncertainty, so BLE still fine-tunes it.
    - BLE auto-placement is suspended while you choose.

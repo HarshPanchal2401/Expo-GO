@@ -331,11 +331,14 @@ export default function AppIOS() {
     // replaced by a 0.70 m guess — quietly discarding the calibration for
     // exactly the users who needed it most. Sourcing the range from the model
     // keeps one definition of what counts as a plausible step.
+    // A wheelchair move is not a step: its parts are shorter than any step
+    // (WheelchairEngine SEGMENT_M), and the step range turned them into 0.70 m.
+    const wheel = extra.carry === "wheelchair";
     const len =
       dynamicLen &&
       isFinite(dynamicLen) &&
-      dynamicLen >= STEP_MODEL_CONFIG.MIN_STEP_LENGTH_M &&
-      dynamicLen <= STEP_MODEL_CONFIG.MAX_STEP_LENGTH_M
+      dynamicLen >= (wheel ? 0.1 : STEP_MODEL_CONFIG.MIN_STEP_LENGTH_M) &&
+      dynamicLen <= (wheel ? 1.0 : STEP_MODEL_CONFIG.MAX_STEP_LENGTH_M)
         ? dynamicLen
         : 0.70;
 
@@ -486,6 +489,10 @@ export default function AppIOS() {
         const me = motionEngineRef.current;
         me.pushHeading(tMotion, headingFilter.heading);
         me.ingest(data, tMotion);
+        // Standing still the compass does not pull the arrow round (HeadingFilter.setMoving).
+        headingFilter.setMoving(
+          me.walking || me.previewSteps > 0 || wheelchairEngine.rolling || tMotion - lastStepTimeRef.current < 2000
+        );
         // Wheelchair mode: movement from the wheels' vibration (and the Push
         // button on the Fusion Map). Its vibration level is shown once a
         // second and logged in a recorded test, to tune Sensitivity.

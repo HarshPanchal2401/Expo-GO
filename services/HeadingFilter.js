@@ -123,6 +123,7 @@ export class HeadingFilter {
     this._heading = 0;
     this._initialized = false;
     this._hasGyro = false;
+    this._moving = true;        // walking / rolling (setMoving); standing, the gyro holds the heading
     this._down = null;          // low-passed gravity direction, device frame
     this._lastGyroT = null;     // seconds
     this._yawRateDps = 0;
@@ -282,6 +283,16 @@ export class HeadingFilter {
     this._lastAbsT = null;
     this._disagreeSince = null;
     this._clearStepWindow();
+  }
+
+  /**
+   * Is the user moving (walking, rolling)? Standing still the compass is not
+   * pulled in or re-synced: the gyro holds the heading (it drifts only a few
+   * degrees a minute), so a field bent by a desk or pillar no longer swings the
+   * arrow while nobody turned. Walking starts with alignToCompass() instead.
+   */
+  setMoving(on) {
+    this._moving = on !== false;
   }
 
   /**
@@ -517,6 +528,12 @@ export class HeadingFilter {
     } else {
       this._alignErr = null;
       this._alignErrT = null;
+    }
+
+    // Standing still: the gyro holds the heading (see setMoving).
+    if (!this._moving) {
+      this._disagreeSince = null;
+      return;
     }
 
     const clean = this._magDisturbed === false;
