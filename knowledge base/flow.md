@@ -277,9 +277,11 @@ Steps move the dot forward. Beacons pull it back to where the signal says the us
 | 5. Navigating        | `services/ParticleFilter.js`, `services/FusionEngine.js`, `services/WalkableGrid.js`                                                                                                |
 | Screen               | `components/v2/FusionMapScreen.js`                                                                                                                                                  |
 | Test recording       | `services/TestRecorder.js`                                                                                                                                                          |
+| 6. Guidance (Where to?) | `services/Router.js`, `services/Places.js`, `services/NavigationSession.js`, `components/v2/useGuidance.js`, `components/v2/GuidanceUi.js` |
 
 ## Known gaps in this flow
 
 - **Wheelchair rolling threshold is untuned:** the vibration level that means "rolling" was set without a real wheelchair recording. On carpet, rolling is not detected and the Push button is needed.
 - **Start in a pocket:** the heading at the start is unknown until the phone is held in front.
+- **Guidance not yet walked:** the route, instructions and rerouting were checked with synthetic walks only; they need a real recorded walk (wrong turn, standing, arrival).
 - **Not yet tested on a phone:** the flow above was checked in simulation and on the floor-plan grid only.

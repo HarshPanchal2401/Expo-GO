@@ -206,3 +206,11 @@ K  = P Hᵀ / (H P Hᵀ + R) ;   x += K·(t − H·x) ;   P = (I − K H) P
 
 ## 8. Loop closure (PDR tab)
 "Close loop" assumes you ended where you started. It spreads the end-point error back along the path in proportion to each point's position along it.
+
+
+## Indoor navigation ("Where to?")
+- Router.js: A* on the walkable grid, extra cost near walls, cut down to corners, split into legs (bearing like the heading: x += sin, y += cos).
+- Places.js: saved destinations {id, name, x, y, category}, snapped onto the green; the seed list is services/placesSeed.js.
+- NavigationSession.js: reads the dot only (never moves it). Progress along the route (never backwards), time left, next instruction, arrived within 3 ft, plans again after 3 s farther than 6 ft off the route (at most every 5 s).
+- UI: components/v2/useGuidance.js (state) and GuidanceUi.js (button, sheet, banner, cards). Route drawn in MapLineLayer's live part (blue with white casing, walked part dim, red pin). Only while navigating and the position is settled.
+- The test recorder logs route / reroute / arrive rows.

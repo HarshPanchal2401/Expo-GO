@@ -60,6 +60,8 @@ import Svg, {
 import { fusionEngine } from "../../services/FusionEngine.js";
 import { v2Scanner } from "../../services/v2BeaconScannerService.js";
 import MobilityModeSwitch from "./MobilityModeSwitch.js";
+import { useGuidance } from "./useGuidance.js";
+import { GuidanceTop, GuidanceBottom, PlacesSheet } from "./GuidanceUi.js";
 import { ensureFloorplanMigrated, FLOORPLAN_W_FT, FLOORPLAN_H_FT } from "../../services/FloorplanMigration.js";
 import { loadStartSpots, saveStartSpot, removeStartSpot, MAX_NAME } from "../../services/StartSpots.js";
 import { checkRangeGeometry } from "../../services/BeaconRangingCalibration.js";
@@ -745,6 +747,43 @@ const MapLineLayer = React.memo(function MapLineLayer({
       <G transform={`translate(${vt.tx} ${vt.ty}) scale(${vt.z})`}>
         {still}
 
+        {/* ── Guidance route (Where to?) ───────────────────────────────────
+            White casing under a blue line, like a maps app; the part already
+            walked is thin and dim; a pin marks the destination. */}
+        {live.route && (
+          <G>
+            {live.route.behind && (
+              <Polyline
+                points={live.route.behind} fill="none" stroke={C.textSecondary}
+                strokeWidth={2.5 * inv} strokeOpacity={0.6} strokeDasharray={`${5 * inv},${4 * inv}`}
+                strokeLinecap="round" strokeLinejoin="round"
+              />
+            )}
+            <Polyline
+              points={live.route.ahead} fill="none" stroke="#ffffff"
+              strokeWidth={8 * inv} strokeOpacity={0.9} strokeLinecap="round" strokeLinejoin="round"
+            />
+            <Polyline
+              points={live.route.ahead} fill="none" stroke="#1f6feb"
+              strokeWidth={5 * inv} strokeLinecap="round" strokeLinejoin="round"
+            />
+            <Circle cx={live.route.dest.cx} cy={live.route.dest.cy} r={9 * inv} fill={C.accentRed} stroke="#ffffff" strokeWidth={2.5 * inv} />
+            <Circle cx={live.route.dest.cx} cy={live.route.dest.cy} r={3 * inv} fill="#ffffff" />
+            {live.route.dest.name ? (
+              <>
+                <SvgText
+                  x={live.route.dest.cx} y={live.route.dest.cy - 14 * inv} textAnchor="middle"
+                  fontSize={12 * inv} fontWeight="800" fill="#0d1117" stroke="#0d1117" strokeWidth={3.5 * inv} strokeLinejoin="round"
+                >{live.route.dest.name}</SvgText>
+                <SvgText
+                  x={live.route.dest.cx} y={live.route.dest.cy - 14 * inv} textAnchor="middle"
+                  fontSize={12 * inv} fontWeight="800" fill="#ffffff"
+                >{live.route.dest.name}</SvgText>
+              </>
+            ) : null}
+          </G>
+        )}
+
         {/* ── "You're roughly here" proximity rings (NOT a precise fix) ── */}
         {live.rings.map((r) => (
           <Circle
@@ -839,7 +878,7 @@ const MapLineLayer = React.memo(function MapLineLayer({
               <Line x1={pending.cx - r * 1.6} y1={pending.cy} x2={pending.cx + r * 1.6} y2={pending.cy} stroke={C.accent} strokeWidth={1.5 * inv} />
               <Line x1={pending.cx} y1={pending.cy - r * 1.6} x2={pending.cx} y2={pending.cy + r * 1.6} stroke={C.accent} strokeWidth={1.5 * inv} />
               <SvgText x={pending.cx} y={pending.cy - r * 2.2} textAnchor="middle" fontSize={10 * inv} fill={C.accent} fontWeight="bold">
-                START
+                {live.pendingLabel}
               </SvgText>
             </G>
           );
@@ -887,6 +926,11 @@ function OfficeMapCanvas({
   // Small panel at the bottom of the map (the A/B choice), so it is in view
   // without scrolling.
   bottomPanel = null,
+  // Guidance (Where to?): the route to draw, a view to move to, and the overlays.
+  navRoute = null,
+  viewRequest = null,
+  pendingLabel = "START",
+  overlay = null,
 }) {
   const {
     x, y, uncertaintyRadius, trail,
@@ -1095,6 +1139,14 @@ function OfficeMapCanvas({
     clearTimeout(hideTimerRef.current);
   }, []);
 
+  // Guidance asks for a view (fit the route, centre on the user): tweened like the buttons.
+  const lastViewReqRef = useRef(0);
+  useEffect(() => {
+    if (!viewRequest || viewRequest.n === lastViewReqRef.current) return;
+    lastViewReqRef.current = viewRequest.n;
+    animateView({ zoom: viewRequest.zoom, cx: viewRequest.cx, cy: viewRequest.cy }, 450);
+  }, [viewRequest, animateView]);
+
   // Effective on-screen scale (px per ft) of the view shown, for drags.
   const getScale = useCallback(
     () => geomRef.current.base.scale * (liveRef.current.zoom ?? 1),
@@ -1276,6 +1328,16 @@ function OfficeMapCanvas({
     haloColor: quality.color,
     halo: !searching && haloPx > 3 ? { cx: userPx.cx, cy: userPx.cy, r: Math.min(haloPx, CANVAS_SIZE) } : null,
     pending: pendingPoint ? toScreen(pendingPoint.x, pendingPoint.y) : null,
+    pendingLabel,
+    route: navRoute
+      ? {
+        ahead: navRoute.ahead.map((pt) => { const { cx, cy } = toScreen(pt.x, pt.y); return `${cx.toFixed(1)},${cy.toFixed(1)}`; }).join(" "),
+        behind: navRoute.behind.length > 1
+          ? navRoute.behind.map((pt) => { const { cx, cy } = toScreen(pt.x, pt.y); return `${cx.toFixed(1)},${cy.toFixed(1)}`; }).join(" ")
+          : null,
+        dest: { ...toScreen(navRoute.dest.x, navRoute.dest.y), name: navRoute.dest.name },
+      }
+      : null,
   };
   // The same object while nothing in it changed, so the line layer (memo) is not
   // even re-rendered on the screen's other updates.
@@ -1421,6 +1483,7 @@ function OfficeMapCanvas({
           <Text style={styles.mapMotionText}>{isWalking ? "moving" : "still"}</Text>
         </View>
       )}
+      {overlay}
     </View>
   );
 }
@@ -2376,7 +2439,18 @@ function FusionMapScreen({
     setObstacleVer((v) => v + 1);
   };
 
+  // "Where to?": route from the dot to a place, and guidance along it. Reads the position only.
+  const guidanceOn = navPhase === "navigating" && !settling && !fusionState.positionAmbiguous && !placementMode && !obstacleEdit;
+  const guidance = useGuidance({
+    enabled: guidanceOn,
+    position: { x: fusionState.x, y: fusionState.y },
+    headingRef,
+    roomW,
+    roomH,
+  });
+
   const handleMapTap = (xRaw, yRaw) => {
+    if (guidance.onMapTap(xRaw, yRaw)) return;
     // Drawing obstacles uses the exact tap; everything else is about where a
     // PERSON is, which can only be on the walkway (the plan's green area).
     let xFt = xRaw, yFt = yRaw;
@@ -2879,6 +2953,7 @@ function FusionMapScreen({
           navPhase === "picking" ||
           navPhase === "choosing" ||
           navPhase === "locating" ||
+          guidance.picking ||
           (navPhase === "navigating" && fusionState.positionAmbiguous)
         }
         onMapTap={handleMapTap}
@@ -2888,10 +2963,21 @@ function FusionMapScreen({
             ? obstacleEdit.first
             : spotCal?.point && spotCal.stage !== "done"
             ? spotCal.point
-            : navPhase === "picking" ? pendingStart : null
+            : navPhase === "picking" ? pendingStart
+            : guidance.stage === "adding" ? guidance.pendingPlace : null
         }
+        pendingLabel={guidance.stage === "adding" ? "PLACE" : "START"}
         savedRoutesOnMap={savedRoutesOnMap}
+        navRoute={guidance.navRoute}
+        viewRequest={guidance.viewRequest}
+        overlay={guidanceOn ? (
+          <>
+            <GuidanceTop g={guidance} />
+            <GuidanceBottom g={guidance} />
+          </>
+        ) : null}
       />
+      <PlacesSheet g={guidance} />
 
       {/* ── Status cards ─────────────────────────────────────────────────
           Below the map, not above it: these appear, grow and disappear as
