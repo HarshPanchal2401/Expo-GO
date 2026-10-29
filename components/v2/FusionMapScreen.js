@@ -2440,7 +2440,7 @@ function FusionMapScreen({
   };
 
   // "Where to?": route from the dot to a place, and guidance along it. Reads the position only.
-  const guidanceOn = navPhase === "navigating" && !settling && !fusionState.positionAmbiguous && !placementMode && !obstacleEdit;
+  const guidanceOn = (navPhase === "navigating" || navPhase === "located") && !settling && !placementMode && !obstacleEdit;
   const guidance = useGuidance({
     enabled: guidanceOn,
     position: { x: fusionState.x, y: fusionState.y },
