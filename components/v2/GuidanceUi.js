@@ -67,6 +67,16 @@ export function GuidanceBottom({ g }) {
   const { stage, info, dest, message } = g;
   const [name, setName] = useState("");
 
+  if (!g.enabled && stage === "idle") {
+    return (
+      <View style={styles.bottom} pointerEvents="none">
+        <View style={[styles.whereBtn, styles.whereOff]}>
+          <Text style={styles.whereText}>📍 Where to?</Text>
+          <Text style={styles.whereHint}>Locate yourself first, then it works</Text>
+        </View>
+      </View>
+    );
+  }
   if (stage === "idle") {
     return (
       <View style={styles.bottom} pointerEvents="box-none">
@@ -203,6 +213,8 @@ const styles = StyleSheet.create({
   bannerNote: { color: "#fff", fontSize: 12, marginTop: 4, fontWeight: "600" },
   note: { alignSelf: "center", backgroundColor: C.surface, color: C.orange, fontSize: 12, paddingHorizontal: 10, paddingVertical: 5, borderRadius: 8, marginBottom: 6, overflow: "hidden" },
   whereBtn: { alignSelf: "center", backgroundColor: C.blue, borderRadius: 24, paddingVertical: 11, paddingHorizontal: 22, elevation: 4 },
+  whereOff: { backgroundColor: "#30363d", alignItems: "center", opacity: 0.9 },
+  whereHint: { color: "#c9d1d9", fontSize: 10, marginTop: 1 },
   whereText: { color: "#fff", fontSize: 15, fontWeight: "800" },
   card: { backgroundColor: C.surface, borderRadius: 12, borderWidth: 1, borderColor: C.border, padding: 12 },
   cardRow: { flexDirection: "row", alignItems: "center" },

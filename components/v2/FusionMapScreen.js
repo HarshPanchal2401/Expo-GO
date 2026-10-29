@@ -2970,12 +2970,12 @@ function FusionMapScreen({
         savedRoutesOnMap={savedRoutesOnMap}
         navRoute={guidance.navRoute}
         viewRequest={guidance.viewRequest}
-        overlay={guidanceOn ? (
+        overlay={(
           <>
             <GuidanceTop g={guidance} />
             <GuidanceBottom g={guidance} />
           </>
-        ) : null}
+        )}
       />
       <PlacesSheet g={guidance} />
 
