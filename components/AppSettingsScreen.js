@@ -26,6 +26,8 @@ import {
   DEFAULT_APP_SETTINGS,
   getAppSettings,
 } from "../services/appSettingsStorage.js";
+import MobilityModeSwitch from "./v2/MobilityModeSwitch.js";
+import OtaUpdateCard from "./OtaUpdateCard.js";
 import { wheelchairEngine } from "../services/WheelchairEngine.js";
 
 let Updates = null;
@@ -107,7 +109,7 @@ export default function AppSettingsScreen() {
   if (loading) {
     return (
       <View style={s.centerBox}>
-        <ActivityIndicator size="large" color="#1f6feb" />
+        <ActivityIndicator size="large" color="#4d8dff" />
         <Text style={s.centerText}>Loading configurations...</Text>
       </View>
     );
@@ -118,9 +120,9 @@ export default function AppSettingsScreen() {
       {/* Header Banner */}
       <View style={s.header}>
         <View style={s.headerBadge}>
-          <Text style={s.headerBadgeText}>⚙️ CONFIG ENGINE</Text>
+          <Text style={s.headerBadgeText}>SETTINGS</Text>
         </View>
-        <Text style={s.headerTitle}>App Parameter Tuning</Text>
+        <Text style={s.headerTitle}>Settings</Text>
         <Text style={s.headerSub}>
           Tune the step detector and stride length. BLE distance settings (Measured Power, n, Kalman) are on the 📏 Raw tab; room size is on the Fusion Map.
         </Text>
@@ -197,8 +199,8 @@ export default function AppSettingsScreen() {
           style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: 10 }}
         >
           <View style={{ flex: 1, paddingRight: 12 }}>
-            <Text style={{ color: "#1e293b", fontSize: 13, fontWeight: "700" }}>Step Engine</Text>
-            <Text style={{ color: "#64748b", fontSize: 11, marginTop: 2 }}>
+            <Text style={{ color: "#f2f4f8", fontSize: 13, fontWeight: "700" }}>Step Engine</Text>
+            <Text style={{ color: "#9aa3b2", fontSize: 11, marginTop: 2 }}>
               NEW: walking detected from the rhythm of the last 2.5 s, any phone position (hand, pocket, swinging); shakes and picking up the phone are ignored. CLASSIC: the old peak detector.
             </Text>
           </View>
@@ -212,8 +214,8 @@ export default function AppSettingsScreen() {
           style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: 10 }}
         >
           <View style={{ flex: 1, paddingRight: 12 }}>
-            <Text style={{ color: "#1e293b", fontSize: 13, fontWeight: "700" }}>Map Matching</Text>
-            <Text style={{ color: "#64748b", fontSize: 11, marginTop: 2 }}>
+            <Text style={{ color: "#f2f4f8", fontSize: 13, fontWeight: "700" }}>Map Matching</Text>
+            <Text style={{ color: "#9aa3b2", fontSize: 11, marginTop: 2 }}>
               ON: while navigating, the position can only move along walkable paths (walls, pillars and no-walk areas drawn on the Fusion Map) and learns your step length and heading drift. OFF: the previous filter.
             </Text>
           </View>
@@ -228,8 +230,8 @@ export default function AppSettingsScreen() {
           style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: 10 }}
         >
           <View style={{ flex: 1, paddingRight: 12 }}>
-            <Text style={{ color: "#1e293b", fontSize: 13, fontWeight: "700" }}>Shake Filter (classic engine only)</Text>
-            <Text style={{ color: "#64748b", fontSize: 11, marginTop: 2 }}>
+            <Text style={{ color: "#f2f4f8", fontSize: 13, fontWeight: "700" }}>Shake Filter (classic engine only)</Text>
+            <Text style={{ color: "#9aa3b2", fontSize: 11, marginTop: 2 }}>
               ON: shaking the phone is not counted as steps. Turn OFF if walking is not detected.
             </Text>
           </View>
@@ -300,6 +302,9 @@ export default function AppSettingsScreen() {
 
       </View>
 
+      <Text style={s.appLabel}>APP</Text>
+      <OtaUpdateCard />
+
       {/* Reset to Factory Defaults */}
       <View style={s.resetContainer}>
         <Pressable onPress={handleReset} style={s.resetBtn}>
@@ -362,16 +367,32 @@ function MobilityCard({ settings, updateParam, onSaved }) {
     );
   };
 
-  // Walking needs no options here; the mode itself is switched on the PDR tab / Fusion Map.
-  if (!wheelchair) return null;
+  // The mode itself is switched here, and only here.
+  const modeCard = (
+    <View style={s.card}>
+      <View style={s.cardHeader}>
+        <View style={{ flex: 1 }}>
+          <Text style={s.cardTitle}>🚶 Movement Mode</Text>
+          <Text style={s.cardDesc}>
+            Walking counts your steps. Wheelchair has no steps: it moves from the wheels' vibration and the Push button on the Map.
+            Stop tracking / navigating before you switch.
+          </Text>
+        </View>
+      </View>
+      <MobilityModeSwitch />
+    </View>
+  );
+  if (!wheelchair) return modeCard;
 
   return (
+    <>
+    {modeCard}
     <View style={s.card}>
       <View style={s.cardHeader}>
         <View style={{ flex: 1 }}>
           <Text style={s.cardTitle}>♿ Wheelchair</Text>
           <Text style={s.cardDesc}>
-            Wheelchair mode is on. Switch between Walking and Wheelchair on the PDR tab or the Fusion Map. A wheelchair makes
+            Wheelchair mode is on. Switch back to Walking in Movement Mode above. A wheelchair makes
             no steps, so movement comes from the wheels' vibration (rolling) and from the Push button on the Fusion Map.
             Direction comes from the gyro.
           </Text>
@@ -385,8 +406,8 @@ function MobilityCard({ settings, updateParam, onSaved }) {
             style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: 10, marginTop: 6 }}
           >
             <View style={{ flex: 1, paddingRight: 12 }}>
-              <Text style={{ color: "#1e293b", fontSize: 13, fontWeight: "700" }}>Detect Rolling Automatically</Text>
-              <Text style={{ color: "#64748b", fontSize: 11, marginTop: 2 }}>
+              <Text style={{ color: "#f2f4f8", fontSize: 13, fontWeight: "700" }}>Detect Rolling Automatically</Text>
+              <Text style={{ color: "#9aa3b2", fontSize: 11, marginTop: 2 }}>
                 ON: the wheels' vibration moves you at the speed below. OFF: only the Push button moves you (best on carpet).
               </Text>
             </View>
@@ -453,7 +474,7 @@ function MobilityCard({ settings, updateParam, onSaved }) {
               </Pressable>
             ) : (
               <>
-                <Text style={[s.inputHint, { color: "#0f172a", fontWeight: "700" }]}>
+                <Text style={[s.inputHint, { color: "#f2f4f8", fontWeight: "700" }]}>
                   {`Rolling detected: ${(cal.progress.rollS || 0).toFixed(1)} s · Pushes: ${cal.progress.pushes || 0}`}
                 </Text>
                 <View style={[s.unitGroup, { marginTop: 6 }]}>
@@ -489,6 +510,7 @@ function MobilityCard({ settings, updateParam, onSaved }) {
         </>
       )}
     </View>
+    </>
   );
 }
 
@@ -599,9 +621,10 @@ function SettingNumberRow({
 // STYLES
 // ============================================================================
 const s = StyleSheet.create({
+  appLabel: { fontSize: 12, fontWeight: "700", letterSpacing: 0.8, color: "#9aa3b2", marginTop: 8, marginLeft: 4 },
   container: {
     flex: 1,
-    backgroundColor: "#f4f6f9",
+    backgroundColor: "#0a0c11",
   },
   content: {
     padding: 14,
@@ -615,7 +638,7 @@ const s = StyleSheet.create({
   },
   centerText: {
     marginTop: 12,
-    color: "#57606a",
+    color: "#9aa3b2",
     fontSize: 14,
     fontWeight: "600",
   },
@@ -624,9 +647,9 @@ const s = StyleSheet.create({
   },
   headerBadge: {
     alignSelf: "flex-start",
-    backgroundColor: "#ddf4ff",
+    backgroundColor: "rgba(77,141,255,0.12)",
     borderWidth: 1,
-    borderColor: "#54aeff",
+    borderColor: "#4d8dff",
     borderRadius: 6,
     paddingHorizontal: 8,
     paddingVertical: 3,
@@ -635,18 +658,18 @@ const s = StyleSheet.create({
   headerBadgeText: {
     fontSize: 10,
     fontWeight: "800",
-    color: "#0969da",
+    color: "#4d8dff",
     letterSpacing: 0.5,
   },
   headerTitle: {
     fontSize: 24,
     fontWeight: "900",
-    color: "#1e293b",
+    color: "#f2f4f8",
     letterSpacing: -0.5,
   },
   headerSub: {
     fontSize: 12.5,
-    color: "#475569",
+    color: "#9aa3b2",
     marginTop: 4,
     lineHeight: 18,
   },
@@ -668,7 +691,7 @@ const s = StyleSheet.create({
     elevation: 2,
   },
   btnSave: {
-    backgroundColor: "#1f6feb",
+    backgroundColor: "#4d8dff",
   },
   btnSaveText: {
     color: "#ffffff",
@@ -676,7 +699,7 @@ const s = StyleSheet.create({
     fontSize: 14,
   },
   btnRestart: {
-    backgroundColor: "#2da44e",
+    backgroundColor: "#1f9d6b",
   },
   btnRestartText: {
     color: "#ffffff",
@@ -684,42 +707,42 @@ const s = StyleSheet.create({
     fontSize: 14,
   },
   unsavedBanner: {
-    backgroundColor: "#fff8c5",
+    backgroundColor: "rgba(245,184,75,0.12)",
     borderWidth: 1,
-    borderColor: "#d4a72c",
+    borderColor: "#f5b84b",
     padding: 10,
     borderRadius: 8,
     marginBottom: 12,
     alignItems: "center",
   },
   unsavedText: {
-    color: "#7d4e17",
+    color: "#f5b84b",
     fontWeight: "700",
     fontSize: 12,
     textAlign: "center",
   },
   successBanner: {
-    backgroundColor: "#dafbe1",
+    backgroundColor: "rgba(52,211,154,0.12)",
     borderWidth: 1,
-    borderColor: "#4ac26b",
+    borderColor: "#34d39a",
     padding: 10,
     borderRadius: 8,
     marginBottom: 12,
     alignItems: "center",
   },
   successText: {
-    color: "#1a7f37",
+    color: "#34d39a",
     fontWeight: "800",
     fontSize: 12.5,
     textAlign: "center",
   },
   card: {
-    backgroundColor: "#ffffff",
+    backgroundColor: "#13161d",
     borderRadius: 14,
     padding: 14,
     marginBottom: 14,
     borderWidth: 1,
-    borderColor: "#e2e8f0",
+    borderColor: "#232834",
     shadowColor: "#000",
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.04,
@@ -735,11 +758,11 @@ const s = StyleSheet.create({
   cardTitle: {
     fontSize: 15,
     fontWeight: "800",
-    color: "#0f172a",
+    color: "#f2f4f8",
   },
   cardDesc: {
     fontSize: 11.5,
-    color: "#64748b",
+    color: "#9aa3b2",
     marginTop: 2,
     marginBottom: 8,
     lineHeight: 16,
@@ -750,13 +773,13 @@ const s = StyleSheet.create({
     justifyContent: "space-between",
     paddingVertical: 10,
     borderTopWidth: 1,
-    borderTopColor: "#f1f5f9",
+    borderTopColor: "#232834",
     gap: 8,
   },
   inputRowStacked: {
     paddingVertical: 10,
     borderTopWidth: 1,
-    borderTopColor: "#f1f5f9",
+    borderTopColor: "#232834",
   },
   inputLabelCol: {
     flex: 1,
@@ -772,23 +795,23 @@ const s = StyleSheet.create({
   inputLabel: {
     fontSize: 13,
     fontWeight: "700",
-    color: "#1e293b",
+    color: "#f2f4f8",
     lineHeight: 18,
   },
   unitBadge: {
     fontSize: 10,
     fontWeight: "800",
-    color: "#0969da",
-    backgroundColor: "#f0f8ff",
+    color: "#4d8dff",
+    backgroundColor: "rgba(77,141,255,0.12)",
     borderWidth: 1,
-    borderColor: "#b6e3ff",
+    borderColor: "#4d8dff",
     paddingHorizontal: 5,
     paddingVertical: 1,
     borderRadius: 4,
   },
   inputHint: {
     fontSize: 11,
-    color: "#64748b",
+    color: "#9aa3b2",
     marginTop: 2,
     lineHeight: 15,
   },
@@ -802,19 +825,19 @@ const s = StyleSheet.create({
     width: 36,
     height: 38,
     borderRadius: 8,
-    backgroundColor: "#f1f5f9",
+    backgroundColor: "#1b1f29",
     borderWidth: 1,
-    borderColor: "#cbd5e1",
+    borderColor: "#232834",
     alignItems: "center",
     justifyContent: "center",
   },
   stepperBtnPressed: {
-    backgroundColor: "#e2e8f0",
+    backgroundColor: "#1b1f29",
   },
   stepperBtnText: {
     fontSize: 19,
     fontWeight: "800",
-    color: "#1e293b",
+    color: "#f2f4f8",
     lineHeight: 22,
   },
   stepperInput: {
@@ -822,19 +845,19 @@ const s = StyleSheet.create({
     height: 38,
     borderRadius: 8,
     borderWidth: 1.5,
-    borderColor: "#cbd5e1",
-    backgroundColor: "#ffffff",
+    borderColor: "#232834",
+    backgroundColor: "#13161d",
     textAlign: "center",
     fontSize: 14,
     fontWeight: "800",
-    color: "#0f172a",
+    color: "#f2f4f8",
     paddingVertical: 0,
     paddingHorizontal: 6,
     includeFontPadding: false,
   },
   stepperInputFocused: {
-    borderColor: "#1f6feb",
-    backgroundColor: "#f0f8ff",
+    borderColor: "#4d8dff",
+    backgroundColor: "rgba(77,141,255,0.12)",
   },
   unitGroup: {
     flexDirection: "row",
@@ -845,19 +868,19 @@ const s = StyleSheet.create({
     paddingVertical: 9,
     borderRadius: 8,
     borderWidth: 1,
-    borderColor: "#cbd5e1",
-    backgroundColor: "#ffffff",
+    borderColor: "#232834",
+    backgroundColor: "#13161d",
     alignItems: "center",
     justifyContent: "center",
   },
   unitBtnActive: {
-    backgroundColor: "#1f6feb",
-    borderColor: "#1f6feb",
+    backgroundColor: "#4d8dff",
+    borderColor: "#4d8dff",
   },
   unitBtnText: {
     fontSize: 12,
     fontWeight: "700",
-    color: "#475569",
+    color: "#9aa3b2",
   },
   unitBtnTextActive: {
     color: "#ffffff",
@@ -871,13 +894,13 @@ const s = StyleSheet.create({
     paddingVertical: 12,
     paddingHorizontal: 20,
     borderRadius: 10,
-    backgroundColor: "#fff1f2",
+    backgroundColor: "rgba(255,122,122,0.12)",
     borderWidth: 1,
-    borderColor: "#fecdd3",
+    borderColor: "rgba(255,122,122,0.35)",
   },
   resetBtnText: {
     fontSize: 12.5,
     fontWeight: "800",
-    color: "#e11d48",
+    color: "#ff7a7a",
   },
 });

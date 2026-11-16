@@ -277,7 +277,7 @@ Steps move the dot forward. Beacons pull it back to where the signal says the us
 | 5. Navigating        | `services/ParticleFilter.js`, `services/FusionEngine.js`, `services/WalkableGrid.js`                                                                                                |
 | Screen               | `components/v2/FusionMapScreen.js`                                                                                                                                                  |
 | Test recording       | `services/TestRecorder.js`                                                                                                                                                          |
-| 6. Guidance (Where to?) | `services/Router.js`, `services/Places.js`, `services/NavigationSession.js`, `components/v2/useGuidance.js`, `components/v2/GuidanceUi.js` |
+| 6. Guidance (Where to?) | `services/NavGraph.js`, `services/Router.js`, `services/Places.js`, `services/NavigationSession.js`, `components/v2/useGuidance.js`, `components/v2/GuidanceUi.js` |
 
 ## Known gaps in this flow
 

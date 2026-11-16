@@ -15,7 +15,7 @@ An **indoor navigation app** for one office. It shows the user's live position o
 
 | Item | Value |
 |---|---|
-| Floor plan | Office, **70 × 70 ft** (`assets/floorplans/office-70x70.png`, 1115×963 px cropped to the outer walls, stretched over the room). Saves from the earlier 72 × 72 and 70 × 72 drawings (room size, beacon positions, start spots, obstacles) are moved onto it once by `services/FloorplanMigration.js` (x, y × new/old size). |
+| Floor plan | Office, **65 × 70 ft** (`assets/floorplans/office-65x70.png`, 1009×977 px cropped to the outer walls, stretched over the room; cream floor, walkable grid 130×140 cells of 0.5 ft built by `scripts/build_walkable_grid.py`). Saves from the earlier 72 × 72, 70 × 72 and 70 × 70 drawings (room size, beacon positions, start spots, obstacles, places) are moved onto it once by `services/FloorplanMigration.js` (x, y × new/old size). `services/placesSeed.js` lists the office rooms as "Where to?" destinations. |
 | Coordinates | Feet, origin bottom-left, **y up**. Heading 0° = map up (+Y), 90° = right (+X), clockwise-positive. A step moves `x += L·sin θ`, `y += L·cos θ`. |
 | Beacons | B1 and B2, placed on the map by the user (anchor positions are stored) |
 | Environment | Many walls, pillars, glass cabins and furniture. BLE signals are heavily affected by these obstacles (NLOS). |

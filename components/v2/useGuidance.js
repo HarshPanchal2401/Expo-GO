@@ -15,6 +15,17 @@ import { splitRoute, fitView } from "../../services/RouteGeometry.js";
 import { testRecorder } from "../../services/TestRecorder.js";
 import { getAppSettings } from "../../services/appSettingsStorage.js";
 
+let AsyncStorage = null;
+try {
+  const mod = require("@react-native-async-storage/async-storage");
+  AsyncStorage = mod.default || mod;
+} catch (e) {
+  AsyncStorage = null;
+}
+const RECENT_KEY = "@places_recent_v1";
+const MAX_RECENT = 4;
+const MAX_QUICK = 6;
+
 const WALK_MPS = 1.0;
 
 function speedMps() {
@@ -33,6 +44,7 @@ export function useGuidance({ enabled, position, headingRef, roomW, roomH }) {
   const [pendingPlace, setPendingPlace] = useState(null);
   const [message, setMessage] = useState("");
   const [viewRequest, setViewRequest] = useState(null);
+  const [recentIds, setRecentIds] = useState([]);
 
   const sessionRef = useRef(new NavigationSession());
   const viewN = useRef(0);
@@ -40,6 +52,19 @@ export function useGuidance({ enabled, position, headingRef, roomW, roomH }) {
   posRef.current = position;
 
   useEffect(() => { loadPlaces().then((l) => setPlaces([...l])); }, []);
+  useEffect(() => {
+    if (!AsyncStorage) return;
+    AsyncStorage.getItem(RECENT_KEY)
+      .then((raw) => { const a = JSON.parse(raw || "[]"); if (Array.isArray(a)) setRecentIds(a.map(String).slice(0, MAX_RECENT)); })
+      .catch(() => {});
+  }, []);
+  const rememberRecent = useCallback((id) => {
+    setRecentIds((prev) => {
+      const next = [String(id), ...prev.filter((x) => x !== String(id))].slice(0, MAX_RECENT);
+      try { AsyncStorage?.setItem(RECENT_KEY, JSON.stringify(next)); } catch (e) { /* this run only */ }
+      return next;
+    });
+  }, []);
 
   const requestView = useCallback((pts) => {
     if (!pts || pts.length < 1) return;
@@ -71,6 +96,10 @@ export function useGuidance({ enabled, position, headingRef, roomW, roomH }) {
   const closeSheet = useCallback(() => setSheetOpen(false), []);
 
   const choose = useCallback((place) => {
+    if (!enabled) {
+      setMessage("Find your position first, then pick a place.");
+      return;
+    }
     const r = plan(place);
     setSheetOpen(false);
     if (!r) {
@@ -83,9 +112,10 @@ export function useGuidance({ enabled, position, headingRef, roomW, roomH }) {
     setInfo(sessionRef.current.update({ ...posRef.current, heading: headingRef?.current }, Date.now()));
     setStage("preview");
     setMessage("");
+    rememberRecent(place.id);
     requestView([posRef.current, ...r.points]);
     testRecorder.add("route", { x: posRef.current.x, y: posRef.current.y, len: r.totalFt, text: place.name });
-  }, [plan, headingRef, requestView]);
+  }, [enabled, plan, headingRef, requestView, rememberRecent]);
 
   const startGuidance = useCallback(() => {
     if (!route) return;
@@ -103,11 +133,14 @@ export function useGuidance({ enabled, position, headingRef, roomW, roomH }) {
     setStage("adding");
   }, []);
 
+  // A tap on a saved place's pin (idle) plans the way there; while adding, a tap sets the new place.
   const onMapTap = useCallback((x, y) => {
-    if (stage !== "adding") return false;
-    const p = snapToGreen({ x, y });
-    setPendingPlace(p || { x, y });
-    return true;
+    if (stage === "adding") {
+      const p = snapToGreen({ x, y });
+      setPendingPlace(p || { x, y });
+      return true;
+    }
+    return false;
   }, [stage]);
 
   const saveNewPlace = useCallback(async (name) => {
@@ -179,7 +212,7 @@ export function useGuidance({ enabled, position, headingRef, roomW, roomH }) {
   // If navigation stays off (Stop, reset) the plan goes with it; a short flicker of the
   // position (ambiguous for a moment) only pauses it.
   useEffect(() => {
-    if (enabled || stage === "idle") return undefined;
+    if (enabled || stage === "idle" || stage === "adding") return undefined;
     const t = setTimeout(reset, 10000);
     return () => clearTimeout(t);
   }, [enabled, stage, reset]);
@@ -195,11 +228,27 @@ export function useGuidance({ enabled, position, headingRef, roomW, roomH }) {
     [places, query, px, py]
   );
 
+  // Home panel: the places around, the last places walked to, and the landmark you are next to.
+  const nearby = useMemo(
+    () => searchPlaces(places, "", Number.isFinite(px) ? { x: px, y: py } : null),
+    [places, px, py]
+  );
+  const quick = useMemo(() => nearby.filter((p) => p.category !== "desk").slice(0, MAX_QUICK), [nearby]);
+  const recent = useMemo(
+    () => recentIds.map((id) => nearby.find((p) => p.id === id)).filter(Boolean),
+    [recentIds, nearby]
+  );
+  const nearestPlace = Number.isFinite(px) && nearby.length ? nearby[0] : null;
+
   return {
     enabled,
+    quick,
+    recent,
+    nearestPlace,
     stage,
     picking: stage === "adding",
-    sheetOpen: sheetOpen && enabled && stage !== "adding",
+    chips: results.slice(0, 6),
+    sheetOpen: sheetOpen && stage !== "adding",
     places: results,
     totalPlaces: places.length,
     query,

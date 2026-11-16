@@ -30,10 +30,10 @@ test("same name moves the place; empty name or bad point is refused", async () =
 });
 
 test("search: by part of the name, nearest first; remove deletes", async () => {
-  await savePlace("Meeting Room A", green.x, green.y);
+  await savePlace("Quiet Pod", green.x, green.y);
   const list = await loadPlaces();
-  assert.equal(searchPlaces(list, "meet").length, 1);
-  assert.equal(searchPlaces(list, "MEETING")[0].name, "Meeting Room A");
+  assert.equal(searchPlaces(list, "quie").length, 1);
+  assert.equal(searchPlaces(list, "QUIET")[0].name, "Quiet Pod");
   assert.equal(searchPlaces(list, "nothing here").length, 0);
   const far = { x: 100, y: 100 };
   const sorted = searchPlaces(list, "", far);

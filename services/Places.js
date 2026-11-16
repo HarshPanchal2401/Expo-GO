@@ -20,10 +20,14 @@ try {
 }
 
 const KEY = "@places_v1";
+const RESET_KEY = "@places_reset_v2"; // places saved earlier (old map, ready-made rooms) are cleared once
+const RECENT_KEY = "@places_recent_v1";
+const REMOVED_KEY = "@places_seed_removed_v1"; // seeded names the user deleted
 export const MAX_PLACES = 60;
 export const MAX_PLACE_NAME = 24;
 
 let cache = null;
+let removedSeeds = []; // lower-case names
 let loadPromise = null; // shared, so a save during the first read cannot overwrite the saved places
 
 /** A point on the green near p (a place in a wall is moved into the corridor), or null. */
@@ -46,15 +50,32 @@ export async function loadPlaces() {
     loadPromise = (async () => {
       let list = [];
       try {
+        if (AsyncStorage && !(await AsyncStorage.getItem(RESET_KEY))) {
+          await AsyncStorage.multiRemove([KEY, REMOVED_KEY, RECENT_KEY]);
+          await AsyncStorage.setItem(RESET_KEY, "1");
+        }
+      } catch (e) {
+        /* tried again on the next start */
+      }
+      try {
         const raw = AsyncStorage ? await AsyncStorage.getItem(KEY) : null;
         const parsed = JSON.parse(raw || "[]");
         if (Array.isArray(parsed)) list = parsed.map(clean).filter(Boolean);
       } catch (e) {
         /* unreadable: start from the seed */
       }
-      // The seed fills in names the phone does not have yet.
+      try {
+        const rm = JSON.parse((AsyncStorage ? await AsyncStorage.getItem(REMOVED_KEY) : null) || "[]");
+        if (Array.isArray(rm)) removedSeeds = rm.map(String);
+      } catch (e) {
+        /* none removed */
+      }
+      // The seed fills in names the phone does not have yet (and did not delete), on the floor.
       for (const s of PLACES_SEED.map(clean).filter(Boolean)) {
-        if (!list.some((p) => p.name.toLowerCase() === s.name.toLowerCase())) list.push(s);
+        const key = s.name.toLowerCase();
+        if (removedSeeds.includes(key) || list.some((p) => p.name.toLowerCase() === key)) continue;
+        const at = snapToGreen(s);
+        if (at) list.push({ ...s, x: at.x, y: at.y });
       }
       cache = list.slice(0, MAX_PLACES);
     })();
@@ -91,7 +112,16 @@ export async function savePlace(name, x, y, category = "") {
 
 export async function removePlace(id) {
   await loadPlaces();
+  const gone = cache.find((s) => s.id === id);
   cache = cache.filter((s) => s.id !== id);
+  if (gone && PLACES_SEED.some((s) => s.name.toLowerCase() === gone.name.toLowerCase())) {
+    removedSeeds = [...new Set([...removedSeeds, gone.name.toLowerCase()])];
+    try {
+      if (AsyncStorage) await AsyncStorage.setItem(REMOVED_KEY, JSON.stringify(removedSeeds));
+    } catch (e) {
+      /* remembered this run only */
+    }
+  }
   await persist();
   return cache;
 }

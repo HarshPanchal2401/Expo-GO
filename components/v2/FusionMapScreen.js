@@ -1,7 +1,7 @@
 // ============================================================================
 // FusionMapScreen.js — Live PDR + BLE Fusion Navigation on the Real Office Map
 //
-// Renders the actual office floor plan (assets/floorplans/office-70x70.png, 70 x 70 ft)
+// Renders the actual office floor plan (assets/floorplans/office-65x70.png, 65 x 70 ft)
 // as the map background, with a live fused position tracked by FusionEngine
 // (async EKF: PDR predicts every step, BLE corrects on every beacon packet).
 //
@@ -59,9 +59,8 @@ import Svg, {
 } from "react-native-svg";
 import { fusionEngine } from "../../services/FusionEngine.js";
 import { v2Scanner } from "../../services/v2BeaconScannerService.js";
-import MobilityModeSwitch from "./MobilityModeSwitch.js";
 import { useGuidance } from "./useGuidance.js";
-import { GuidanceTop, GuidanceBottom, PlacesSheet } from "./GuidanceUi.js";
+import { GuidanceTop, GuidanceHome, GuidanceBottom, PlacesSheet } from "./GuidanceUi.js";
 import { ensureFloorplanMigrated, FLOORPLAN_W_FT, FLOORPLAN_H_FT } from "../../services/FloorplanMigration.js";
 import { loadStartSpots, saveStartSpot, removeStartSpot, MAX_NAME } from "../../services/StartSpots.js";
 import { checkRangeGeometry } from "../../services/BeaconRangingCalibration.js";
@@ -80,7 +79,7 @@ import { MAP_NORTH_SIDE, getMapRotationDeg } from "../../services/MapNorth.js";
 // Everything the obstacle editor can draw: RF obstacles + no-walk areas.
 const EDIT_TYPES = [...OBSTACLE_TYPES, ...AREA_TYPES];
 
-const FLOORPLAN_IMAGE = require("../../assets/floorplans/office-70x70.png");
+const FLOORPLAN_IMAGE = require("../../assets/floorplans/office-65x70.png");
 
 // Bump with every change to the locating/ranging behaviour. Shown on screen
 // because an OTA update is only APPLIED on the next cold start after it
@@ -136,11 +135,11 @@ const UNCERTAINTY_HIGH_FT = 3.5;   // below this: confident fix
 const UNCERTAINTY_LOW_FT = 10;     // above this: general-area only
 
 const C = {
-  bg: "#0d1117",
-  surface: "#161b22",
-  surfaceAlt: "#1c2128",
-  border: "#30363d",
-  accent: "#58a6ff",
+  bg: "#0a0c11",
+  surface: "#13161d",
+  surfaceAlt: "#1b1f29",
+  border: "#232834",
+  accent: "#4d8dff",
   accentGreen: "#3fb950",
   accentOrange: "#d29922",
   accentRed: "#f85149",
@@ -310,7 +309,7 @@ function snapToGrid(ft, step = GRID_MINOR_FT) {
 /**
  * Scale + offset to fit a roomW×roomH (feet) rectangle into a boxW×boxH (px)
  * bounding box, preserving aspect ratio with a small margin. Works for square
- * rooms (today's 70×70 ft office) and non-square ones.
+ * rooms (today's 65×70 ft office) and non-square ones.
  */
 function computeTransform(roomW, roomH, boxW, boxH) {
   const scaleX = boxW / roomW;
@@ -784,6 +783,11 @@ const MapLineLayer = React.memo(function MapLineLayer({
           </G>
         )}
 
+        {/* ── Saved places (Where to?): a small dot each; tap one to go there ── */}
+        {live.pins && live.pins.map((pl, i) => (
+          <Circle key={`pin${i}`} cx={pl.cx} cy={pl.cy} r={4.2 * inv} fill="#a78bfa" stroke="#ffffff" strokeWidth={1.4 * inv} />
+        ))}
+
         {/* ── "You're roughly here" proximity rings (NOT a precise fix) ── */}
         {live.rings.map((r) => (
           <Circle
@@ -928,6 +932,7 @@ function OfficeMapCanvas({
   bottomPanel = null,
   // Guidance (Where to?): the route to draw, a view to move to, and the overlays.
   navRoute = null,
+  placePins = null,
   viewRequest = null,
   pendingLabel = "START",
   overlay = null,
@@ -1329,6 +1334,7 @@ function OfficeMapCanvas({
     halo: !searching && haloPx > 3 ? { cx: userPx.cx, cy: userPx.cy, r: Math.min(haloPx, CANVAS_SIZE) } : null,
     pending: pendingPoint ? toScreen(pendingPoint.x, pendingPoint.y) : null,
     pendingLabel,
+    pins: placePins ? placePins.map((pl) => ({ ...toScreen(pl.x, pl.y), name: pl.name })) : null,
     route: navRoute
       ? {
         ahead: navRoute.ahead.map((pt) => { const { cx, cy } = toScreen(pt.x, pt.y); return `${cx.toFixed(1)},${cy.toFixed(1)}`; }).join(" "),
@@ -1460,29 +1466,6 @@ function OfficeMapCanvas({
         </View>
       )}
 
-      {/* ── On-map distance readout ──────────────────────────────────────────
-          Two numbers, because one alone is ambiguous. WALKED is the sum of
-          measured step lengths — real odometry, so it counts only distance the
-          user's legs actually covered. It is deliberately NOT the length of the
-          drawn track, which also contains BLE correction movement and would
-          over-report a walk. NET is the straight-line distance from where
-          tracking started, so an out-and-back reads as a large WALKED with a
-          near-zero NET rather than looking like a tracking failure. */}
-      {!placementMode && (
-        <View style={styles.mapDistanceOverlay} pointerEvents="none">
-          <View style={styles.mapDistRow}>
-            <Text style={styles.mapDistLabel}>WALKED</Text>
-            <Text style={styles.mapDistValue}>{totalDistanceFt.toFixed(1)} ft</Text>
-          </View>
-          <View style={styles.mapDistDivider} />
-          <View style={styles.mapDistRow}>
-            <Text style={styles.mapDistLabel}>NET</Text>
-            <Text style={styles.mapDistValueAlt}>{netDisplacementFt.toFixed(1)} ft</Text>
-          </View>
-          <View style={[styles.mapMotionDot, isWalking ? styles.mapMotionMoving : styles.mapMotionStill]} />
-          <Text style={styles.mapMotionText}>{isWalking ? "moving" : "still"}</Text>
-        </View>
-      )}
       {overlay}
     </View>
   );
@@ -1555,6 +1538,9 @@ function FusionMapScreen({
   useEffect(() => { if (navPhase === "navigating") setLastTrail(null); }, [navPhase]);
   const [placementMode, setPlacementMode] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Panels under the controls, closed until wanted: the tools, and the live numbers.
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const [configLoaded, setConfigLoaded] = useState(false);
 
 
@@ -1639,6 +1625,18 @@ function FusionMapScreen({
     previewRef.current = { dx: 0, dy: 0, timer: null };
     setPreviewOffset(null);
   }, []);
+  // A confirmed step moved the position by (mx, my): the shown lead shrinks by half of it,
+  // so the dot keeps moving every step and the lead is used up in a few steps, never dropped.
+  const absorbPreview = (mx, my) => {
+    const pv = previewRef.current;
+    if (!(pv.dx || pv.dy)) return;
+    if (Math.hypot(mx, my) < 0.05) return; // that step did not move the position
+    const dx = pv.dx - 0.5 * mx, dy = pv.dy - 0.5 * my;
+    if (Math.hypot(dx, dy) < 0.4 || dx * mx + dy * my <= 0) { clearPreview(); return; }
+    if (pv.timer) clearTimeout(pv.timer);
+    previewRef.current = { dx, dy, timer: setTimeout(clearPreview, 3000) };
+    setPreviewOffset({ dx, dy });
+  };
   settlingRef.current = settling;
   const settleRef = useRef({ start: 0, hist: [] });
   // "choosing" entered while settling: the filter already runs on both spots,
@@ -2099,8 +2097,9 @@ function FusionMapScreen({
         } else if (navPhase !== "navigating") {
           return;
         }
-        // Confirmed steps replace the preview.
-        if (previewRef.current.dx || previewRef.current.dy) clearPreview();
+        // Confirmed steps take over from the preview gradually (below): dropping it at
+        // once pulled the dot back to the real position, then forward again.
+        const pvFrom = previewRef.current.dx || previewRef.current.dy ? fusionEngine.getState() : null;
         // Walking: the position is shown from the first step on.
         if (settlingRef.current) revealPosition();
         const stepLengthFt = metresToFeet(stepLengthMeters);
@@ -2109,6 +2108,7 @@ function FusionMapScreen({
         fusionEngine.predict(stepLengthFt, heading, { headingJumpSdDeg: headingReset ? 15 : 0, t });
         if (carry) setCarryMode(carry);
         const stAfter = fusionEngine.getState();
+        if (pvFrom) absorbPreview(stAfter.x - pvFrom.x, stAfter.y - pvFrom.y);
         testRecorder.add("step", { len: stepLengthFt, heading, x: stAfter.x, y: stAfter.y, text: carry || "" });
         showFusionState(stAfter);
       };
@@ -2650,27 +2650,28 @@ function FusionMapScreen({
       contentContainerStyle={styles.scrollContent}
       scrollEnabled={!mapGestureActive}
     >
-      {/* Walking / Wheelchair (only while idle: switching restarts the movement engines) */}
-      {!placementMode && (
-        <MobilityModeSwitch disabled={navPhase !== "idle"} hint="Stop navigation to switch mode." />
+      {/* Top: the search bar ("Where to?"), or the next-turn banner while guiding */}
+      {placementMode ? (
+        <View style={styles.runHeader}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.screenTitle}>Place beacons</Text>
+            <Text style={styles.runSubtitle}>Drag markers to their real position, then Save</Text>
+          </View>
+        </View>
+      ) : (
+        <GuidanceTop g={guidance} meta={`± ${(fusionState.uncertaintyRadius / 3.28084).toFixed(1)} m · ${roomW} × ${roomH} ft`} />
       )}
 
-      {/* Header */}
-      <View style={styles.runHeader}>
-        <View style={{ flex: 1 }}>
-          <Text style={styles.screenTitle}>🏢 Office Map</Text>
-          <Text style={styles.runSubtitle}>
-            {placementMode
-              ? "Drag markers to their real position, then Save"
-              : `${roomW} × ${roomH} ft  •  ${stepCount} steps  •  ${quality.label}`}
+      {/* Wheelchair mode makes no steps: walking does not move the dot, so say so */}
+      {mobilityMode === "wheelchair" && !placementMode && (
+        <View style={[styles.statusBanner, styles.statusBannerWarn]}>
+          <Text style={styles.statusBannerText}>
+            ♿ Wheelchair mode is on, so walking steps do not move the dot. Switch to Walking in Settings → Movement Mode.
           </Text>
         </View>
-        <TouchableOpacity style={styles.reconfigBtn} onPress={() => setSettingsOpen((s) => !s)}>
-          <Text style={styles.reconfigBtnText}>⚙ Floor Plan</Text>
-        </TouchableOpacity>
-      </View>
+      )}
 
-      {/* BLE scan status — makes a silently-dead feed impossible to miss */}
+      {/* BLE problems only: when the feed is fine, the chip above says so */}
       {(() => {
         const b1Selected = Boolean(bleStats.b1?.id);
         const b2Selected = Boolean(bleStats.b2?.id);
@@ -2701,8 +2702,7 @@ function FusionMapScreen({
           return (
             <View style={[styles.statusBanner, styles.statusBannerWarn]}>
               <Text style={styles.statusBannerText}>
-                📡 Scanning, but {!b1Selected && !b2Selected ? "no beacons are" : "one beacon isn't"} selected yet.
-                Pick B1/B2 in the Raw tab.
+                📡 {!b1Selected && !b2Selected ? "No beacons are" : "One beacon isn't"} selected yet. Pick B1/B2 in the Raw tab.
               </Text>
             </View>
           );
@@ -2711,18 +2711,12 @@ function FusionMapScreen({
           return (
             <View style={[styles.statusBanner, styles.statusBannerWarn]}>
               <Text style={styles.statusBannerText}>
-                📡 Scanning, beacons selected, but no packets received yet — check they're powered on and in range.
+                📡 No packets yet — check the beacons are powered on and in range.
               </Text>
             </View>
           );
         }
-        return (
-          <View style={[styles.statusBanner, styles.statusBannerOk]}>
-            <Text style={styles.statusBannerText}>
-              📡 Scanning • B1 {b1Signal ? "✓" : "…"} • B2 {b2Signal ? "✓" : "…"}
-            </Text>
-          </View>
-        );
+        return null;
       })()}
 
       {/* Floor plan size settings (collapsible) */}
@@ -2970,14 +2964,23 @@ function FusionMapScreen({
         savedRoutesOnMap={savedRoutesOnMap}
         navRoute={guidance.navRoute}
         viewRequest={guidance.viewRequest}
-        overlay={(
-          <>
-            <GuidanceTop g={guidance} />
-            <GuidanceBottom g={guidance} />
-          </>
-        )}
       />
-      <PlacesSheet g={guidance} />
+      <PlacesSheet g={guidance} room={{ w: roomW, h: roomH }} />
+
+      {/* Under the map: where you are + quick destinations (idle), or the route card */}
+      {!placementMode && (
+        <View style={{ marginTop: 14 }}>
+          <GuidanceBottom g={guidance} />
+          <GuidanceHome
+            g={guidance}
+            room={{ w: roomW, h: roomH }}
+            accuracyM={fusionState.uncertaintyRadius / 3.28084}
+            live={isScanning && !scanError}
+            beaconCount={(Number.isFinite(bleStats.b1?.rawRssi) ? 1 : 0) + (Number.isFinite(bleStats.b2?.rawRssi) ? 1 : 0)}
+            hint={navPhase === "idle" ? "Press Find My Position below to start." : ""}
+          />
+        </View>
+      )}
 
       {/* ── Status cards ─────────────────────────────────────────────────
           Below the map, not above it: these appear, grow and disappear as
@@ -3189,10 +3192,10 @@ function FusionMapScreen({
           <>
             {navPhase === "idle" && (
               <>
-                <TouchableOpacity style={[styles.placeBtn, { flex: 1, marginRight: 10 }]} onPress={() => setPlacementMode(true)}>
-                  <Text style={styles.primaryBtnText}>📍 Place Beacons</Text>
+                <TouchableOpacity style={[styles.secondaryBtn, { flex: 1, marginRight: 10 }]} onPress={handleStartPicking}>
+                  <Text style={styles.secondaryBtnText}>👆 Set Start on Map</Text>
                 </TouchableOpacity>
-                <TouchableOpacity style={[styles.primaryBtn, { flex: 1 }]} onPress={handleStartLocating}>
+                <TouchableOpacity style={[styles.primaryBtn, { flex: 1.3 }]} onPress={handleStartLocating}>
                   <Text style={styles.primaryBtnText}>◎ Find My Position</Text>
                 </TouchableOpacity>
               </>
@@ -3263,116 +3266,110 @@ function FusionMapScreen({
           </Text>
         </TouchableOpacity>
       )}
-      {!placementMode && navPhase === "idle" && (
-        <TouchableOpacity style={[styles.secondaryBtn, { marginBottom: 12 }]} onPress={handleStartPicking}>
-          <Text style={styles.secondaryBtnText}>👆 Set My Start on the Map</Text>
-        </TouchableOpacity>
-      )}
-      {!placementMode && navPhase === "idle" && !spotCal && (
-        <TouchableOpacity style={[styles.secondaryBtn, { marginBottom: 12 }]} onPress={handleStartSpotCal}>
-          <Text style={styles.secondaryBtnText}>📐 Calibrate Distance Here</Text>
-        </TouchableOpacity>
-      )}
-      {!placementMode && !obstacleEdit && !spotCal && (navPhase === "idle" || navPhase === "navigating") && (
-        <TouchableOpacity
-          style={[styles.secondaryBtn, { marginBottom: 12 }]}
-          onPress={() => setObstacleEdit({ type: "wall", first: null, erase: false })}
-        >
-          <Text style={styles.secondaryBtnText}>
-            🧱 Draw Walls / Pillars / Cabins / No-walk ({obstacleMap.items.length} drawn)
-          </Text>
-        </TouchableOpacity>
-      )}
-      {!placementMode && !obstacleEdit && !spotCal && (
-        <View style={{ flexDirection: "row", marginBottom: 12 }}>
-          <TouchableOpacity
-            style={[styles.secondaryBtn, { flex: 1, marginRight: recState.rows ? 8 : 0 }, recState.active && { borderColor: C.accentRed }]}
-            onPress={() => {
-              if (recState.active) testRecorder.stop();
-              else testRecorder.start(`room ${roomW}x${roomH} ft; B1 (${anchor1.x},${anchor1.y}); B2 (${anchor2.x},${anchor2.y})`);
-            }}
-          >
-            <Text style={[styles.secondaryBtnText, recState.active && { color: C.accentRed }]}>
-              {recState.active
-                ? `⏹ Stop Recording (${recState.truths} marks)`
-                : "📝 Record Test Walk"}
-            </Text>
+      {/* Tools and details: closed until wanted, so the map and its controls are what you see */}
+      {!placementMode && (
+        <View style={styles.panelToggles}>
+          <TouchableOpacity style={[styles.panelToggle, toolsOpen && styles.panelToggleOn]} onPress={() => setToolsOpen((v) => !v)}>
+            <Text style={[styles.panelToggleText, toolsOpen && { color: C.accent }]}>🛠 Tools</Text>
           </TouchableOpacity>
-          {recState.rows > 0 && !recState.active && (
-            <TouchableOpacity
-              style={[styles.secondaryBtn, { flex: 1 }]}
-              onPress={() => Share.share({ title: "PDR test walk", message: testRecorder.toCSV() }).catch(() => {})}
-            >
-              <Text style={styles.secondaryBtnText}>📤 Share CSV ({recState.rows})</Text>
-            </TouchableOpacity>
-          )}
+          <TouchableOpacity style={[styles.panelToggle, detailsOpen && styles.panelToggleOn]} onPress={() => setDetailsOpen((v) => !v)}>
+            <Text style={[styles.panelToggleText, detailsOpen && { color: C.accent }]}>📊 Details</Text>
+          </TouchableOpacity>
         </View>
       )}
-      {recState.active && (
-        <Text style={[styles.locateDiag, { marginTop: -6, marginBottom: 10 }]}>
-          Recording. While navigating, tap the map exactly where you are standing (e.g. at each corner / door) - those marks measure the real error.
-        </Text>
-      )}
 
-      {/* "Reset to Center" is gone deliberately: the room centre was never a
-          real position, only a placeholder to stop the dot sitting somewhere
-          stale. Re-locate does the thing that was actually wanted — measure
-          where the user is — so offering a made-up position alongside it would
-          just be a worse button. */}
-
-      {!placementMode && (
-        <TouchableOpacity style={styles.routesToggle} onPress={() => setShowRoutes((v) => !v)}>
-          <Text style={styles.routesToggleText}>
-            {showRoutes ? "▾" : "▸"} Saved Paths ({savedRoutes.length})
-          </Text>
-        </TouchableOpacity>
-      )}
-      {!placementMode && showRoutes && (
-        <View style={styles.routesBox}>
-          {savedRoutes.length === 0 ? (
-            <Text style={styles.routesEmpty}>
-              No saved paths yet. Walk a route and tap Save Path; it stays drawn on the map.
+      {!placementMode && toolsOpen && (
+        <View style={styles.card}>
+          <View style={styles.toolGrid}>
+            {navPhase === "idle" && (
+              <TouchableOpacity style={styles.toolBtn} onPress={() => setPlacementMode(true)}>
+                <Text style={styles.toolBtnText}>📍 Place Beacons</Text>
+              </TouchableOpacity>
+            )}
+            {navPhase === "idle" && !spotCal && (
+              <TouchableOpacity style={styles.toolBtn} onPress={handleStartSpotCal}>
+                <Text style={styles.toolBtnText}>📐 Calibrate Distance</Text>
+              </TouchableOpacity>
+            )}
+            {!obstacleEdit && !spotCal && (navPhase === "idle" || navPhase === "navigating") && (
+              <TouchableOpacity style={styles.toolBtn} onPress={() => setObstacleEdit({ type: "wall", first: null, erase: false })}>
+                <Text style={styles.toolBtnText}>🧱 Draw Walls ({obstacleMap.items.length})</Text>
+              </TouchableOpacity>
+            )}
+            <TouchableOpacity style={styles.toolBtn} onPress={() => setSettingsOpen((v) => !v)}>
+              <Text style={styles.toolBtnText}>⚙ Floor Plan Size</Text>
+            </TouchableOpacity>
+            {!obstacleEdit && !spotCal && (
+              <TouchableOpacity
+                style={[styles.toolBtn, recState.active && { borderColor: C.accentRed }]}
+                onPress={() => {
+                  if (recState.active) testRecorder.stop();
+                  else testRecorder.start(`room ${roomW}x${roomH} ft; B1 (${anchor1.x},${anchor1.y}); B2 (${anchor2.x},${anchor2.y})`);
+                }}
+              >
+                <Text style={[styles.toolBtnText, recState.active && { color: C.accentRed }]}>
+                  {recState.active ? `⏹ Stop Recording (${recState.truths})` : "📝 Record Test Walk"}
+                </Text>
+              </TouchableOpacity>
+            )}
+            {!obstacleEdit && !spotCal && recState.rows > 0 && !recState.active && (
+              <TouchableOpacity
+                style={styles.toolBtn}
+                onPress={() => Share.share({ title: "PDR test walk", message: testRecorder.toCSV() }).catch(() => {})}
+              >
+                <Text style={styles.toolBtnText}>📤 Share CSV ({recState.rows})</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+          {recState.active && (
+            <Text style={[styles.locateDiag, { marginTop: 8 }]}>
+              Recording. While navigating, tap the map exactly where you are standing (e.g. at each corner / door): those marks measure the real error.
             </Text>
+          )}
+
+          <Text style={styles.panelLabel}>Saved paths ({savedRoutes.length})</Text>
+          {savedRoutes.length === 0 ? (
+            <Text style={styles.routesEmpty}>None yet. Walk a route and tap Save Path; it stays drawn on the map.</Text>
           ) : (
             savedRoutes.map((r) => {
               const drawable = isFusionMapRoute(r);
               const shown = drawable && shownRouteIds.has(r.id);
               const color = routeColor(r.id);
               return (
-              <View key={r.id} style={styles.routeRow}>
-                <TouchableOpacity
-                  style={{ flex: 1, flexDirection: "row", alignItems: "center" }}
-                  disabled={!drawable}
-                  onPress={() => toggleRouteOnMap(r.id)}
-                >
-                  <View
-                    style={[
-                      styles.routeSwatch,
-                      shown
-                        ? { backgroundColor: color, borderColor: color }
-                        : { borderColor: drawable ? color : C.textMuted },
-                    ]}
-                  />
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.routeName}>{r.name}</Text>
-                    <Text style={styles.routeMeta}>
-                      {drawable
-                        ? `${r.timestamp} · ${r.steps} steps · ${Number(r.distance).toFixed(1)} ft · ${shown ? "on map, tap to hide" : "tap to show on map"}`
-                        : `${r.timestamp} · ${r.steps} steps · PDR tracker path (metres), not drawn on floor plan`}
-                    </Text>
-                  </View>
-                </TouchableOpacity>
-                <TouchableOpacity onPress={() => handleDeleteRoute(r.id)} style={styles.routeDelete}>
-                  <Text style={styles.routeDeleteText}>✕</Text>
-                </TouchableOpacity>
-              </View>
+                <View key={r.id} style={styles.routeRow}>
+                  <TouchableOpacity
+                    style={{ flex: 1, flexDirection: "row", alignItems: "center" }}
+                    disabled={!drawable}
+                    onPress={() => toggleRouteOnMap(r.id)}
+                  >
+                    <View
+                      style={[
+                        styles.routeSwatch,
+                        shown
+                          ? { backgroundColor: color, borderColor: color }
+                          : { borderColor: drawable ? color : C.textMuted },
+                      ]}
+                    />
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.routeName}>{r.name}</Text>
+                      <Text style={styles.routeMeta}>
+                        {drawable
+                          ? `${r.timestamp} · ${r.steps} steps · ${Number(r.distance).toFixed(1)} ft · ${shown ? "on map" : "tap to show"}`
+                          : `${r.timestamp} · ${r.steps} steps · PDR tracker path, not drawn here`}
+                      </Text>
+                    </View>
+                  </TouchableOpacity>
+                  <TouchableOpacity onPress={() => handleDeleteRoute(r.id)} style={styles.routeDelete}>
+                    <Text style={styles.routeDeleteText}>✕</Text>
+                  </TouchableOpacity>
+                </View>
               );
             })
           )}
         </View>
       )}
 
-      {!placementMode && (
+      {!placementMode && detailsOpen && (
         <>
           {/* Live metrics — all in feet */}
           <View style={styles.metricsGrid}>
@@ -3412,13 +3409,6 @@ function FusionMapScreen({
               color={C.beacon2}
             />
           </View>
-
-          <Text style={styles.hintText}>
-            The dashed rings around each beacon show the raw BLE-measured distance — a
-            "you're roughly on this circle" indicator, not a precise fix. The green dot
-            is the fused best estimate; its halo grows honestly when confidence drops,
-            and the dot itself fades when the fix is only approximate.
-          </Text>
 
           {/* Confidence bars */}
           <View style={styles.card}>
@@ -3542,7 +3532,8 @@ const styles = StyleSheet.create({
   routeDeleteText: { color: C.accentRed, fontSize: 15, fontWeight: "700" },
 
   // ── Zoom controls ──
-  zoomCluster: { position: "absolute", top: 12, right: 12, alignItems: "center" },
+  // Middle of the right edge: the top is for the search bar and the route banner.
+  zoomCluster: { position: "absolute", top: "50%", marginTop: -84, right: 12, alignItems: "center" },
   zoomBtn: {
     width: 36, height: 36, borderRadius: 8, marginBottom: 6,
     alignItems: "center", justifyContent: "center",
@@ -3711,6 +3702,26 @@ const styles = StyleSheet.create({
     letterSpacing: 0.5, marginBottom: 4,
   },
   metricPillValue: { fontSize: 14, fontWeight: "700" },
+  bleChip: {
+    flexDirection: "row", alignItems: "center", borderWidth: 1, borderRadius: 14,
+    paddingHorizontal: 10, paddingVertical: 5, backgroundColor: C.surface,
+  },
+  bleDot: { width: 7, height: 7, borderRadius: 4, marginRight: 6 },
+  bleChipText: { color: C.textSecondary, fontSize: 12, fontWeight: "700" },
+  panelToggles: { flexDirection: "row", marginBottom: 10 },
+  panelToggle: {
+    flex: 1, alignItems: "center", paddingVertical: 9, borderRadius: 10, borderWidth: 1,
+    borderColor: C.border, backgroundColor: C.surface, marginRight: 8,
+  },
+  panelToggleOn: { borderColor: C.accent },
+  panelToggleText: { color: C.textSecondary, fontSize: 13, fontWeight: "700" },
+  toolGrid: { flexDirection: "row", flexWrap: "wrap", marginTop: 10 },
+  toolBtn: {
+    paddingVertical: 9, paddingHorizontal: 12, borderRadius: 10, borderWidth: 1, borderColor: C.border,
+    backgroundColor: C.surfaceAlt, marginRight: 8, marginBottom: 8,
+  },
+  toolBtnText: { color: C.textPrimary, fontSize: 13, fontWeight: "600" },
+  panelLabel: { color: C.textSecondary, fontSize: 11, fontWeight: "700", letterSpacing: 0.6, textTransform: "uppercase", marginTop: 10, marginBottom: 6 },
   runHeader: { flexDirection: "row", alignItems: "flex-start", marginBottom: 12 },
   runSubtitle: { fontSize: 12, color: C.textMuted, marginTop: 2 },
   reconfigBtn: {

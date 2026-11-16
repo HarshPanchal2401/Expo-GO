@@ -11,7 +11,7 @@ import React, { useEffect, useState } from "react";
 import { View, Text, Pressable, StyleSheet } from "react-native";
 import { getAppSettings, saveAppSettings, subscribeAppSettings } from "../../services/appSettingsStorage.js";
 
-const C = { card: "#161b22", border: "#30363d", text: "#e6edf3", sub: "#8b949e", accent: "#58a6ff", bg: "#0d1117" };
+const C = { card: "#13161d", border: "#232834", text: "#f2f4f8", sub: "#9aa3b2", accent: "#4d8dff", bg: "#0a0c11" };
 const MODES = [
   { key: "walking", label: "🚶 Walking" },
   { key: "wheelchair", label: "♿ Wheelchair" },

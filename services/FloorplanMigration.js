@@ -2,7 +2,7 @@
 // FloorplanMigration.js — one-time move of saved positions onto the current plan
 //
 // The office drawing has been replaced twice: 72 x 72 ft (first image), then
-// 70 x 72 ft, now 70 x 70 ft (assets/floorplans/office-70x70.png). Each image
+// 70 x 72 ft, 70 x 70 ft, now 65 x 70 ft (assets/floorplans/office-65x70.png). Each image
 // is stretched over the room, so everything saved on the phone in feet - beacon
 // positions, start spots, drawn obstacles - sits at a place ON THE DRAWING. When
 // the room size changes, x and y are scaled by new/old size so each of them stays
@@ -21,19 +21,21 @@ try {
   AsyncStorage = null;
 }
 
-export const FLOORPLAN_W_FT = 70;
+export const FLOORPLAN_W_FT = 65;
 export const FLOORPLAN_H_FT = 70;
 // Sizes of the earlier drawings: a saved size equal to one of these is moved.
 const OLD_SIZES = [
   { w: 72, h: 72 },
   { w: 70, h: 72 },
+  { w: 70, h: 70 },
 ];
 
-const FLAG_KEY = "@floorplan_migrated_70x70_v1";
+const FLAG_KEY = "@floorplan_migrated_65x70_v1";
 const SIZE_KEY = "@v2_fusion_place_size_ft";
 const ANCHORS_KEY = "@v2_fusion_anchors_ft";
 const OBSTACLES_KEY = "@v2_obstacle_map_v1";
 const SPOTS_KEY = "@start_spots_v1";
+const PLACES_KEY = "@places_v1";
 
 const sc = (v, f) => (Number.isFinite(v) ? Number((v * f).toFixed(2)) : v);
 
@@ -53,8 +55,8 @@ export async function migrateFloorplan(storage = AsyncStorage) {
       await storage.setItem(FLAG_KEY, "already-current");
       return { ran: false, reason: "already-current" };
     }
-    // Nothing saved yet = the first drawing's default (72 x 72).
-    const from = size ? OLD_SIZES.find((o) => o.w === w && o.h === h) : OLD_SIZES[0];
+    // Nothing saved yet = the previous drawing's default (70 x 70).
+    const from = size ? OLD_SIZES.find((o) => o.w === w && o.h === h) : OLD_SIZES.find((o) => o.w === 70 && o.h === 70);
     if (!from) {
       await storage.setItem(FLAG_KEY, "custom-size-kept");
       return { ran: false, reason: "custom-room-size" };
@@ -91,6 +93,11 @@ export async function migrateFloorplan(storage = AsyncStorage) {
     if (Array.isArray(spots) && spots.length) {
       await storage.setItem(SPOTS_KEY, JSON.stringify(spots.map(pt)));
       done.push("start-spots");
+    }
+    const places = await readJson(storage, PLACES_KEY).catch(() => null);
+    if (Array.isArray(places) && places.length) {
+      await storage.setItem(PLACES_KEY, JSON.stringify(places.map(pt)));
+      done.push("places");
     }
     await storage.setItem(FLAG_KEY, "done");
     return { ran: true, done, from };

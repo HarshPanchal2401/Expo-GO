@@ -17,6 +17,7 @@ import AppSettingsScreen from "./components/AppSettingsScreen.js";
 import RawDistanceScreen from "./components/v2/RawDistanceScreen.js";
 import FusionMapScreen from "./components/v2/FusionMapScreen.js";
 import PdrTrackerScreen from "./components/v2/PdrTrackerScreen.js";
+import BottomTabs from "./components/v2/BottomTabs.js";
 import ErrorBoundary from "./components/ErrorBoundary.js";
 import { getAppSettings, subscribeAppSettings } from "./services/appSettingsStorage.js";
 import { v2Scanner } from "./services/v2BeaconScannerService.js";
@@ -923,71 +924,7 @@ export default function AppAndroid() {
 
   return (
     <SafeAreaView style={styles.safe}>
-      <StatusBar barStyle="light-content" backgroundColor="#0d1117" />
-
-      {/* ── Top Header Bar ── */}
-      <View style={styles.topHeader}>
-        <View style={styles.brandGroup}>
-          <Text style={styles.brandTitle}>Indoor Nav</Text>
-          <View style={styles.v2Badge}>
-            <Text style={styles.v2BadgeText}>V2</Text>
-          </View>
-        </View>
-
-        {/* OTA Update Quick Button */}
-        <Pressable
-          style={styles.headerOtaBtn}
-          onPress={handleOtaCheck}
-          disabled={otaChecking}
-        >
-          {otaChecking ? (
-            <ActivityIndicator size="small" color="#58a6ff" />
-          ) : (
-            <Text style={styles.headerOtaBtnText}>
-              {otaStatus ? otaStatus : "🔄 Check Updates"}
-            </Text>
-          )}
-        </Pressable>
-      </View>
-
-      {/* ── Primary Navigation Tab Bar ── */}
-      <View style={styles.tabBar}>
-        <Pressable
-          style={[styles.tabBtn, activeTab === "fusionMap" && styles.tabBtnActive]}
-          onPress={() => setActiveTab("fusionMap")}
-        >
-          <Text style={[styles.tabBtnText, activeTab === "fusionMap" && styles.tabBtnTextActive]}>
-            🗺️ Fusion Map
-          </Text>
-        </Pressable>
-
-        <Pressable
-          style={[styles.tabBtn, activeTab === "pdr" && styles.tabBtnActive]}
-          onPress={() => setActiveTab("pdr")}
-        >
-          <Text style={[styles.tabBtnText, activeTab === "pdr" && styles.tabBtnTextActive]}>
-            🚶 PDR
-          </Text>
-        </Pressable>
-
-        <Pressable
-          style={[styles.tabBtn, activeTab === "raw" && styles.tabBtnActive]}
-          onPress={() => setActiveTab("raw")}
-        >
-          <Text style={[styles.tabBtnText, activeTab === "raw" && styles.tabBtnTextActive]}>
-            📏 Raw
-          </Text>
-        </Pressable>
-
-        <Pressable
-          style={[styles.tabBtn, activeTab === "settings" && styles.tabBtnActive]}
-          onPress={() => setActiveTab("settings")}
-        >
-          <Text style={[styles.tabBtnText, activeTab === "settings" && styles.tabBtnTextActive]}>
-            ⚙️ Settings
-          </Text>
-        </Pressable>
-      </View>
+      <StatusBar barStyle="light-content" backgroundColor="#0a0c11" />
 
       {/* ── Active Tab View ── */}
       <ErrorBoundary fallbackMessage="This view encountered an unexpected error. Tap below to reload.">
@@ -1033,6 +970,8 @@ export default function AppAndroid() {
           <AppSettingsScreen />
         )}
       </ErrorBoundary>
+
+      <BottomTabs active={activeTab} onChange={setActiveTab} />
     </SafeAreaView>
   );
 }
@@ -1040,7 +979,8 @@ export default function AppAndroid() {
 const styles = StyleSheet.create({
   safe: {
     flex: 1,
-    backgroundColor: "#0d1117",
+    backgroundColor: "#0a0c11",
+    paddingTop: Platform.OS === "android" ? StatusBar.currentHeight || 0 : 0,
   },
   topHeader: {
     flexDirection: "row",

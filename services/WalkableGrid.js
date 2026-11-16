@@ -46,12 +46,12 @@ export class WalkableGrid {
     const bytes = decodeBase64(data.bits);
     this.cells = new Uint8Array(this.cols * this.rows);
     for (let i = 0; i < this.cells.length; i++) this.cells[i] = (bytes[i >> 3] >> (i & 7)) & 1;
-    this.setRoom(70, 70); // the office drawing (office-70x70.png)
+    this.setRoom(65, 70); // the office drawing (office-65x70.png)
     this._nearestCache = new Map();
   }
 
   setRoom(widthFt, heightFt) {
-    this.w = widthFt > 0 ? widthFt : 70;
+    this.w = widthFt > 0 ? widthFt : 65;
     this.h = heightFt > 0 ? heightFt : 70;
     this.cw = this.w / this.cols;
     this.ch = this.h / this.rows;

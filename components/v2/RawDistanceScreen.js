@@ -28,8 +28,8 @@ export { rawDistanceM, kalmanStep };
 const N_PRESETS = [2.0, 2.5, 3.0, 3.5, 4.0];
 
 const C = {
-  bg: "#0d1117", card: "#161b22", border: "#30363d",
-  text: "#e6edf3", sub: "#8b949e", accent: "#58a6ff",
+  bg: "#0a0c11", card: "#13161d", border: "#232834",
+  text: "#f2f4f8", sub: "#9aa3b2", accent: "#4d8dff",
   b1: "#f78166", b2: "#3fb950", warn: "#d29922",
 };
 

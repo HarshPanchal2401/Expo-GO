@@ -78,7 +78,7 @@ export default function OtaUpdateCard() {
         style={[s.otaBtn, isCheckingUpdate && { opacity: 0.6 }]}
       >
         {isCheckingUpdate ? (
-          <ActivityIndicator size="small" color="#1f6feb" />
+          <ActivityIndicator size="small" color="#4d8dff" />
         ) : (
           <Text style={s.otaBtnText}>🔄 Check Update</Text>
         )}
@@ -92,10 +92,10 @@ const s = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    backgroundColor: "white",
+    backgroundColor: "#13161d",
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: "#d0d7de",
+    borderColor: "#232834",
     padding: 14,
     marginTop: 6,
     marginBottom: 14
@@ -103,26 +103,26 @@ const s = StyleSheet.create({
   otaTitle: {
     fontSize: 13,
     fontWeight: "700",
-    color: "#24292f"
+    color: "#f2f4f8"
   },
   otaSub: {
     fontSize: 11,
-    color: "#57606a",
+    color: "#9aa3b2",
     marginTop: 2
   },
   otaBtn: {
-    backgroundColor: "#ffffff",
+    backgroundColor: "transparent",
     paddingHorizontal: 12,
     paddingVertical: 7,
     borderRadius: 8,
     borderWidth: 1,
-    borderColor: "#1f6feb",
+    borderColor: "#4d8dff",
     alignItems: "center",
     justifyContent: "center"
   },
   otaBtnText: {
     fontSize: 12,
     fontWeight: "700",
-    color: "#1f6feb"
+    color: "#4d8dff"
   }
 });

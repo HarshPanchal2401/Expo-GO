@@ -24,7 +24,6 @@ import {
   TextInput,
 } from "react-native";
 import { stepLengthModel } from "../../services/StepLengthModel.js";
-import MobilityModeSwitch from "./MobilityModeSwitch.js";
 import Svg, {
   Polyline,
   Circle,
@@ -42,16 +41,16 @@ const FT_PER_M = 3.280839895;
 
 // Theme palette matching V2
 const C = {
-  bg: "#0d1117",
-  card: "#161b22",
-  cardAlt: "#1c2128",
-  border: "#30363d",
-  borderLight: "#21262d",
-  text: "#e6edf3",
-  textMuted: "#8b949e",
-  textDim: "#484f58",
-  accent: "#58a6ff",
-  accentHover: "#1f6feb",
+  bg: "#0a0c11",
+  card: "#13161d",
+  cardAlt: "#1b1f29",
+  border: "#232834",
+  borderLight: "#1b1f29",
+  text: "#f2f4f8",
+  textMuted: "#9aa3b2",
+  textDim: "#667085",
+  accent: "#4d8dff",
+  accentHover: "#4d8dff",
   green: "#3fb950",
   orange: "#d29922",
   red: "#f85149",
@@ -264,9 +263,6 @@ export default function PdrTrackerScreen({
           </Text>
         </View>
       </View>
-
-      {/* ── Walking / Wheelchair ── */}
-      <MobilityModeSwitch disabled={running} hint="Stop tracking to switch mode." />
 
       {/* ── Sensor Status Bar ── */}
       <View style={styles.card}>
@@ -641,13 +637,13 @@ const PathCanvas = React.memo(function PathCanvas({ points, heading, previousPat
       <Svg width={canvasWidth} height={canvasHeight}>
         <Defs>
           <LinearGradient id="pathGradient" x1="0%" y1="0%" x2="100%" y2="100%">
-            <Stop offset="0%" stopColor="#58a6ff" />
+            <Stop offset="0%" stopColor="#4d8dff" />
             <Stop offset="100%" stopColor="#3fb950" />
           </LinearGradient>
         </Defs>
 
         {/* Background */}
-        <Rect x={0} y={0} width={canvasWidth} height={canvasHeight} fill="#0d1117" rx={8} />
+        <Rect x={0} y={0} width={canvasWidth} height={canvasHeight} fill="#0a0c11" rx={8} />
 
         {/* Grid lines (faint) */}
         {[-3, -2, -1, 0, 1, 2, 3].map((offset) => {
@@ -661,7 +657,7 @@ const PathCanvas = React.memo(function PathCanvas({ points, heading, previousPat
                   y1={0}
                   x2={gx}
                   y2={canvasHeight}
-                  stroke="#21262d"
+                  stroke="#1b1f29"
                   strokeWidth={0.7}
                   strokeDasharray="3,3"
                 />
@@ -672,7 +668,7 @@ const PathCanvas = React.memo(function PathCanvas({ points, heading, previousPat
                   y1={gy}
                   x2={canvasWidth}
                   y2={gy}
-                  stroke="#21262d"
+                  stroke="#1b1f29"
                   strokeWidth={0.7}
                   strokeDasharray="3,3"
                 />
@@ -687,7 +683,7 @@ const PathCanvas = React.memo(function PathCanvas({ points, heading, previousPat
           y1={0}
           x2={originCanvas.x}
           y2={canvasHeight}
-          stroke="#30363d"
+          stroke="#232834"
           strokeWidth={1}
         />
         <Line
@@ -695,7 +691,7 @@ const PathCanvas = React.memo(function PathCanvas({ points, heading, previousPat
           y1={originCanvas.y}
           x2={canvasWidth}
           y2={originCanvas.y}
-          stroke="#30363d"
+          stroke="#232834"
           strokeWidth={1}
         />
 
@@ -704,7 +700,7 @@ const PathCanvas = React.memo(function PathCanvas({ points, heading, previousPat
           <Polyline
             points={prevPolylineStr}
             fill="none"
-            stroke="#8b949e"
+            stroke="#9aa3b2"
             strokeWidth={2}
             strokeDasharray="4,4"
             strokeOpacity={0.6}
@@ -746,13 +742,13 @@ const PathCanvas = React.memo(function PathCanvas({ points, heading, previousPat
           y1={curCanvas.y}
           x2={tipX}
           y2={tipY}
-          stroke="#58a6ff"
+          stroke="#4d8dff"
           strokeWidth={2.5}
           strokeLinecap="round"
         />
         <Polygon
           points={`${tipX},${tipY} ${wing1X},${wing1Y} ${wing2X},${wing2Y}`}
-          fill="#58a6ff"
+          fill="#4d8dff"
         />
       </Svg>
     </View>
@@ -762,7 +758,7 @@ const PathCanvas = React.memo(function PathCanvas({ points, heading, previousPat
 const styles = StyleSheet.create({
   // ── Step length calibration card ──
   calPrimaryBtn: {
-    backgroundColor: "#1f6feb",
+    backgroundColor: "#4d8dff",
     borderRadius: 8,
     paddingVertical: 13,
     alignItems: "center",
@@ -770,27 +766,27 @@ const styles = StyleSheet.create({
   },
   calPrimaryBtnText: { color: "#ffffff", fontSize: 14, fontWeight: "700" },
   calGhostBtn: { paddingVertical: 10, alignItems: "center", marginTop: 6 },
-  calGhostBtnText: { color: "#8b949e", fontSize: 12, fontWeight: "600" },
+  calGhostBtnText: { color: "#9aa3b2", fontSize: 12, fontWeight: "600" },
   calHint: {
-    color: "#8b949e",
+    color: "#9aa3b2",
     fontSize: 11,
     lineHeight: 16,
     marginTop: 10,
   },
   calProgressBox: {
-    backgroundColor: "#1c2128",
+    backgroundColor: "#1b1f29",
     borderWidth: 1,
-    borderColor: "#30363d",
+    borderColor: "#232834",
     borderRadius: 8,
     paddingVertical: 16,
     alignItems: "center",
     marginTop: 12,
   },
-  calProgressSteps: { color: "#58a6ff", fontSize: 34, fontWeight: "800" },
-  calProgressLabel: { color: "#8b949e", fontSize: 12, marginTop: 2 },
-  calProgressEst: { color: "#484f58", fontSize: 11, marginTop: 6 },
+  calProgressSteps: { color: "#4d8dff", fontSize: 34, fontWeight: "800" },
+  calProgressLabel: { color: "#9aa3b2", fontSize: 12, marginTop: 2 },
+  calProgressEst: { color: "#667085", fontSize: 11, marginTop: 6 },
   calInputLabel: {
-    color: "#8b949e",
+    color: "#9aa3b2",
     fontSize: 11,
     fontWeight: "700",
     letterSpacing: 0.5,
@@ -798,13 +794,13 @@ const styles = StyleSheet.create({
     marginBottom: 6,
   },
   calInput: {
-    backgroundColor: "#0d1117",
+    backgroundColor: "#0a0c11",
     borderWidth: 1,
-    borderColor: "#30363d",
+    borderColor: "#232834",
     borderRadius: 8,
     paddingHorizontal: 12,
     paddingVertical: 10,
-    color: "#e6edf3",
+    color: "#f2f4f8",
     fontSize: 16,
     fontWeight: "600",
     marginBottom: 12,
@@ -845,7 +841,7 @@ const styles = StyleSheet.create({
     borderColor: C.green,
   },
   badgeIdle: {
-    backgroundColor: "#21262d",
+    backgroundColor: "#1b1f29",
     borderColor: C.border,
   },
   badgeText: {
@@ -969,7 +965,7 @@ const styles = StyleSheet.create({
   },
   bounceTrack: {
     height: 6,
-    backgroundColor: "#21262d",
+    backgroundColor: "#1b1f29",
     borderRadius: 3,
     overflow: "hidden",
   },
@@ -1035,7 +1031,7 @@ const styles = StyleSheet.create({
     borderColor: C.red,
   },
   btnSave: {
-    backgroundColor: "#1f6feb",
+    backgroundColor: "#4d8dff",
     borderWidth: 1,
     borderColor: C.accent,
   },
